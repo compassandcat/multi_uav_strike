@@ -22,7 +22,7 @@
  * - /mission/mode                    - 工作模式（来自 comm_node）
  * - /mission/waypoint_cmd           - 航点命令（来自 comm_node）
  * - /detection/yolo_result          - YOLO检测结果
- * - /gimbal_los_angle               - 云台LOS角度（来自 gimbal_simulator）
+ * - /target_los_angle               - 目标LOS角度（来自 gimbal_simulator）
  * - /target_estimated_pose           - 目标估计位置（来自 target_estimator）
  * - /target_estimated_twist         - 目标估计速度
  * - /inter_uav/other_uav_poses      - 邻居无人机位置
@@ -94,6 +94,7 @@ private:
     // ============== 发布 ==============
     ros::Publisher waypoint_control_pub_;
     ros::Publisher guidance_enable_pub_;
+    ros::Publisher guidance_mode_pub_;       // 模式："strike" 或 "track"
     ros::Publisher guidance_target_pub_;
     ros::Publisher avoidance_vector_pub_;
     ros::Publisher emergency_stop_pub_;
@@ -209,7 +210,7 @@ public:
 
         // 云台 LOS 角度
         gimbal_los_sub_ = nh_.subscribe(
-            "gimbal_los_angle", 10,
+            "target_los_angle", 10,
             &MissionManager::gimbalLosCallback, this);
 
         // 目标估计位置
@@ -250,6 +251,9 @@ public:
 
         guidance_enable_pub_ = nh_.advertise<std_msgs::Bool>(
             "guidance/enable", 10);
+
+        guidance_mode_pub_ = nh_.advertise<std_msgs::String>(
+            "guidance/mode", 10);
 
         guidance_target_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(
             "guidance/target_pose", 10);
@@ -477,34 +481,33 @@ public:
 
     void handleSearchTrack() {
         // 搜索即跟踪模式
+        // 如果已启动制导，不应再设置 waypoint 模式
+        if (is_guidance_active_) {
+            return;
+        }
+
         if (!current_target_.is_locked) {
             // 目标未锁定，执行航点
             current_task_status_ = TaskStatus::EXECUTING_WAYPOINT;
         } else {
-            // 目标已锁定，启动螺旋接近
-            if (!is_spiral_active_) {
-                startSpiralApproach();
-            }
-            current_task_status_ = TaskStatus::SPIRAL_APPROACH;
+            // 目标已锁定，直接启动制导接近
+            startGuidanceApproach();
         }
     }
 
     void handleSearchStrike() {
         // 搜索即打击模式
+        // 如果已启动制导，不应再设置 waypoint 模式
+        if (is_guidance_active_) {
+            return;
+        }
+
         if (!current_target_.is_locked) {
             // 目标未锁定，执行航点
             current_task_status_ = TaskStatus::EXECUTING_WAYPOINT;
         } else {
-            // 目标已锁定，螺旋接近
-            if (!is_spiral_active_) {
-                startSpiralApproach();
-            }
-            current_task_status_ = TaskStatus::SPIRAL_APPROACH;
-
-            // 螺旋接近完成后，启动制导接近
-            if (true) {
-                startGuidanceApproach();
-            }
+            // 目标已锁定，直接启动制导接近
+            startGuidanceApproach();
         }
     }
 
@@ -538,15 +541,30 @@ public:
         is_guidance_active_ = true;
         current_task_status_ = TaskStatus::GUIDANCE_APPROACH;
 
+        // 停止航点执行，避免和 guidance 冲突
+        ROS_WARN("[MissionManager] >>>>> stop command about to be published to waypoint_executor");
+        std_msgs::String cmd;
+        cmd.data = "stop";
+        waypoint_control_pub_.publish(cmd);
+        ROS_WARN("[MissionManager] >>>>> stop command published");
+
+        // 确定模式：SEARCH_STRIKE -> "strike", SEARCH_TRACK -> "track"
+        std::string guidance_mode = (current_work_mode_ == WorkMode::SEARCH_STRIKE) ? "strike" : "track";
+
         // 使能制导
         std_msgs::Bool enable;
         enable.data = true;
         guidance_enable_pub_.publish(enable);
 
+        // 发送模式
+        std_msgs::String mode_msg;
+        mode_msg.data = guidance_mode;
+        guidance_mode_pub_.publish(mode_msg);
+
         // 发送目标给制导
         guidance_target_pub_.publish(current_target_.pose);
 
-        ROS_INFO("[MissionManager] Starting guidance approach to target");
+        ROS_WARN_THROTTLE(5.0, "[MissionManager] Starting guidance approach to target (mode: %s)", guidance_mode.c_str());
     }
 
     void disableGuidance() {

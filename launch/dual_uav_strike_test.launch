@@ -25,10 +25,10 @@
         respawn="false">
     <param name="x_init" value="10.0" />
     <param name="y_init" value="10.0" />
-    <param name="max_speed" value="0.5" />
+    <param name="max_speed" value="17" />
     <param name="min_speed" value="0.0" />
     <param name="max_tangential_acc" value="1" />
-    <param name="max_normal_acc" value="0.1" />
+    <param name="max_normal_acc" value="0.05" />
     <param name="sim_freq" value="100.0" />
     <param name="trigger_freq" value="0.1" />
   </node>
@@ -90,7 +90,7 @@
           output="screen"
           respawn="false">
       <param name="guidance_strategy" value="intercept" />
-      <param name="uav_speed" value="0.1" />
+      <param name="uav_speed" value="5.0" />
       <param name="intercept_time_horizon" value="5.0" />
       <param name="v_max" value="5.0" />
       <param name="a_max" value="10.0" />
@@ -117,7 +117,7 @@
       <param name="flight_mode_position" value="2" />
       <param name="flight_mode_velocity" value="0" />
       <param name="avoidance_safe_distance" value="10.0" />
-      <param name="use_desired_yaw_from_wp" value="false" />
+      <param name="use_desired_yaw_from_wp" value="true" />
       <param name="use_sim" value="true" />
       <param name="ref_lat" value="36.096" />
       <param name="ref_lon" value="114.392" />
@@ -210,7 +210,7 @@
           output="screen"
           respawn="false">
       <param name="guidance_strategy" value="intercept" />
-      <param name="uav_speed" value="0.1" />
+      <param name="uav_speed" value="5.0" />
       <param name="intercept_time_horizon" value="5.0" />
       <param name="v_max" value="5.0" />
       <param name="a_max" value="10.0" />
@@ -319,7 +319,7 @@
         output="screen"
         respawn="false"
         args="">
-    <param name="mode" value="SEARCH_STRIKE" />
+    <param name="mode" value="SEARCH_ONLY" />
     <param name="auto_pub" value="true" />
   </node>
 

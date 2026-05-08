@@ -630,7 +630,7 @@ public:
 
     void controlCallback(const std_msgs::String::ConstPtr& msg) {
         std::string cmd = msg->data;
-        ROS_INFO("[WaypointExecutor] Received control command: %s", cmd.c_str());
+        ROS_WARN("[WaypointExecutor] >>>>> Received control command: %s", cmd.c_str());
 
         if (cmd == "stop") {
             stop();
@@ -647,7 +647,9 @@ public:
     void stop() {
         is_executing_ = false;
         waypoint_queue_.clear();
+        ROS_WARN("[WaypointExecutor] >>>>> stop() called, about to publish zero velocity");
         publishZeroVelocity();
+        ROS_WARN("[WaypointExecutor] >>>>> stop() completed");
         ROS_INFO("[WaypointExecutor] Stopped");
     }
 

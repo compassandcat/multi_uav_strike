@@ -78,7 +78,7 @@ public:
         uav_pose_sub_ = nh_.subscribe("quad/pose", 10, &GimbalSimulator::uavPoseCallback, this);
 
         // 4. 创建发布者
-        los_angle_pub_ = nh_.advertise<geometry_msgs::Point>("gimbal_los_angle", 10);
+        los_angle_pub_ = nh_.advertise<geometry_msgs::Point>("target_los_angle", 10);
         gimbal_pose_pub_ = nh_.advertise<geometry_msgs::PoseStamped>("gimbal_pose", 10);
 
         // 5. 创建控制定时器（100Hz）
@@ -88,7 +88,7 @@ public:
         ROS_INFO("Params: image=%dx%d, FOV=%.1f deg, P-gain=%.2f, max_yaw_rate=%.2f rad/s, max_pitch_rate=%.2f rad/s",
                  image_width_, image_height_, fov_deg_, gimbal_p_gain_, max_yaw_rate_, max_pitch_rate_);
         ROS_INFO("Subscribed to: target=%s, uav_pose=quad/pose", "/target_position");
-        ROS_INFO("Publishing to: los_angle=%s, gimbal_pose=%s", "/gimbal_los_angle", "/gimbal_pose");
+        ROS_INFO("Publishing to: los_angle=%s, gimbal_pose=%s", "/target_los_angle", "/gimbal_pose");
     }
 
     // 目标位置回调函数

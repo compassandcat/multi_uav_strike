@@ -6,6 +6,7 @@
 #include <std_msgs/Int16.h>
 #include <std_msgs/Float32.h>
 #include <std_msgs/Bool.h>
+#include <std_msgs/String.h>
 #include <visualization_msgs/Marker.h>
 #include <limits>
 #include <Eigen/Eigen>
@@ -25,6 +26,7 @@ private:
     ros::Subscriber los_angle_sub_;
     ros::Subscriber real_target_sub_;  // 真实目标位置用于评估
     ros::Subscriber enable_sub_;       // 使能控制（来自 mission_manager）
+    ros::Subscriber mode_sub_;        // 模式控制："strike" 或 "track"
 
     // Publishers
     ros::Publisher vel_cmd_pub_;          // setpoint_velocity/cmd_vel_unstamped
@@ -56,6 +58,7 @@ private:
 
     // 使能控制：SEARCH_ONLY 模式下 guidance 不工作
     bool is_enabled_;
+    std::string current_mode_;  // "strike" 或 "track"
 
     // Guidance strategy
     std::unique_ptr<multi_uav_strike::GuidanceStrategy> guidance_strategy_;
@@ -65,6 +68,20 @@ private:
     // Control mode
     int flight_mode_velocity_;
     int flight_mode_attitude_;
+
+    // 跟踪约束参数
+    double min_altitude_;            // 最小高度限制
+    double max_tracking_distance_;   // 最大跟踪距离
+    double desired_tracking_angle_;   // 期望跟踪角度（目标在机头前下方）
+
+    // TRACK模式专用参数
+    double track_altitude_;          // 固定跟踪高度（m）
+    double track_horiz_dist_;        // 水平安全距离（m，小于此值水平速度归0）
+    double track_P_;                 // P控制增益
+    double track_I_;                 // I控制增益
+    double track_max_speed_;         // 最大速度限制（m/s）
+    double track_integral_x_;        // PI积分项 x
+    double track_integral_y_;        // PI积分项 y
 
     // 打击评估相关
     double strike_distance_threshold_;  // 打击成功距离阈值(m)
@@ -83,7 +100,10 @@ public:
         strike_time_(0.0),
         is_approaching_(true),
         prev_distance_(std::numeric_limits<double>::max()),
-        is_enabled_(false) {
+        is_enabled_(false),
+        current_mode_("strike"),
+        track_integral_x_(0.0),
+        track_integral_y_(0.0) {
         initParams();
         initSubscribers();
         initPublishers();
@@ -122,6 +142,13 @@ public:
         nh_private_.param<int>("flight_mode_velocity", flight_mode_velocity_, 0);
         nh_private_.param<int>("flight_mode_attitude", flight_mode_attitude_, 1);
         nh_private_.param<double>("strike_distance_threshold", strike_distance_threshold_, 2.0);  // 2米内视为击中
+
+        // TRACK模式专用参数
+        nh_private_.param<double>("track_altitude", track_altitude_, 30.0);       // 固定跟踪高度
+        nh_private_.param<double>("track_horiz_dist", track_horiz_dist_, 8.0);    // 水平安全距离
+        nh_private_.param<double>("track_P", track_P_, 1.0);                     // P控制增益
+        nh_private_.param<double>("track_I", track_I_, 0.1);                     // I控制增益
+        nh_private_.param<double>("uav_speed", track_max_speed_, 5.0);     // 最大速度限制
     }
 
     void initSubscribers() {
@@ -138,7 +165,7 @@ public:
             &GuidanceControlNode::uavPoseCallback, this);
 
         los_angle_sub_ = nh_.subscribe(
-            "gimbal_los_angle", 10,
+            "target_los_angle", 10,
             &GuidanceControlNode::losAngleCallback, this);
 
         // 订阅真实目标位置用于评估（用于判断是否真正击中目标）
@@ -150,6 +177,11 @@ public:
         enable_sub_ = nh_.subscribe(
             "guidance/enable", 10,
             &GuidanceControlNode::enableCallback, this);
+
+        // 模式控制（"strike" 或 "track"）
+        mode_sub_ = nh_.subscribe(
+            "guidance/mode", 10,
+            &GuidanceControlNode::modeCallback, this);
     }
 
     void initPublishers() {
@@ -230,10 +262,15 @@ public:
     void enableCallback(const std_msgs::Bool::ConstPtr& msg) {
         is_enabled_ = msg->data;
         if (is_enabled_) {
-            ROS_WARN("[Guidance] Guidance ENABLED");
+            ROS_WARN_THROTTLE(5.0, "[Guidance] Guidance ENABLED (mode: %s)", current_mode_.c_str());
         } else {
-            ROS_WARN("[Guidance] Guidance DISABLED (SEARCH_ONLY mode)");
+            ROS_WARN_THROTTLE(5.0, "[Guidance] Guidance DISABLED (SEARCH_ONLY mode)");
         }
+    }
+
+    void modeCallback(const std_msgs::String::ConstPtr& msg) {
+        current_mode_ = msg->data;
+        ROS_WARN_THROTTLE(5.0, "[Guidance] Mode changed to: %s", current_mode_.c_str());
     }
 
     // 计算打击评估
@@ -297,40 +334,41 @@ public:
             return;
         }
 
-        // 发布NWU姿态用于RViz显示
-        // 已移至 mission_manager_node（SEARCH_ONLY 模式下也需要显示）
-        // current_uav_pose_.header.stamp = ros::Time::now();
-        // uav_pose_nwu_pub_.publish(current_uav_pose_);
-
         // Compute guidance command based on strategy type
         switch (current_strategy_type_) {
             case multi_uav_strike::GuidanceStrategyType::INTERCEPT: {
-                auto* strategy = static_cast<multi_uav_strike::InterceptGuidance*>(guidance_strategy_.get());
-                auto cmd = strategy->computeCommand(
-                    current_uav_pose_,
-                    current_target_pose_,
-                    current_target_twist_);
-
-                // Publish velocity command (NWU → NED转换: x不变, y取反, z取反)
-                geometry_msgs::Twist vel_cmd;
-                vel_cmd.linear.x = cmd.velocity.x();
-                vel_cmd.linear.y = -cmd.velocity.y();  // NWU Y(West) -> NED -Y(East)
-                vel_cmd.linear.z = -cmd.velocity.z();  // NWU Z(Up) -> NED -Z(Down)
-                vel_cmd.angular.x = 0.0;
-                vel_cmd.angular.y = 0.0;
-                vel_cmd.angular.z = 0.0;
-                vel_cmd_pub_.publish(vel_cmd);
 
                 // Set flight mode to velocity
                 std_msgs::Int16 mode_msg;
                 mode_msg.data = flight_mode_velocity_;
                 flight_mode_pub_.publish(mode_msg);
 
-                // 评估打击效果（仅在未评估过第一次打击时）
-                evaluateStrike();
-
-                // 发布拦截点可视化
-                publishInterceptPointMarker(cmd.intercept_point);
+                geometry_msgs::Twist vel_cmd;
+                if (current_mode_ == "track") {
+                    // TRACK模式：独立PI控制，不做STRIKE评估
+                    // 固定高度 + PI控制水平位置
+                    computeTrackVelocity(vel_cmd);
+                    vel_cmd_pub_.publish(vel_cmd);
+                } else {
+                    // STRIKE模式
+                    auto* strategy = static_cast<multi_uav_strike::InterceptGuidance*>(guidance_strategy_.get());
+                    auto cmd = strategy->computeCommand(
+                        current_uav_pose_,
+                        current_target_pose_,
+                        current_target_twist_);
+                    // Publish velocity command - 转换为NED坐标发送
+                    // NWU (guidance内部) -> NED (飞控期望)
+                    // NED: x=North(不变), y=East(取反), z=Down(取反)
+                    vel_cmd.linear.x = cmd.velocity.x();   // NED N
+                    vel_cmd.linear.y = -cmd.velocity.y();  // NED E = -NWU W
+                    vel_cmd.linear.z = -cmd.velocity.z();  // NED D = -NWU U (z<0=向上)
+                    vel_cmd.angular.x = 0.0;
+                    vel_cmd.angular.y = 0.0;
+                    vel_cmd.angular.z = 0.0;
+                    evaluateStrike();
+                    vel_cmd_pub_.publish(vel_cmd);
+                    publishInterceptPointMarker(cmd.intercept_point);
+                }
                 break;
             }
 
@@ -361,6 +399,89 @@ public:
                 break;
             }
         }
+    }
+
+    // TRACK模式专用：PI控制速度计算
+    void computeTrackVelocity(geometry_msgs::Twist& vel_cmd) {
+        double dx = current_target_pose_.pose.position.x - current_uav_pose_.pose.position.x;
+        double dy = current_target_pose_.pose.position.y - current_uav_pose_.pose.position.y;
+        double dz = current_target_pose_.pose.position.z - current_uav_pose_.pose.position.z;
+
+        double horiz_dist = sqrt(dx*dx + dy*dy);
+
+        // 偏航角：让机头朝向目标
+        // current_yaw这里计算出是NWU坐标系的，左转是正
+        double current_yaw = atan2(2.0 * (current_uav_pose_.pose.orientation.w * current_uav_pose_.pose.orientation.z +
+                                          current_uav_pose_.pose.orientation.x * current_uav_pose_.pose.orientation.y),
+                                   1.0 - 2.0 * (current_uav_pose_.pose.orientation.y * current_uav_pose_.pose.orientation.y +
+                                                current_uav_pose_.pose.orientation.z * current_uav_pose_.pose.orientation.z));
+        double target_bearing = atan2(dy, dx);
+        double yaw_error = target_bearing - current_yaw;
+        yaw_error = atan2(sin(yaw_error), cos(yaw_error));
+
+        // 偏航角控制：los是全局角度（NED），直接作为期望航向
+        // current_los_angle_.x 是目标在NED下的绝对方位角，不是相对机头的偏移
+        double desired_yaw;
+        if (is_los_received_) {
+            desired_yaw = current_los_angle_.x;  // 直接使用全局LOS角度
+        } else {
+            desired_yaw = target_bearing;
+        }
+
+        // PI控制：水平速度根据位置偏差计算
+        double cmd_x = track_P_ * dx + track_I_ * track_integral_x_;
+        double cmd_y = track_P_ * dy + track_I_ * track_integral_y_;
+
+        // 速度限幅
+        double speed = sqrt(cmd_x*cmd_x + cmd_y*cmd_y);
+        if (speed > track_max_speed_) {
+            cmd_x = cmd_x / speed * track_max_speed_;
+            cmd_y = cmd_y / speed * track_max_speed_;
+        }
+
+        // 缓冲带：防止在threshold附近航向跳变
+        const double HYSTERESIS_MARGIN = 2.0;  // 缓冲带宽度
+        double inner_threshold = track_horiz_dist_ - HYSTERESIS_MARGIN;
+        double outer_threshold = track_horiz_dist_ + HYSTERESIS_MARGIN;
+
+        if (horiz_dist < inner_threshold) {
+            // 在内边界内，速度归0，航向保持当前朝向
+            cmd_x = 0.0;
+            cmd_y = 0.0;
+            track_integral_x_ = 0.0;
+            track_integral_y_ = 0.0;
+            desired_yaw = current_yaw;  // 保持当前航向，不跳变
+        } else if (horiz_dist < outer_threshold) {
+            // 在缓冲带内，逐渐过渡航向，避免跳变
+            double ratio = (horiz_dist - inner_threshold) / (2.0 * HYSTERESIS_MARGIN);
+            ratio = std::max(0.0, std::min(1.0, ratio));
+            // los_yaw是全局角度（NED），不是相对机头的偏移
+            double los_yaw = current_los_angle_.x;
+            desired_yaw = current_yaw * (1.0 - ratio) + los_yaw * ratio;
+        } else {
+            // 在外边界外，正常跟踪
+            track_integral_x_ += dx * 0.02;
+            track_integral_y_ += dy * 0.02;
+            track_integral_x_ = std::max(-5.0, std::min(5.0, track_integral_x_));
+            track_integral_y_ = std::max(-5.0, std::min(5.0, track_integral_y_));
+        }
+
+        // 高度控制：固定高度 track_altitude_
+        // NED: z>0向下，z<0向上
+        double alt_error = current_uav_pose_.pose.position.z - track_altitude_;
+        double cmd_z = std::max(-1.0, std::min(1.0, -0.5 * alt_error));  // P控制，高度低了向上(z<0)
+
+        vel_cmd.linear.x = cmd_x;
+        vel_cmd.linear.y = -cmd_y;  // NED E = -NWU W
+        vel_cmd.linear.z = -cmd_z;   // NED D (z<0=up)
+        vel_cmd.angular.x = 0.0;
+        vel_cmd.angular.y = 0.0;
+        vel_cmd.angular.z = -desired_yaw;
+
+        ROS_WARN_THROTTLE(0.5, "[Guidance-TRACK] dx=%.1f dy=%.1f horiz=%.1f alt=%.1f des_alt=%.1f vel(%.2f,%.2f,%.2f) yaw=%.0f",
+                         dx, dy, horiz_dist, current_uav_pose_.pose.position.z, track_altitude_,
+                         vel_cmd.linear.x, vel_cmd.linear.y, vel_cmd.linear.z,
+                         desired_yaw * 180.0 / M_PI);
     }
 
     void publishAttitudeThrust(const multi_uav_strike::AttitudeThrustCommand& cmd) {

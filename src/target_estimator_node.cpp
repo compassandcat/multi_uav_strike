@@ -107,7 +107,7 @@ public:
         rng_.seed(seed);
         normal_dist_ = std::normal_distribution<double>(0.0, 1.0);
 
-        gimbal_los_sub_ = nh_.subscribe("gimbal_los_angle", 10, &TargetEstimator::gimbalLosCallback, this);
+        gimbal_los_sub_ = nh_.subscribe("target_los_angle", 10, &TargetEstimator::gimbalLosCallback, this);
         uav_pose_sub_ = nh_.subscribe("quad/pose", 10, &TargetEstimator::uavPoseCallback, this);
 
         target_est_marker_pub_ = nh_.advertise<visualization_msgs::Marker>("target_estimated_marker", 10);
@@ -122,7 +122,7 @@ public:
                  num_particles_, init_dist_std_dev_, process_noise_std_dev_, observation_noise_std_dev_);
         ROS_INFO("New Params: dist_prior=%.2f, vel_consistency=%.2f",
                  dist_prior_weight_, vel_consistency_weight_);
-        ROS_INFO("Subscribed to: gimbal_los=%s, uav_pose=%s", "/gimbal_los_angle", "/quad/pose");
+        ROS_INFO("Subscribed to: target_los=%s, uav_pose=%s", "/target_los_angle", "/quad/pose");
         ROS_INFO("Publishing to: target_est_marker=%s, particles=%s, target_est_pose=%s",
                  "/target_estimated_marker", "/particles_marker_array", "/target_estimated_pose");
         ROS_INFO("Anti-collapse Params: target_z_prior=%.2fm, z_weight=%.2f, angle_dist_gain=%.3f",
