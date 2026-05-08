@@ -93,6 +93,9 @@ public:
 
     // 目标位置回调函数
     void targetCallback(const geometry_msgs::Point::ConstPtr& msg) {
+        // 目标位置：target_motion_simulator_node发布的是NED坐标
+        // 但无人机也在NED坐标，我们需要计算相对位置
+        // 因此直接使用msg（不转换坐标系）
         current_target_pos_ = *msg;
         is_target_received_ = true;
     }
@@ -210,7 +213,7 @@ public:
     void publishLOSAngle(double desired_yaw, double desired_pitch) {
         geometry_msgs::Point los_angle_msg;
         los_angle_msg.x = desired_yaw;     // 期望方位角（真实LOS，rad）
-        los_angle_msg.y = -desired_pitch;   // 期望俯仰角（真实LOS，rad）
+        los_angle_msg.y = desired_pitch;   // 期望俯仰角（保持计算值的符号）
         // 跟踪精度：基于云台与目标的角度偏差（图像畸变/脱靶量）
         if (std::isnan(gimbal_tracking_accuracy_)) {
             gimbal_tracking_accuracy_ = 0.5;  // 默认中等置信度

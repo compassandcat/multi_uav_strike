@@ -478,10 +478,10 @@ public:
         vel_cmd.angular.y = 0.0;
         vel_cmd.angular.z = -desired_yaw;
 
-        ROS_WARN_THROTTLE(0.5, "[Guidance-TRACK] dx=%.1f dy=%.1f horiz=%.1f alt=%.1f des_alt=%.1f vel(%.2f,%.2f,%.2f) yaw=%.0f",
-                         dx, dy, horiz_dist, current_uav_pose_.pose.position.z, track_altitude_,
-                         vel_cmd.linear.x, vel_cmd.linear.y, vel_cmd.linear.z,
-                         desired_yaw * 180.0 / M_PI);
+        // ROS_WARN_THROTTLE(0.5, "[Guidance-TRACK] dx=%.1f dy=%.1f horiz=%.1f alt=%.1f des_alt=%.1f vel(%.2f,%.2f,%.2f) yaw=%.0f",
+        //                  dx, dy, horiz_dist, current_uav_pose_.pose.position.z, track_altitude_,
+        //                  vel_cmd.linear.x, vel_cmd.linear.y, vel_cmd.linear.z,
+        //                  desired_yaw * 180.0 / M_PI);
     }
 
     void publishAttitudeThrust(const multi_uav_strike::AttitudeThrustCommand& cmd) {
