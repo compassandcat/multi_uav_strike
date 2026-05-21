@@ -196,7 +196,7 @@ public:
         publishEstimatedTargetPose();
         publishEstimatedTargetTwist();
 
-        // 调试：对比估计位置与真实位置
+        // 调试：对比估计位置与真实位置（只在误差超过阈值时输出）
         if (is_real_target_received_) {
             double est_x = estimated_target_pose_.pose.position.x;
             double est_y = estimated_target_pose_.pose.position.y;
@@ -207,60 +207,18 @@ public:
             double error_x = est_x - real_x;
             double error_y = est_y - real_y;
             double error_z = est_z - real_z;
-            double total_error = sqrt(error_x*error_x + error_y*error_y + error_z*error_z);
 
-            // 误差超过10米时打印详细信息（只关注水平面误差）
-            if (sqrt(error_x*error_x + error_y*error_y) > 8.0) {
-                ROS_WARN("[PF-DBG] ===== Large horizontal error: %.1fm (z_err=%.2f) =====", total_error, error_z);
-                ROS_WARN("[PF-DBG] EST: (%.2f, %.2f, %.2f) REAL: (%.2f, %.2f, %.2f)",
-                        est_x, est_y, est_z, real_x, real_y, real_z);
-                ROS_WARN("[PF-DBG] ERR: (%.2f, %.2f, %.2f)", error_x, error_y, error_z);
-                ROS_WARN("[PF-DBG] LOS: (%.3f, %.3f, %.3f) tracking_acc=%.4f",
-                        current_los_angle_.x, current_los_angle_.y, current_los_angle_.z, tracking_accuracy_filter);
-                ROS_WARN("[PF-DBG] UAV: (%.2f, %.2f, %.2f)",
-                        current_uav_pose_.pose.position.x,
-                        current_uav_pose_.pose.position.y,
-                        current_uav_pose_.pose.position.z);
-
-                // 计算实际LOS与真实目标的差距
-                double uav_x = current_uav_pose_.pose.position.x;
-                double uav_y = current_uav_pose_.pose.position.y;
-                double dx_real = real_x - uav_x;
-                double dy_real = real_y - uav_y;
-                double real_yaw = atan2(dy_real, dx_real);
-                double real_pitch = atan2(-current_uav_pose_.pose.position.z, sqrt(dx_real*dx_real + dy_real*dy_real));
-                double yaw_diff = fabs(current_los_angle_.x - real_yaw);
-                double pitch_diff = fabs(current_los_angle_.y - real_pitch);
-                ROS_WARN("[PF-DBG] REAL_LOS: yaw=%.3f pitch=%.3f, DIFF: yaw=%.3f pitch=%.3f",
-                        real_yaw, real_pitch, yaw_diff, pitch_diff);
-                ROS_WARN("[PF-DBG] Particles: %lu, avg_dist=%.2f",
-                        particles_.size(), avg_particle_dist_);
-
-                // 打印粒子权重分布
-                double w_min = 1e10, w_max = 0.0, w_sum = 0.0;
-                for (const auto& p : particles_) {
-                    w_min = std::min(w_min, p.weight);
-                    w_max = std::max(w_max, p.weight);
-                    w_sum += p.weight;
-                }
-                ROS_WARN("[PF-DBG] Weight range: [%.6f, %.6f], sum=%.2f",
-                        w_min, w_max, w_sum);
-
-                // 打印部分粒子分布
-                int print_count = std::min(5, (int)particles_.size());
-                for (int i = 0; i < print_count; ++i) {
-                    const auto& p = particles_[i];
-                    ROS_WARN("[PF-DBG] Particle[%d]: pos(%.2f,%.2f,%.2f) vel(%.2f,%.2f,%.2f) w=%.4f",
-                            i, p.x, p.y, p.z, p.vx, p.vy, p.vz, p.weight);
-                }
-            }
-        }
-
-        ROS_DEBUG_THROTTLE(1.0, "Estimated target: x=%.2f, y=%.2f, z=%.2f (particles num: %lu)",
+            // 水平误差超过10米时才打印
+            double horiz_error = sqrt(error_x*error_x + error_y*error_y);
+            if (horiz_error > 10.0) {
+                ROS_DEBUG_THROTTLE(1.0, "[PF] Large tracking error: %.1fm (est_z=%.2f)", horiz_error, error_z);
+                ROS_DEBUG_THROTTLE(1.0, "Estimated target: x=%.2f, y=%.2f, z=%.2f (particles num: %lu)",
                            estimated_target_pose_.pose.position.x,
                            estimated_target_pose_.pose.position.y,
                            estimated_target_pose_.pose.position.z,
                            particles_.size());
+            }
+        }
     }
 
     void initializeParticles() {
@@ -367,7 +325,7 @@ public:
 
             // 对于地面目标，强制将z拉向target_z_prior_
             // 使用较大的吸引力，防止粒子漂移到空中
-            double z_pull_strength = 2.0;  // 越大越强制拉回先验高度
+            double z_pull_strength = 3.0;  // 越大越强制拉回先验高度
             double z_error = p.z - target_z_prior_;
             p.vz -= z_pull_strength * z_error * dt;
             // 限制vz，防止过冲
@@ -384,18 +342,6 @@ public:
             // 对于地面目标，限制z在合理范围
             p.z = std::max(-5.0, std::min(p.z, 50.0));
         }
-
-        calculateAvgParticleDist();
-
-        // Debug: 预测后粒子分布
-        double px_min = 1e10, px_max = -1e10, py_min = 1e10, py_max = -1e10, pz_min = 1e10, pz_max = -1e10;
-        for (const auto& p : particles_) {
-            px_min = std::min(px_min, p.x); px_max = std::max(px_max, p.x);
-            py_min = std::min(py_min, p.y); py_max = std::max(py_max, p.y);
-            pz_min = std::min(pz_min, p.z); pz_max = std::max(pz_max, p.z);
-        }
-        ROS_DEBUG_THROTTLE(2.0, "[PRED] Particle range: X[%.2f,%.2f] Y[%.2f,%.2f] Z[%.2f,%.2f] avg_dist=%.2f",
-                          px_min, px_max, py_min, py_max, pz_min, pz_max, avg_particle_dist_);
     }
 
     void updateParticleWeights() {
@@ -473,62 +419,6 @@ public:
                 p.weight /= total_weight;
             }
         }
-
-        // ===== 调试：验证粒子是否在LOS线上 =====
-        double dbg_uav_x = current_uav_pose_.pose.position.x;
-        double dbg_uav_y = current_uav_pose_.pose.position.y;
-        double dbg_uav_z = current_uav_pose_.pose.position.z;
-        double los_yaw = current_los_angle_.x;
-        double los_pitch = current_los_angle_.y;
-
-        // 计算实际目标位置
-        double real_target_x = real_target_pos_.x;
-        double real_target_y = real_target_pos_.y;
-        double dx_to_real = real_target_x - dbg_uav_x;
-        double dy_to_real = real_target_y - dbg_uav_y;
-        double real_yaw = atan2(dy_to_real, dx_to_real);
-        // NED: target在下方，所以dz = target_z - uav_z (负值表示目标在无人机下方)
-        double dz_real = 0.0 - dbg_uav_z;  // target_z=0, uav_z是负值(NED向下)
-        double real_dist = sqrt(dx_to_real*dx_to_real + dy_to_real*dy_to_real);
-        double real_pitch = atan2(dz_real, real_dist);
-
-        // 计算估计位置到真实位置的偏差
-        double est_x = estimated_target_pose_.pose.position.x;
-        double est_y = estimated_target_pose_.pose.position.y;
-        double dx_to_est = est_x - dbg_uav_x;
-        double dy_to_est = est_y - dbg_uav_y;
-        double est_yaw = atan2(dy_to_est, dx_to_est);
-        // NED: dz = target_z - uav_z
-        double dz_est = estimated_target_pose_.pose.position.z - dbg_uav_z;
-        double est_dist = sqrt(dx_to_est*dx_to_est + dy_to_est*dy_to_est);
-        double est_pitch = atan2(dz_est, est_dist);
-
-        double yaw_diff = fabs(est_yaw - real_yaw);
-        double pitch_diff = fabs(est_pitch - real_pitch);
-
-        if (yaw_diff > 0.1 || pitch_diff > 0.1) {
-            ROS_WARN("[PF-DBG] ===== OFF-LOS ERROR =====");
-            ROS_WARN("[PF-DBG] EST off LOS: yaw_diff=%.3f pitch_diff=%.3f", yaw_diff, pitch_diff);
-            ROS_WARN("[PF-DBG] EST_POS: (%.2f, %.2f) -> yaw=%.3f pitch=%.3f", est_x, est_y, est_yaw, est_pitch);
-            ROS_WARN("[PF-DBG] REAL_POS: (%.2f, %.2f) -> yaw=%.3f pitch=%.3f", real_target_x, real_target_y, real_yaw, real_pitch);
-            ROS_WARN("[PF-DBG] LOS: yaw=%.3f pitch=%.3f", los_yaw, los_pitch);
-            ROS_WARN("[PF-DBG] UAV: (%.2f, %.2f, %.2f)", dbg_uav_x, dbg_uav_y, dbg_uav_z);
-        }
-
-        // Debug: 计算有效粒子数
-        double sum_w_sq = 0.0;
-        double min_w = 1e10, max_w = 0.0;
-        for (const auto& p : particles_) {
-            sum_w_sq += p.weight * p.weight;
-            min_w = std::min(min_w, p.weight);
-            max_w = std::max(max_w, p.weight);
-        }
-        double effective_n = 1.0 / sum_w_sq;
-        // 只在异常时打印
-        if (effective_n < num_particles_ * 0.3) {
-            ROS_WARN_THROTTLE(1.0, "[PF] effective_n=%.1f/%d, w_range=[%.6f, %.6f]",
-                            effective_n, num_particles_, min_w, max_w);
-        }
     }
 
     // 修正后的重采样函数
@@ -568,24 +458,6 @@ public:
         }
 
         particles_ = std::move(new_particles);
-
-        // Debug: 重采样后检查粒子分布
-        double px_mean = 0, py_mean = 0, pz_mean = 0;
-        double px_std = 0, py_std = 0, pz_std = 0;
-        for (const auto& p : particles_) {
-            px_mean += p.x;
-            py_mean += p.y;
-            pz_mean += p.z;
-        }
-        px_mean /= num_particles_;
-        py_mean /= num_particles_;
-        pz_mean /= num_particles_;
-        for (const auto& p : particles_) {
-            px_std += (p.x - px_mean) * (p.x - px_mean);
-            py_std += (p.y - py_mean) * (p.y - py_mean);
-            pz_std += (p.z - pz_mean) * (p.z - pz_mean);
-        }
-        ROS_DEBUG("[RESAMPLE] Particles std: (%.2f, %.2f, %.2f)", sqrt(px_std/num_particles_), sqrt(py_std/num_particles_), sqrt(pz_std/num_particles_));
     }
 
     void estimateTargetState() {

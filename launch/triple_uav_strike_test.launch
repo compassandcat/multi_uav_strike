@@ -1,18 +1,19 @@
 <?xml version="1.0"?>
 <!--
-  dual_uav_strike_test.launch
-  双机完整测试 launch
+  triple_uav_strike_test.launch
+  三机完整测试 launch
 
-  结构：两个大 group (uav0, uav1)，每个 group 内包含除 target_motion_simulator_node 外所有节点
+  结构：三个 group (uav0, uav1, uav2)，每个 group 内包含除 target_motion_simulator_node 外所有节点
   target_motion_simulator_node 是共享的，用于模拟目标车辆
 
   航点设计：
   - UAV0: 从 (0,0) 出发，方形航线 (0,0)->(10,0)->(10,10)->(0,10)->(0,0)
   - UAV1: 从 (20,5) 出发，L 型航线 (20,5)->(5,5)->(5,15)->(5,25)
-  - 两机航路在 (5,5) 附近交叉，用于测试机间避障
+  - UAV2: 从 (15,15) 出发，三角形航线 (15,15)->(0,20)->(10,25)->(15,15)
+  - 三机航路在中心区域交叉，用于测试机间避障
 
   使用方法：
-  $ roslaunch multi_uav_strike dual_uav_strike_test.launch
+  $ roslaunch multi_uav_strike triple_uav_strike_test.launch
 -->
 <launch>
   <!-- ============================================================ -->
@@ -42,7 +43,7 @@
           respawn="true" output="screen">
       <param name="init_pose_x" value="0.0"/>
       <param name="init_pose_y" value="0.0"/>
-      <param name="init_pose_z" value="-10.0"/>
+      <param name="init_pose_z" value="-50.0"/>
     </node>
 
     <!-- 云台模拟 -->
@@ -58,7 +59,7 @@
       <param name="max_yaw_rate" value="1.2" />
       <param name="max_pitch_rate" value="1.2" />
       <param name="loop_freq" value="100.0" />
-      <param name="image_noise_std_dev" value="0.1" />
+      <param name="image_noise_std_dev" value="0.01" />
     </node>
 
     <!-- 目标估计 -->
@@ -69,9 +70,9 @@
           respawn="false">
       <param name="num_particles" value="500" />
       <param name="init_dist_std_dev" value="1.0" />
-      <param name="process_noise_std_dev" value="0.2" />
-      <param name="observation_noise_std_dev" value="0.05" />
-      <param name="min_confidence" value="0.2" />
+      <param name="process_noise_std_dev" value="0.03" />
+      <param name="observation_noise_std_dev" value="0.1" />
+      <param name="min_confidence" value="0.01" />
       <param name="pf_loop_freq" value="50.0" />
       <param name="vel_consistency_weight" value="0.3" />
       <param name="target_z_prior" value="0.0" />
@@ -160,7 +161,7 @@
     <!-- 飞控仿真 -->
     <node name="quad" pkg="multimodequad_ros" type="multimodequad_ros"
           respawn="true" output="screen">
-      <param name="init_pose_x" value="20.0"/>
+      <param name="init_pose_x" value="-80.0"/>
       <param name="init_pose_y" value="5.0"/>
       <param name="init_pose_z" value="-10.0"/>
     </node>
@@ -178,7 +179,7 @@
       <param name="max_yaw_rate" value="1.2" />
       <param name="max_pitch_rate" value="1.2" />
       <param name="loop_freq" value="100.0" />
-      <param name="image_noise_std_dev" value="0.05" />
+      <param name="image_noise_std_dev" value="0.01" />
     </node>
 
     <!-- 目标估计 -->
@@ -189,9 +190,9 @@
           respawn="false">
       <param name="num_particles" value="500" />
       <param name="init_dist_std_dev" value="1.0" />
-      <param name="process_noise_std_dev" value="0.2" />
-      <param name="observation_noise_std_dev" value="0.05" />
-      <param name="min_confidence" value="0.2" />
+      <param name="process_noise_std_dev" value="0.03" />
+      <param name="observation_noise_std_dev" value="0.1" />
+      <param name="min_confidence" value="0.01" />
       <param name="pf_loop_freq" value="50.0" />
       <param name="vel_consistency_weight" value="0.3" />
       <param name="target_z_prior" value="0.0" />
@@ -274,7 +275,127 @@
   </group>
 
   <!-- ============================================================ -->
-  <!-- 航点分发器：为两架无人机分别发送不同航点 -->
+  <!-- UAV2 -->
+  <!-- ============================================================ -->
+  <group ns="uav2">
+    <!-- 飞控仿真 -->
+    <node name="quad" pkg="multimodequad_ros" type="multimodequad_ros"
+          respawn="true" output="screen">
+      <param name="init_pose_x" value="65.0"/>
+      <param name="init_pose_y" value="-5.0"/>
+      <param name="init_pose_z" value="-10.0"/>
+    </node>
+
+        <!-- 云台模拟 -->
+    <node name="gimbal_simulator_node"
+        pkg="multi_uav_strike"
+        type="gimbal_simulator_node"
+        output="screen"
+        respawn="false">
+      <param name="image_width" value="1920" />
+      <param name="image_height" value="1080" />
+      <param name="fov_deg" value="45.0" />
+      <param name="gimbal_p_gain" value="1.5" />
+      <param name="max_yaw_rate" value="1.2" />
+      <param name="max_pitch_rate" value="1.2" />
+      <param name="loop_freq" value="100.0" />
+      <param name="image_noise_std_dev" value="0.01" />
+    </node>
+
+    <!-- 目标估计 -->
+    <node name="target_estimator_node"
+          pkg="multi_uav_strike"
+          type="target_estimator_node"
+          output="screen"
+          respawn="false">
+      <param name="num_particles" value="500" />
+      <param name="init_dist_std_dev" value="1.0" />
+      <param name="process_noise_std_dev" value="0.03" />
+      <param name="observation_noise_std_dev" value="0.1" />
+      <param name="min_confidence" value="0.01" />
+      <param name="pf_loop_freq" value="50.0" />
+      <param name="vel_consistency_weight" value="0.3" />
+      <param name="target_z_prior" value="0.0" />
+      <param name="target_z_weight" value="0.1" />
+      <param name="angle_error_dist_gain" value="0.03" />
+      <param name="est_marker_r" value="0.0" />
+      <param name="est_marker_g" value="1.0" />
+      <param name="est_marker_b" value="0.0" />
+      <param name="est_marker_a" value="1.0" />
+    </node>
+
+    <!-- 制导控制 -->
+    <node name="guidance_control_node"
+          pkg="multi_uav_strike"
+          type="guidance_control_node"
+          output="screen"
+          respawn="false">
+      <param name="guidance_strategy" value="intercept" />
+      <param name="uav_speed" value="10.0" />
+      <param name="intercept_time_horizon" value="5.0" />
+      <param name="v_max" value="5.0" />
+      <param name="a_max" value="10.0" />
+      <param name="pos_p_gain" value="1.0" />
+      <param name="vel_p_gain" value="0.5" />
+      <param name="thrust_weight" value="0.5" />
+      <param name="los_kp_yaw" value="1.5" />
+      <param name="los_kp_pitch" value="1.5" />
+      <param name="los_max_rate" value="1.2" />
+      <param name="los_debug_yaw_only" value="true" />
+      <param name="los_debug_fixed_thrust" value="true" />
+      <param name="los_debug_fixed_thrust_value" value="0.313" />
+    </node>
+
+    <!-- 航点执行器 -->
+    <node name="waypoint_executor_node"
+          pkg="multi_uav_strike"
+          type="waypoint_executor_node"
+          output="screen"
+          respawn="false">
+      <param name="executor_rate" value="50.0" />
+      <param name="uav_speed" value="1.0" />
+      <param name="arrival_threshold" value="2.0" />
+      <param name="flight_mode_position" value="2" />
+      <param name="flight_mode_velocity" value="0" />
+      <param name="avoidance_safe_distance" value="10.0" />
+      <param name="use_desired_yaw_from_wp" value="false" />
+      <param name="use_sim" value="true" />
+      <param name="ref_lat" value="36.096" />
+      <param name="ref_lon" value="114.392" />
+      <param name="ref_alt" value="100.0" />
+    </node>
+
+    <!-- 通信节点 -->
+    <node name="comm_node"
+          pkg="multi_uav_strike"
+          type="comm_node"
+          output="screen"
+          respawn="false">
+      <param name="uav_name" value="uav2" />
+      <param name="neighbor_timeout" value="5.0" />
+      <param name="target_share_interval" value="1.0" />
+      <param name="telemetry_rate" value="10" />
+      <param name="use_sim" value="true" />
+    </node>
+
+    <!-- 任务管理器 -->
+    <node name="mission_manager_node"
+          pkg="multi_uav_strike"
+          type="mission_manager_node"
+          output="screen"
+          respawn="false">
+      <param name="avoidance_safe_distance" value="10.0" />
+      <param name="low_speed_threshold" value="12.0" />
+      <param name="strike_distance_threshold" value="2.0" />
+      <param name="mission_loop_rate" value="50.0" />
+      <param name="target_lock_confidence" value="0.7" />
+      <param name="spiral_approach_duration" value="10.0" />
+      <param name="spiral_approach_radius" value="20.0" />
+    </node>
+  </group>
+
+  <!-- ============================================================ -->
+  <!-- 航点分发器：为三架无人机分别发送不同航点 -->
   <!-- ============================================================ -->
   <!-- UAV0 航点：方形航线 (0,0)->(10,0)->(10,10)->(0,10)->(0,0) -->
   <param name="uav0_wp0_lat_offset" value="0.0" />
@@ -303,6 +424,21 @@
   <param name="uav1_wp3_lat_offset" value="0.000225" />
   <param name="uav1_wp3_lon_offset" value="0.00009" />
   <param name="uav1_wp3_alt" value="110.0" />
+
+  <!-- UAV2 航点：三角形航线 (15,15)->(0,20)->(10,25)->(15,15) -->
+  <param name="uav2_wp0_lat_offset" value="0.000135" />
+  <param name="uav2_wp0_lon_offset" value="0.000135" />
+  <param name="uav2_wp0_alt" value="110.0" />
+  <param name="uav2_wp1_lat_offset" value="0.0" />
+  <param name="uav2_wp1_lon_offset" value="0.00018" />
+  <param name="uav2_wp1_alt" value="110.0" />
+  <param name="uav2_wp2_lat_offset" value="0.00009" />
+  <param name="uav2_wp2_lon_offset" value="0.000225" />
+  <param name="uav2_wp2_alt" value="110.0" />
+  <param name="uav2_wp3_lat_offset" value="0.000135" />
+  <param name="uav2_wp3_lon_offset" value="0.000135" />
+  <param name="uav2_wp3_alt" value="110.0" />
+
   <node name="waypoint_distributor_node"
         pkg="multi_uav_strike"
         type="waypoint_distributor_node"
@@ -320,14 +456,14 @@
         respawn="false"
         args=""
         launch-prefix="bash -c 'sleep 2; $@' --" >
-    <param name="mode" value="SEARCH_STRIKE" />
+    <param name="mode" value="SEARCH_TRACK" />
     <param name="auto_pub" value="true" />
   </node>
 
   <!-- ============================================================ -->
-  <!-- RViz -->
+  <!-- RViz (延迟启动确保航点已分发) -->
   <!-- ============================================================ -->
   <node name="rviz" pkg="rviz" type="rviz"
-        args="-d $(find multi_uav_strike)/rviz/view_strike_dual.rviz" />
+        args="-d $(find multi_uav_strike)/rviz/view_strike_triple.rviz"/>
 
 </launch>

@@ -125,6 +125,9 @@ private:
     std::vector<NeighborUav> neighbors_;
     double avoidance_safe_distance_;
 
+    // 无人机编号（用于区分颜色）
+    int uav_id_;
+
 public:
     WaypointExecutor() : nh_private_("~"),
         current_waypoint_index_(0),
@@ -160,6 +163,16 @@ public:
         nh_private_.param<int>("flight_mode_velocity", flight_mode_velocity_, 0);
         nh_private_.param<int>("flight_mode_position", flight_mode_position_, 2);
         nh_private_.param<double>("avoidance_safe_distance", avoidance_safe_distance_, 10.0);
+
+        // 自动从命名空间获取 uav_id（如 ns="uav0" → id=0）
+        std::string ns = ros::this_node::getNamespace();
+        size_t underscore_pos = ns.find("uav");
+        if (underscore_pos != std::string::npos) {
+            std::string num_str = ns.substr(underscore_pos + 3);
+            uav_id_ = atoi(num_str.c_str());
+        } else {
+            uav_id_ = 0;
+        }
 
         // 基准点参数（默认为安阳）
         nh_private_.param<double>("ref_lat", ref_lat_, ANYANG_LAT);
@@ -568,8 +581,9 @@ public:
         line_strip.type = visualization_msgs::Marker::LINE_STRIP;
         line_strip.action = visualization_msgs::Marker::ADD;
         line_strip.scale.x = 0.3;
-        line_strip.color.r = 0.0;
-        line_strip.color.g = 1.0;
+        // 颜色根据 uav_id 设置
+        line_strip.color.r = 1.0;
+        line_strip.color.g = 0.3 + 0.2 * uav_id_;
         line_strip.color.b = 0.0;
         line_strip.color.a = 1.0;
 
@@ -611,9 +625,24 @@ public:
             marker.scale.x = 2.0;
             marker.scale.y = 2.0;
             marker.scale.z = 2.0;
-            marker.color.r = 1.0;
-            marker.color.g = 0.5;
-            marker.color.b = 0.0;
+            // 颜色根据 uav_id 设置：uav0=绿色系，uav1=蓝色系，uav2=黄色系
+            if (uav_id_ == 0) {
+                marker.color.r = 0.2;
+                marker.color.g = 0.8;
+                marker.color.b = 0.2;
+            } else if (uav_id_ == 1) {
+                marker.color.r = 0.2;
+                marker.color.g = 0.4;
+                marker.color.b = 0.8;
+            } else if (uav_id_ == 2) {
+                marker.color.r = 1.0;
+                marker.color.g = 0.6;
+                marker.color.b = 0.0;
+            } else {
+                marker.color.r = 0.5;
+                marker.color.g = 0.5;
+                marker.color.b = 0.5;
+            }
             marker.color.a = 1.0;
 
             marker_array.markers.push_back(marker);

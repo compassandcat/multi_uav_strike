@@ -3,6 +3,7 @@
 #include <geometry_msgs/Twist.h>
 #include <geometry_msgs/TwistStamped.h>
 #include <geometry_msgs/Point.h>
+#include <geometry_msgs/PoseArray.h>
 #include <std_msgs/Int16.h>
 #include <std_msgs/Float32.h>
 #include <std_msgs/Bool.h>
@@ -27,6 +28,7 @@ private:
     ros::Subscriber real_target_sub_;  // 真实目标位置用于评估
     ros::Subscriber enable_sub_;       // 使能控制（来自 mission_manager）
     ros::Subscriber mode_sub_;        // 模式控制："strike" 或 "track"
+    ros::Subscriber other_uav_poses_sub_;  // 邻居无人机位置
 
     // Publishers
     ros::Publisher vel_cmd_pub_;          // setpoint_velocity/cmd_vel_unstamped
@@ -83,6 +85,9 @@ private:
     double track_integral_x_;        // PI积分项 x
     double track_integral_y_;        // PI积分项 y
 
+    // STRIKE模式参数
+    double strike_min_altitude_;      // 开始下降的最小高度阈值
+
     // 打击评估相关
     double strike_distance_threshold_;  // 打击成功距离阈值(m)
     bool first_strike_evaluated_;      // 是否已评估第一次打击
@@ -91,6 +96,13 @@ private:
     double strike_time_;                // 打击时间戳
     bool is_approaching_;               // 是否正在接近目标
     double prev_distance_;              // 上一时刻距离
+
+    // 机间避障相关
+    struct NeighborUav {
+        double ned_x, ned_y, ned_z;
+    };
+    std::vector<NeighborUav> neighbors_;
+    double avoidance_safe_distance_;
 
 public:
     GuidanceControlNode() : nh_private_("~"),
@@ -103,7 +115,8 @@ public:
         is_enabled_(false),
         current_mode_("strike"),
         track_integral_x_(0.0),
-        track_integral_y_(0.0) {
+        track_integral_y_(0.0),
+        strike_min_altitude_(20.0) {
         initParams();
         initSubscribers();
         initPublishers();
@@ -149,6 +162,9 @@ public:
         nh_private_.param<double>("track_P", track_P_, 1.0);                     // P控制增益
         nh_private_.param<double>("track_I", track_I_, 0.1);                     // I控制增益
         nh_private_.param<double>("uav_speed", track_max_speed_, 5.0);     // 最大速度限制
+
+        // STRIKE模式专用参数
+        nh_private_.param<double>("strike_min_altitude", strike_min_altitude_, 20.0);  // 开始下降的最小高度阈值
     }
 
     void initSubscribers() {
@@ -182,6 +198,11 @@ public:
         mode_sub_ = nh_.subscribe(
             "guidance/mode", 10,
             &GuidanceControlNode::modeCallback, this);
+
+        // 邻居无人机位置订阅（机间避障用）
+        other_uav_poses_sub_ = nh_.subscribe(
+            "inter_uav/other_uav_poses", 10,
+            &GuidanceControlNode::otherUavPosesCallback, this);
     }
 
     void initPublishers() {
@@ -273,6 +294,58 @@ public:
         ROS_WARN_THROTTLE(5.0, "[Guidance] Mode changed to: %s", current_mode_.c_str());
     }
 
+    // 邻居无人机位置回调（机间避障用）
+    void otherUavPosesCallback(const geometry_msgs::PoseArray::ConstPtr& msg) {
+        neighbors_.clear();
+        for (const auto& pose : msg->poses) {
+            NeighborUav neighbor;
+            // NED → NWU 转换: x不变, y取反, z取反
+            neighbor.ned_x = pose.position.x;
+            neighbor.ned_y = -pose.position.y;
+            neighbor.ned_z = -pose.position.z;
+            neighbors_.push_back(neighbor);
+        }
+    }
+
+    // 机间避障（人工势场）
+    void applyInterUavAvoidance(double& vx, double& vy, double& vz) {
+        if (neighbors_.empty()) {
+            return;
+        }
+
+        double repulsion_gain = 10.0;
+        double min_safe_distance = 25.0;
+
+        double fx = 0.0, fy = 0.0, fz = 0.0;
+
+        for (const auto& neighbor : neighbors_) {
+            double dx = current_uav_pose_.pose.position.x - neighbor.ned_x;
+            double dy = current_uav_pose_.pose.position.y - neighbor.ned_y;
+            double dz = current_uav_pose_.pose.position.z - neighbor.ned_z;
+            double dist = sqrt(dx*dx + dy*dy + dz*dz);
+            if (dist < min_safe_distance) {
+                if (dist < 2)
+                    dist = 2;  // 避免除以零
+                double force_magnitude = repulsion_gain / (dist * dist);
+                fx += (dx / dist) * force_magnitude;
+                fy += (dy / dist) * force_magnitude;
+                fz += (dz / dist) * force_magnitude;
+            }
+        }
+
+        vx += fx;
+        vy += fy;
+
+        // 限速
+        double speed = sqrt(vx*vx + vy*vy + vz*vz);
+        if (speed > track_max_speed_ * 1.5) {
+            double scale = (track_max_speed_ * 1.5) / speed;
+            vx *= scale;
+            vy *= scale;
+            vz *= scale;
+        }
+    }
+
     // 计算打击评估
     void evaluateStrike() {
         if (first_strike_evaluated_ || !is_real_target_received_) {
@@ -361,7 +434,27 @@ public:
                     // NED: x=North(不变), y=East(取反), z=Down(取反)
                     vel_cmd.linear.x = cmd.velocity.x();   // NED N
                     vel_cmd.linear.y = -cmd.velocity.y();  // NED E = -NWU W
-                    vel_cmd.linear.z = -cmd.velocity.z();  // NED D = -NWU U (z<0=向上)
+
+                    // 基于视场角pitch的高度控制
+                    // pitch大（绝对值）= 俯冲阶段 = 允许下降
+                    // pitch小 = 接近阶段 = 限制下降
+                    double pitch = current_los_angle_.y;  // 来自LOS（NED下俯仰角）
+                    double pitch_threshold = 0.5f;  // ~0.5rad，小于此值限制下降
+                    double current_alt = current_uav_pose_.pose.position.z;
+
+                    if (fabs(pitch) > pitch_threshold) {
+                        // pitch大或高度已低，正常下降
+                        vel_cmd.linear.z = -cmd.velocity.z();
+                    } else {
+                        // pitch小且高度还高，限制下沉
+                        double down_limit = -0.0;  // 最大下沉 0.1 m/s
+                        double desired_z = -cmd.velocity.z();
+                        if (desired_z > down_limit) {
+                            desired_z = down_limit;
+                        }
+                        vel_cmd.linear.z = desired_z;
+                    }
+
                     vel_cmd.angular.x = 0.0;
                     vel_cmd.angular.y = 0.0;
                     vel_cmd.angular.z = 0.0;
@@ -470,6 +563,9 @@ public:
         // NED: z>0向下，z<0向上
         double alt_error = current_uav_pose_.pose.position.z - track_altitude_;
         double cmd_z = std::max(-1.0, std::min(1.0, -0.5 * alt_error));  // P控制，高度低了向上(z<0)
+
+        // 机间避障
+        applyInterUavAvoidance(cmd_x, cmd_y, cmd_z);
 
         vel_cmd.linear.x = cmd_x;
         vel_cmd.linear.y = -cmd_y;  // NED E = -NWU W
