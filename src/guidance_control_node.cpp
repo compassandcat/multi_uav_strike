@@ -71,6 +71,14 @@ private:
     int flight_mode_velocity_;
     int flight_mode_attitude_;
 
+    // 仿真/真机切换
+    bool use_sim_;
+    std::string pose_topic_;
+    std::string vel_cmd_topic_;
+    std::string attitude_cmd_topic_;
+    std::string attitude_rates_topic_;
+    std::string thrust_cmd_topic_;
+
     // 跟踪约束参数
     double min_altitude_;            // 最小高度限制
     double max_tracking_distance_;   // 最大跟踪距离
@@ -116,7 +124,8 @@ public:
         current_mode_("strike"),
         track_integral_x_(0.0),
         track_integral_y_(0.0),
-        strike_min_altitude_(20.0) {
+        strike_min_altitude_(20.0),
+        use_sim_(true) {
         initParams();
         initSubscribers();
         initPublishers();
@@ -133,6 +142,24 @@ public:
     }
 
     void initParams() {
+        // 仿真/真机切换
+        nh_private_.param<bool>("use_sim", use_sim_, true);
+
+        // 根据 use_sim 设置 topic 名称
+        if (use_sim_) {
+            pose_topic_ = "quad/pose";
+            vel_cmd_topic_ = "quad/setpoint_velocity/cmd_vel_unstamped";
+            attitude_cmd_topic_ = "quad/setpoint_attitude/attitude";
+            attitude_rates_topic_ = "quad/setpoint_attitude/cmd_vel";
+            thrust_cmd_topic_ = "quad/thrust";
+        } else {
+            pose_topic_ = "mavros/local_position/pose";
+            vel_cmd_topic_ = "mavros/setpoint_velocity/cmd_vel_unstamped";
+            attitude_cmd_topic_ = "mavros/setpoint_attitude/attitude";
+            attitude_rates_topic_ = "mavros/setpoint_attitude/cmd_vel";
+            thrust_cmd_topic_ = "mavros/setpoint_attitude/thrust";
+        }
+
         // Strategy selection parameter
         std::string strategy_str;
         nh_private_.param<std::string>("guidance_strategy", strategy_str, "intercept");
@@ -165,6 +192,8 @@ public:
 
         // STRIKE模式专用参数
         nh_private_.param<double>("strike_min_altitude", strike_min_altitude_, 20.0);  // 开始下降的最小高度阈值
+
+        ROS_INFO("[Guidance] Mode: %s, pose_topic: %s", use_sim_ ? "SIMULATION" : "PX4 SITL", pose_topic_.c_str());
     }
 
     void initSubscribers() {
@@ -177,7 +206,7 @@ public:
             &GuidanceControlNode::targetTwistCallback, this);
 
         uav_pose_sub_ = nh_.subscribe(
-            "quad/pose", 10,
+            pose_topic_, 10,
             &GuidanceControlNode::uavPoseCallback, this);
 
         los_angle_sub_ = nh_.subscribe(
@@ -207,19 +236,22 @@ public:
 
     void initPublishers() {
         vel_cmd_pub_ = nh_.advertise<geometry_msgs::Twist>(
-            "quad/setpoint_velocity/cmd_vel_unstamped", 10);
+            vel_cmd_topic_, 10);
 
         attitude_cmd_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(
-            "quad/setpoint_attitude/attitude", 10);
+            attitude_cmd_topic_, 10);
 
         attitude_rates_pub_ = nh_.advertise<geometry_msgs::TwistStamped>(
-            "quad/setpoint_attitude/cmd_vel", 10);
+            attitude_rates_topic_, 10);
 
         thrust_cmd_pub_ = nh_.advertise<std_msgs::Float32>(
-            "quad/thrust", 10);
+            thrust_cmd_topic_, 10);
 
-        flight_mode_pub_ = nh_.advertise<std_msgs::Int16>(
-            "quad/flight_mode", 10);
+        // flight_mode_pub_ 在仿真模式使用 quad/flight_mode，PX4 模式不使用（通过 mavros/set_mode 切换）
+        if (use_sim_) {
+            flight_mode_pub_ = nh_.advertise<std_msgs::Int16>(
+                "quad/flight_mode", 10);
+        }
 
         strike_eval_pub_ = nh_.advertise<std_msgs::Bool>(
             "strike_evaluation", 10);  // 发布打击评估结果
@@ -251,19 +283,37 @@ public:
     }
 
     void uavPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
-        // ===== NED → NWU 坐标转换 =====
-        // NED: X=North, Y=East, Z=Down
-        // NWU: X=North, Y=West, Z=Up
-        // 位置：X不变, Y取反, Z取反
-        current_uav_pose_.pose.position.x = msg->pose.position.x;
-        current_uav_pose_.pose.position.y = -msg->pose.position.y;
-        current_uav_pose_.pose.position.z = -msg->pose.position.z;
+        if (use_sim_) {
+            // ===== NED → NWU 坐标转换 =====
+            // NED: X=North, Y=East, Z=Down
+            // NWU: X=North, Y=West, Z=Up
+            // 位置：X不变, Y取反, Z取反
+            current_uav_pose_.pose.position.x = msg->pose.position.x;
+            current_uav_pose_.pose.position.y = -msg->pose.position.y;
+            current_uav_pose_.pose.position.z = -msg->pose.position.z;
 
-        // 四元数：w,x不变, y,z取反 (等价于绕X轴旋转180度)
-        current_uav_pose_.pose.orientation.w = msg->pose.orientation.w;
-        current_uav_pose_.pose.orientation.x = msg->pose.orientation.x;
-        current_uav_pose_.pose.orientation.y = -msg->pose.orientation.y;
-        current_uav_pose_.pose.orientation.z = -msg->pose.orientation.z;
+            // 四元数：w,x不变, y,z取反 (等价于绕X轴旋转180度)
+            current_uav_pose_.pose.orientation.w = msg->pose.orientation.w;
+            current_uav_pose_.pose.orientation.x = msg->pose.orientation.x;
+            current_uav_pose_.pose.orientation.y = -msg->pose.orientation.y;
+            current_uav_pose_.pose.orientation.z = -msg->pose.orientation.z;
+        } else {
+            // ===== ENU → NED → NWU =====
+            // Mavros 输入是 ENU: X=East, Y=North, Z=Up
+            // ENU -> NED: x_ned = y_enu, y_ned = x_enu, z_ned = -z_enu
+            // NED -> NWU: x_nwu = x_ned, y_nwu = -y_ned, z_nwu = -z_ned
+            // 合成 ENU -> NWU: x = y_enu, y = -x_enu, z = z_enu
+            current_uav_pose_.pose.position.x = msg->pose.position.y;
+            current_uav_pose_.pose.position.y = -msg->pose.position.x;
+            current_uav_pose_.pose.position.z = msg->pose.position.z;
+
+            // 四元数: ENU->NED (180°绕X) + NED->NWU (180°绕X) = 恒等
+            // 但实际上两个180°旋转的合成仍是180°旋转，等价于只做一次
+            current_uav_pose_.pose.orientation.w = msg->pose.orientation.w;
+            current_uav_pose_.pose.orientation.x = msg->pose.orientation.x;
+            current_uav_pose_.pose.orientation.y = -msg->pose.orientation.y;
+            current_uav_pose_.pose.orientation.z = -msg->pose.orientation.z;
+        }
 
         current_uav_pose_.header.stamp = msg->header.stamp;
         current_uav_pose_.header.frame_id = msg->header.frame_id;
@@ -421,6 +471,9 @@ public:
                     // TRACK模式：独立PI控制，不做STRIKE评估
                     // 固定高度 + PI控制水平位置
                     computeTrackVelocity(vel_cmd);
+                    if (!use_sim_) {
+                        convertVelNedToEnu(vel_cmd);
+                    }
                     vel_cmd_pub_.publish(vel_cmd);
                 } else {
                     // STRIKE模式
@@ -429,6 +482,14 @@ public:
                         current_uav_pose_,
                         current_target_pose_,
                         current_target_twist_);
+                    // 打印目标信息、无人机信息、速度指令信息用于调试
+                    ROS_INFO("[Guidance] Target Pos (NWU): [%.2f, %.2f, %.2f]",
+                                       current_target_pose_.pose.position.x, current_target_pose_.pose.position.y, current_target_pose_.pose.position.z);
+                    ROS_INFO("[Guidance] UAV Pos (NWU): [%.2f, %.2f, %.2f], UAV Alt: %.2f m",
+                                       current_uav_pose_.pose.position.x, current_uav_pose_.pose.position.y, current_uav_pose_.pose.position.z, -current_uav_pose_.pose.position.z);
+                    ROS_INFO("[Guidance] Velocity Command (NWU): [%.2f, %.2f, %.2f], Intercept Point (NWU): [%.2f, %.2f, %.2f]",
+                                       cmd.velocity.x(), cmd.velocity.y(), cmd.velocity.z(),
+                                       cmd.intercept_point.x(), cmd.intercept_point.y(), cmd.intercept_point.z());
                     // Publish velocity command - 转换为NED坐标发送
                     // NWU (guidance内部) -> NED (飞控期望)
                     // NED: x=North(不变), y=East(取反), z=Down(取反)
@@ -459,6 +520,9 @@ public:
                     vel_cmd.angular.y = 0.0;
                     vel_cmd.angular.z = 0.0;
                     evaluateStrike();
+                    if (!use_sim_) {
+                        convertVelNedToEnu(vel_cmd);
+                    }
                     vel_cmd_pub_.publish(vel_cmd);
                     publishInterceptPointMarker(cmd.intercept_point);
                 }
@@ -578,6 +642,29 @@ public:
         //                  dx, dy, horiz_dist, current_uav_pose_.pose.position.z, track_altitude_,
         //                  vel_cmd.linear.x, vel_cmd.linear.y, vel_cmd.linear.z,
         //                  desired_yaw * 180.0 / M_PI);
+    }
+
+    /**
+     * 将 NED 速度指令转换为 ENU（用于 PX4 SITL）
+     * NED: x=North, y=East, z=Down
+     * ENU: x=East, y=North, z=Up
+     */
+    void convertVelNedToEnu(geometry_msgs::Twist& vel_cmd) {
+        double ned_vx = vel_cmd.linear.x;
+        double ned_vy = vel_cmd.linear.y;
+        double ned_vz = vel_cmd.linear.z;
+        double ned_yaw = vel_cmd.angular.z;
+
+        // NED -> ENU: x_enu = y_ned, y_enu = x_ned, z_enu = -z_ned
+        vel_cmd.linear.x = ned_vy;       // ENU East = NED East
+        vel_cmd.linear.y = ned_vx;       // ENU North = NED North
+        vel_cmd.linear.z = -ned_vz;      // ENU Up = -NED Down
+
+        // Yaw: NED heading -> ENU heading
+        // NED: 0=North, PI/2=East; ENU: 0=East, PI/2=North
+        // yaw_enu = yaw_ned - PI/2, 但 PX4 期望的是 body frame rate
+        // 这里简单取负值，与位置转换保持一致
+        vel_cmd.angular.z = -ned_yaw;
     }
 
     void publishAttitudeThrust(const multi_uav_strike::AttitudeThrustCommand& cmd) {

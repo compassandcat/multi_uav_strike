@@ -48,9 +48,14 @@
 #include <geometry_msgs/PoseArray.h>
 #include <geometry_msgs/Point.h>
 #include <nav_msgs/Path.h>
+#include <mavros_msgs/State.h>
+#include <mavros_msgs/SetMode.h>
+#include <mavros_msgs/CommandBool.h>
 
 #include <string>
 #include <cmath>
+#include <thread>
+#include <chrono>
 
 // 工作模式枚举
 enum class WorkMode {
@@ -71,6 +76,18 @@ enum class TaskStatus {
     EMERGENCY_STOP       // 急停
 };
 
+// PX4 SITL 起飞状态
+enum class TakeoffState {
+    TAKEOFF_IDLE,           // 空闲状态，等待开始起飞
+    TAKEOFF_WAITING_FCU,   // 等待 FCU 连接
+    TAKEOFF_SETTING_OFFBOARD, // 正在切换 OFFBOARD 模式
+    TAKEOFF_ARMING,        // 正在解锁
+    TAKEOFF_TAKEOFF_EXEC,  // 执行起飞爬升
+    TAKEOFF_HOVERING,      // 悬停等待
+    TAKEOFF_COMPLETE,      // 起飞完成
+    TAKEOFF_FAILED         // 起飞失败
+};
+
 class MissionManager {
 private:
     // ROS 句柄
@@ -88,8 +105,16 @@ private:
     ros::Subscriber inter_uav_target_sub_;
     ros::Subscriber self_pose_sub_;
     ros::Subscriber obstacle_sub_;
+    ros::Subscriber mavros_state_sub_;    // PX4 SITL: 飞控状态
 
-// ==============
+    // ============== Service Client ==============
+    ros::ServiceClient set_mode_client_; // PX4 SITL: 模式切换
+    ros::ServiceClient arming_client_;  // PX4 SITL: 解锁
+
+    // ============== PX4 起飞 ==============
+    ros::Publisher takeoff_setpoint_pub_; // PX4 SITL: 位置 setpoint 发布器
+
+    // ==============
 
     // ============== 发布 ==============
     ros::Publisher waypoint_control_pub_;
@@ -156,6 +181,22 @@ private:
     double target_lock_confidence_;  // 目标锁定所需置信度
     double spiral_approach_duration_; // 螺旋接近持续时间（秒）
 
+    // 仿真/真机切换
+    bool use_sim_;
+    std::string pose_topic_;
+
+    // PX4 SITL 起飞状态
+    TakeoffState takeoff_state_;
+    bool is_px4_connected_;       // FCU 是否连接
+    bool is_offboard_mode_;        // 是否已切换到 OFFBOARD
+    double takeoff_altitude_;      // 起飞目标高度 (NED: z 向下为正)
+    double takeoff_check_interval_;
+    ros::Time takeoff_start_time_;
+    mavros_msgs::State current_mavros_state_;
+    geometry_msgs::PoseStamped takeoff_setpoint_; // 起飞位置 setpoint
+    std::atomic<bool> setpoint_running_{false};
+    std::thread setpoint_thread_;
+
 public:
     MissionManager() : nh_private_("~"),
         current_work_mode_(WorkMode::IDLE),
@@ -171,7 +212,13 @@ public:
         strike_distance_threshold_(2.0),
         mission_loop_rate_(50.0),
         target_lock_confidence_(0.7),
-        spiral_approach_duration_(10.0) {
+        spiral_approach_duration_(10.0),
+        use_sim_(true),
+        is_px4_connected_(false),
+        is_offboard_mode_(false),
+        takeoff_state_(TakeoffState::TAKEOFF_IDLE),
+        takeoff_altitude_(50.0),
+        takeoff_check_interval_(0.5) {
 
         initParams();
         initSubscribers();
@@ -179,7 +226,8 @@ public:
         initTimers();
         initTargetState();
 
-        ROS_INFO("[MissionManager] Initialized. Low speed threshold: %.1f m/s", low_speed_threshold_);
+        ROS_INFO("[MissionManager] Initialized. Low speed threshold: %.1f m/s, use_sim: %s",
+                 low_speed_threshold_, use_sim_ ? "true" : "false");
     }
 
     void initParams() {
@@ -190,6 +238,17 @@ public:
         nh_private_.param<double>("target_lock_confidence", target_lock_confidence_, 0.7);
         nh_private_.param<double>("spiral_approach_duration", spiral_approach_duration_, 10.0);
         nh_private_.param<double>("spiral_approach_radius", spiral_approach_radius_, 20.0);
+
+        // 仿真/真机切换
+        nh_private_.param<bool>("use_sim", use_sim_, true);
+        nh_private_.param<double>("takeoff_altitude", takeoff_altitude_, 50.0);
+
+        // 根据 use_sim 设置 topic
+        if (use_sim_) {
+            pose_topic_ = "quad/pose";
+        } else {
+            pose_topic_ = "mavros/local_position/pose";
+        }
     }
 
     void initSubscribers() {
@@ -233,16 +292,32 @@ public:
             "inter_uav/target_info", 10,
             &MissionManager::interUavTargetCallback, this);
 
-        // 本机位置
-        // TODO: 仿真阶段用 quad/pose，真机飞行时需改为 mavros/local_position/pose
+        // 本机位置（根据 use_sim 选择 topic）
         self_pose_sub_ = nh_.subscribe(
-            "quad/pose", 10,
+            pose_topic_, 10,
             &MissionManager::selfPoseCallback, this);
 
         // 毫米波雷达障碍检测
         obstacle_sub_ = nh_.subscribe(
             "detection/obstacle", 10,
             &MissionManager::obstacleCallback, this);
+
+        // PX4 SITL: 飞控状态订阅
+        if (!use_sim_) {
+            mavros_state_sub_ = nh_.subscribe(
+                "mavros/state", 10,
+                &MissionManager::mavrosStateCallback, this);
+
+            // PX4 SITL: 模式切换 service client
+            set_mode_client_ = nh_.serviceClient<mavros_msgs::SetMode>(
+                "mavros/set_mode");
+
+            // PX4 SITL: 解锁 service client
+            arming_client_ = nh_.serviceClient<mavros_msgs::CommandBool>(
+                "mavros/cmd/arming");
+
+            ROS_INFO("[MissionManager] PX4 SITL mode enabled, subscribing to mavros/state");
+        }
     }
 
     void initPublishers() {
@@ -269,6 +344,12 @@ public:
 
         uav_pose_nwu_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(
             "quad/pose_nwu", 10);  // NWU姿态发布(RViz用)
+
+        // PX4 SITL: 起飞位置 setpoint 发布器
+        if (!use_sim_) {
+            takeoff_setpoint_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(
+                "mavros/setpoint_position/local", 10);
+        }
     }
 
     void initTimers() {
@@ -388,18 +469,47 @@ public:
                  msg->header.frame_id.c_str());
     }
 
+    void mavrosStateCallback(const mavros_msgs::State::ConstPtr& msg) {
+        current_mavros_state_ = *msg;
+        is_px4_connected_ = msg->connected;
+        is_offboard_mode_ = (msg->mode == "OFFBOARD");
+
+        // 检测 OFFBOARD 模式切换
+        if (is_offboard_mode_ && !isTakeoffComplete()) {
+            ROS_WARN("[MissionManager] OFFBOARD mode detected, waiting for takeoff complete...");
+        }
+    }
+
     void selfPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
-        current_pose_ = *msg;
+        if (use_sim_) {
+            // 仿真输入是 NED 坐标系
+            current_pose_ = *msg;
+        } else {
+            // Mavros 输入是 ENU 坐标系，需要转换为 NED
+            // ENU -> NED: x_ned = y_enu, y_ned = x_enu, z_ned = -z_enu
+            current_pose_.pose.position.x = msg->pose.position.y;
+            current_pose_.pose.position.y = msg->pose.position.x;
+            current_pose_.pose.position.z = -msg->pose.position.z;
+            // 四元数 ENU->NED: w,x 不变, y,z 取反
+            current_pose_.pose.orientation.w = msg->pose.orientation.w;
+            current_pose_.pose.orientation.x = msg->pose.orientation.x;
+            current_pose_.pose.orientation.y = -msg->pose.orientation.y;
+            current_pose_.pose.orientation.z = -msg->pose.orientation.z;
+            current_pose_.header = msg->header;
+        }
         is_pose_received_ = true;
 
         // 发布NWU姿态用于RViz显示
-        geometry_msgs::PoseStamped uav_pose_nwu = *msg;
-        // NED -> NWU 转换
-        uav_pose_nwu.pose.position.y = -uav_pose_nwu.pose.position.y;
-        uav_pose_nwu.pose.position.z = -uav_pose_nwu.pose.position.z;
+        // NED -> NWU: x不变, y取反, z取反
+        geometry_msgs::PoseStamped uav_pose_nwu;
+        uav_pose_nwu.pose.position.x = current_pose_.pose.position.x;
+        uav_pose_nwu.pose.position.y = -current_pose_.pose.position.y;
+        uav_pose_nwu.pose.position.z = -current_pose_.pose.position.z;
         // 四元数: w,x 不变, y,z 取反
-        uav_pose_nwu.pose.orientation.y = -uav_pose_nwu.pose.orientation.y;
-        uav_pose_nwu.pose.orientation.z = -uav_pose_nwu.pose.orientation.z;
+        uav_pose_nwu.pose.orientation.w = current_pose_.pose.orientation.w;
+        uav_pose_nwu.pose.orientation.x = current_pose_.pose.orientation.x;
+        uav_pose_nwu.pose.orientation.y = -current_pose_.pose.orientation.y;
+        uav_pose_nwu.pose.orientation.z = -current_pose_.pose.orientation.z;
         uav_pose_nwu.header.stamp = ros::Time::now();
         uav_pose_nwu.header.frame_id = "map";  // RViz
         uav_pose_nwu_pub_.publish(uav_pose_nwu);
@@ -430,6 +540,15 @@ public:
             return;
         }
 
+        // PX4 SITL: 运行起飞状态机
+        if (!use_sim_) {
+            runPx4TakeoffSequence();
+            if (!isTakeoffComplete()) {
+                // 起飞未完成，跳过任务执行
+                return;
+            }
+        }
+
         // 检查急停条件（毫米波雷达）
         checkEmergencyStop();
 
@@ -451,6 +570,162 @@ public:
 
         // 发布状态
         publishStatus();
+    }
+
+    // PX4 SITL: 执行起飞状态机
+    void runPx4TakeoffSequence() {
+        switch (takeoff_state_) {
+            case TakeoffState::TAKEOFF_IDLE:
+                // 等待自动开始或外部触发
+                if (!use_sim_ && is_px4_connected_) {
+                    takeoff_state_ = TakeoffState::TAKEOFF_WAITING_FCU;
+                    ROS_WARN("[MissionManager] Starting PX4 takeoff sequence...");
+                }
+                break;
+
+            case TakeoffState::TAKEOFF_WAITING_FCU:
+                if (!is_px4_connected_) {
+                    ROS_WARN_THROTTLE(2.0, "[MissionManager] Waiting for PX4 FCU connection...");
+                } else {
+                    takeoff_state_ = TakeoffState::TAKEOFF_SETTING_OFFBOARD;
+                    startSetpointPublisher();
+                }
+                break;
+
+            case TakeoffState::TAKEOFF_SETTING_OFFBOARD:
+                if (setMode("OFFBOARD")) {
+                    takeoff_state_ = TakeoffState::TAKEOFF_ARMING;
+                }
+                break;
+
+            case TakeoffState::TAKEOFF_ARMING:
+                if (armVehicle(true)) {
+                    takeoff_state_ = TakeoffState::TAKEOFF_TAKEOFF_EXEC;
+                    takeoff_start_time_ = ros::Time::now();
+                    takeoff_setpoint_.pose.position.z = takeoff_altitude_;
+                    ROS_WARN("[MissionManager] Arming successful, starting takeoff climb...");
+                }
+                break;
+
+            case TakeoffState::TAKEOFF_TAKEOFF_EXEC: {
+                // 检查高度 (NED: z 向下为正)
+                double current_alt = -current_pose_.pose.position.z;
+                if (current_alt >= takeoff_altitude_) {
+                    double elapsed = (ros::Time::now() - takeoff_start_time_).toSec();
+                    if (elapsed > 2.0) {  // 稳定 2 秒
+                        takeoff_state_ = TakeoffState::TAKEOFF_HOVERING;
+                        takeoff_start_time_ = ros::Time::now();
+                        ROS_WARN("[MissionManager] Takeoff altitude reached, hovering...");
+                    }
+                } else {
+                    ROS_WARN_THROTTLE(1.0, "[MissionManager] Takeoff climbing: %.1f / %.1f m",
+                                     current_alt, takeoff_altitude_);
+                }
+
+                // 超时检测
+                double elapsed = (ros::Time::now() - takeoff_start_time_).toSec();
+                if (elapsed > 60.0) {
+                    ROS_ERROR("[MissionManager] Takeoff timeout!");
+                    takeoff_state_ = TakeoffState::TAKEOFF_FAILED;
+                }
+                break;
+            }
+
+            case TakeoffState::TAKEOFF_HOVERING: {
+                // 悬停一段时间后进入任务
+                double elapsed = (ros::Time::now() - takeoff_start_time_).toSec();
+                if (elapsed > 2.0) {
+                    takeoff_state_ = TakeoffState::TAKEOFF_COMPLETE;
+                    ROS_WARN("[MissionManager] ===== TAKEOFF COMPLETE! Ready for mission execution =====");
+                    stopSetpointPublisher();
+                }
+                break;
+            }
+
+            case TakeoffState::TAKEOFF_COMPLETE:
+                // 起飞完成，等待任务模式
+                break;
+
+            case TakeoffState::TAKEOFF_FAILED:
+                ROS_ERROR("[MissionManager] Takeoff failed!");
+                break;
+        }
+    }
+
+    // PX4 SITL: 启动 setpoint 发布线程
+    void startSetpointPublisher() {
+        if (setpoint_running_) {
+            return;
+        }
+        setpoint_running_ = true;
+        setpoint_thread_ = std::thread([this]() {
+            ROS_INFO("[MissionManager] Setpoint publisher thread started");
+            // 初始化 setpoint
+            takeoff_setpoint_.header.frame_id = "map";
+            takeoff_setpoint_.pose.position.x = 0;
+            takeoff_setpoint_.pose.position.y = 0;
+            takeoff_setpoint_.pose.position.z = 0.5;  // 初始低高度
+
+            ros::Rate rate(50);  // 50Hz
+            while (ros::ok() && setpoint_running_) {
+                takeoff_setpoint_.header.stamp = ros::Time::now();
+                takeoff_setpoint_pub_.publish(takeoff_setpoint_);
+                ros::spinOnce();
+                rate.sleep();
+            }
+            ROS_INFO("[MissionManager] Setpoint publisher thread stopped");
+        });
+    }
+
+    void stopSetpointPublisher() {
+        setpoint_running_ = false;
+        if (setpoint_thread_.joinable()) {
+            setpoint_thread_.join();
+        }
+    }
+
+    bool setMode(const std::string& mode) {
+        mavros_msgs::SetMode set_mode;
+        set_mode.request.custom_mode = mode;
+
+        if (!set_mode_client_.call(set_mode) || !set_mode.response.mode_sent) {
+            ROS_WARN_THROTTLE(2.0, "[MissionManager] Failed to send set mode command: %s", mode.c_str());
+            return false;
+        }
+
+        // 等待确认
+        ros::Rate rate(10);
+        auto start = ros::Time::now();
+        while (ros::ok() && (ros::Time::now() - start).toSec() < 5.0) {
+            ros::spinOnce();
+            if (current_mavros_state_.mode == mode) {
+                ROS_INFO("[MissionManager] Mode confirmed: %s", mode.c_str());
+                return true;
+            }
+            rate.sleep();
+        }
+
+        ROS_WARN_THROTTLE(2.0, "[MissionManager] Mode change timeout - current mode: %s",
+                         current_mavros_state_.mode.c_str());
+        return false;
+    }
+
+    bool armVehicle(bool arm) {
+        mavros_msgs::CommandBool arm_cmd;
+        arm_cmd.request.value = arm;
+
+        if (arming_client_.call(arm_cmd) && arm_cmd.response.success) {
+            ROS_INFO("[MissionManager] Vehicle %s", arm ? "ARMED" : "DISARMED");
+            return true;
+        }
+
+        ROS_WARN_THROTTLE(2.0, "[MissionManager] Failed to %s vehicle", arm ? "arm" : "disarm");
+        return false;
+    }
+
+    // PX4 SITL: 获取起飞是否完成
+    bool isTakeoffComplete() const {
+        return takeoff_state_ == TakeoffState::TAKEOFF_COMPLETE;
     }
 
     void avoidanceTimerCallback(const ros::TimerEvent&) {

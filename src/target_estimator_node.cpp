@@ -55,6 +55,10 @@ private:
     double target_z_weight_;       // 高度误差的权重（控制高度约束的强度）
     double angle_error_dist_gain_; // 角度误差的距离惩罚系数（放大远距粒子的角度误差）
 
+    // 仿真/真机切换
+    bool use_sim_;
+    std::string uav_pose_topic_;
+
     // 新增：估计目标marker颜色参数（launch可配置）
     double est_marker_r_;    // 红色通道 [0,1]
     double est_marker_g_;    // 绿色通道 [0,1]
@@ -106,12 +110,20 @@ public:
         est_marker_b_ = std::max(0.0, std::min(1.0, est_marker_b_));
         est_marker_a_ = std::max(0.0, std::min(1.0, est_marker_a_));
 
+        // 仿真/真机切换
+        n_param.param<bool>("use_sim", use_sim_, true);
+        if (use_sim_) {
+            uav_pose_topic_ = "quad/pose";
+        } else {
+            uav_pose_topic_ = "mavros/local_position/pose";
+        }
+
         unsigned int seed = std::chrono::system_clock::now().time_since_epoch().count();
         rng_.seed(seed);
         normal_dist_ = std::normal_distribution<double>(0.0, 1.0);
 
         gimbal_los_sub_ = nh_.subscribe("target_los_angle", 10, &TargetEstimator::gimbalLosCallback, this);
-        uav_pose_sub_ = nh_.subscribe("quad/pose", 10, &TargetEstimator::uavPoseCallback, this);
+        uav_pose_sub_ = nh_.subscribe(uav_pose_topic_, 10, &TargetEstimator::uavPoseCallback, this);
         real_target_sub_ = nh_.subscribe("/target_position", 10, &TargetEstimator::realTargetCallback, this);
 
         target_est_marker_pub_ = nh_.advertise<visualization_msgs::Marker>("target_estimated_marker", 10);
@@ -126,7 +138,7 @@ public:
                  num_particles_, init_dist_std_dev_, process_noise_std_dev_, observation_noise_std_dev_);
         ROS_INFO("New Params: dist_prior=%.2f, vel_consistency=%.2f",
                  dist_prior_weight_, vel_consistency_weight_);
-        ROS_INFO("Subscribed to: target_los=%s, uav_pose=%s", "/target_los_angle", "/quad/pose");
+        ROS_INFO("Subscribed to: target_los=%s, uav_pose=%s", "/target_los_angle", uav_pose_topic_.c_str());
         ROS_INFO("Publishing to: target_est_marker=%s, particles=%s, target_est_pose=%s",
                  "/target_estimated_marker", "/particles_marker_array", "/target_estimated_pose");
         ROS_INFO("Anti-collapse Params: target_z_prior=%.2fm, z_weight=%.2f, angle_dist_gain=%.3f",
@@ -144,16 +156,31 @@ public:
     }
 
     void uavPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
-        // ===== NED → NWU 坐标转换 =====
-        current_uav_pose_.pose.position.x = msg->pose.position.x;
-        current_uav_pose_.pose.position.y = -msg->pose.position.y;
-        current_uav_pose_.pose.position.z = -msg->pose.position.z;
+        if (use_sim_) {
+            // ===== NED → NWU 坐标转换 =====
+            current_uav_pose_.pose.position.x = msg->pose.position.x;
+            current_uav_pose_.pose.position.y = -msg->pose.position.y;
+            current_uav_pose_.pose.position.z = -msg->pose.position.z;
 
-        // 四元数：w,x不变, y,z取反 (等价于绕X轴旋转180度)
-        current_uav_pose_.pose.orientation.w = msg->pose.orientation.w;
-        current_uav_pose_.pose.orientation.x = msg->pose.orientation.x;
-        current_uav_pose_.pose.orientation.y = -msg->pose.orientation.y;
-        current_uav_pose_.pose.orientation.z = -msg->pose.orientation.z;
+            // 四元数：w,x不变, y,z取反 (等价于绕X轴旋转180度)
+            current_uav_pose_.pose.orientation.w = msg->pose.orientation.w;
+            current_uav_pose_.pose.orientation.x = msg->pose.orientation.x;
+            current_uav_pose_.pose.orientation.y = -msg->pose.orientation.y;
+            current_uav_pose_.pose.orientation.z = -msg->pose.orientation.z;
+        } else {
+            // ===== ENU → NED → NWU =====
+            // Mavros 输入是 ENU: X=East, Y=North, Z=Up
+            // 合成 ENU -> NWU: x = y_enu, y = -x_enu, z = z_enu
+            current_uav_pose_.pose.position.x = msg->pose.position.y;
+            current_uav_pose_.pose.position.y = -msg->pose.position.x;
+            current_uav_pose_.pose.position.z = msg->pose.position.z;
+
+            // 四元数: ENU->NED (180°绕X) + NED->NWU (180°绕X) = 恒等
+            current_uav_pose_.pose.orientation.w = msg->pose.orientation.w;
+            current_uav_pose_.pose.orientation.x = msg->pose.orientation.x;
+            current_uav_pose_.pose.orientation.y = -msg->pose.orientation.y;
+            current_uav_pose_.pose.orientation.z = -msg->pose.orientation.z;
+        }
 
         current_uav_pose_.header.stamp = msg->header.stamp;
         current_uav_pose_.header.frame_id = msg->header.frame_id;

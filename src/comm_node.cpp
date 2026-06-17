@@ -129,16 +129,15 @@ public:
 
     void initSubscribers() {
         // 本机位置
-        // 仿真：订阅 quad/pose；实机：订阅 mavros/local_position/pose（空着待硬件实现）
+        // 仿真：订阅 quad/pose；实机：订阅 mavros/local_position/pose
         if (use_sim_) {
             self_pose_sub_ = nh_.subscribe(
                 "quad/pose", 10,
                 &CommNode::selfPoseCallback, this);
         } else {
-            // TODO: 实机时从硬件读取位置（空着）
-            // self_pose_sub_ = nh_.subscribe(
-            //     "mavros/local_position/pose", 10,
-            //     &CommNode::selfPoseCallback, this);
+            self_pose_sub_ = nh_.subscribe(
+                "mavros/local_position/pose", 10,
+                &CommNode::selfPoseCallback, this);
         }
 
         // 订阅所有 UAV 发布的自己的位置（全局 topic）
@@ -212,7 +211,22 @@ public:
     // ============== 回调函数 ==============
 
     void selfPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
-        current_self_pose_ = *msg;
+        if (use_sim_) {
+            // 仿真输入是 NED 坐标系，直接使用
+            current_self_pose_ = *msg;
+        } else {
+            // Mavros 输入是 ENU 坐标系，需要转换为 NED
+            // ENU -> NED: x_ned = y_enu, y_ned = x_enu, z_ned = -z_enu
+            current_self_pose_.pose.position.x = msg->pose.position.y;
+            current_self_pose_.pose.position.y = msg->pose.position.x;
+            current_self_pose_.pose.position.z = -msg->pose.position.z;
+            // 四元数 ENU->NED: w,x 不变, y,z 取反
+            current_self_pose_.pose.orientation.w = msg->pose.orientation.w;
+            current_self_pose_.pose.orientation.x = msg->pose.orientation.x;
+            current_self_pose_.pose.orientation.y = -msg->pose.orientation.y;
+            current_self_pose_.pose.orientation.z = -msg->pose.orientation.z;
+            current_self_pose_.header = msg->header;
+        }
         is_self_pose_received_ = true;
 
         // 设置 frame_id 为本机名，订阅方通过此过滤自己的消息

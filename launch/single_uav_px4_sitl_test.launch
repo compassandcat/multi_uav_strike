@@ -1,0 +1,207 @@
+<?xml version="1.0"?>
+<!--
+  single_uav_px4_sitl_test.launch
+  单机 PX4 SITL 测试 launch
+
+  使用方法：
+  1. 先启动 PX4 SITL: ./src/PX4_Firmware/Tools/sitl_dual_run.sh
+  2. 再启动此 launch: roslaunch multi_uav_strike single_uav_px4_sitl_test.launch
+
+  注意：
+  - 使用 mavros 连接 PX4 SITL 而不是 multimodequad_ros
+  - mission_manager_node 内部集成 PX4 起飞流程
+  - 起飞完成后 mission_manager 开始执行任务
+-->
+<launch>
+  <!-- 解析参数 -->
+  <arg name="mode" default="SEARCH_STRIKE" />
+  <arg name="takeoff_altitude" default="50.0" />
+
+  <!-- Set GeographicLib data path -->
+  <env name="GEOGRAPHICLIB_DATA" value="$(env HOME)/.GeographicLib" />
+
+  <!-- ============================================================ -->
+  <!-- 1. MAVROS + PX4 SITL Controller (uav0) -->
+  <!-- ============================================================ -->
+  <group ns="uav0">
+    <!-- MAVROS node for PX4 -->
+    <include file="$(find mavros)/launch/px4.launch">
+      <arg name="fcu_url" value="udp://:14540@127.0.0.1:14580" />
+      <arg name="tgt_system" value="1" />
+    </include>
+  </group>
+
+  <!-- ============================================================ -->
+  <!-- 2. 目标运动模拟（仿真目标车辆） -->
+  <!-- ============================================================ -->
+  <node name="target_motion_simulator_node"
+        pkg="multi_uav_strike"
+        type="target_motion_simulator_node"
+        output="screen"
+        respawn="false">
+    <param name="x_init" value="0.0" />
+    <param name="y_init" value="5.0" />
+    <param name="max_speed" value="0.0" />
+    <param name="min_speed" value="0.0" />
+    <param name="max_tangential_acc" value="0" />
+    <param name="max_normal_acc" value="0" />
+    <param name="sim_freq" value="100.0" />
+    <param name="trigger_freq" value="0.1" />
+  </node>
+
+  <!-- ============================================================ -->
+  <!-- 3. 云台模拟节点 -->
+  <!-- ============================================================ -->
+  <group ns="uav0">
+    <node name="gimbal_simulator_node"
+        pkg="multi_uav_strike"
+        type="gimbal_simulator_node"
+        output="screen"
+        respawn="false">
+      <param name="image_width" value="1920" />
+      <param name="image_height" value="1080" />
+      <param name="fov_deg" value="45.0" />
+      <param name="gimbal_p_gain" value="1.5" />
+      <param name="max_yaw_rate" value="1.2" />
+      <param name="max_pitch_rate" value="1.2" />
+      <param name="loop_freq" value="100.0" />
+      <param name="image_noise_std_dev" value="0.1" />
+      <param name="use_sim" value="false" />
+    </node>
+  </group>
+
+  <!-- ============================================================ -->
+  <!-- 4. 目标估计节点（粒子滤波） -->
+  <!-- ============================================================ -->
+  <group ns="uav0">
+    <node name="target_estimator_node"
+          pkg="multi_uav_strike"
+          type="target_estimator_node"
+          output="screen"
+          respawn="false">
+      <param name="num_particles" value="500" />
+      <param name="init_dist_std_dev" value="1.0" />
+      <param name="process_noise_std_dev" value="0.2" />
+      <param name="observation_noise_std_dev" value="0.05" />
+      <param name="min_confidence" value="0.2" />
+      <param name="pf_loop_freq" value="50.0" />
+      <param name="vel_consistency_weight" value="0.3" />
+      <param name="target_z_prior" value="0.0" />
+      <param name="target_z_weight" value="0.1" />
+      <param name="angle_error_dist_gain" value="0.03" />
+      <param name="est_marker_r" value="0.0" />
+      <param name="est_marker_g" value="1.0" />
+      <param name="est_marker_b" value="0.0" />
+      <param name="est_marker_a" value="1.0" />
+      <param name="use_sim" value="false" />
+    </node>
+  </group>
+
+  <!-- ============================================================ -->
+  <!-- 5. 制导控制节点 -->
+  <!-- ============================================================ -->
+  <group ns="uav0">
+    <node name="guidance_control_node"
+          pkg="multi_uav_strike"
+          type="guidance_control_node"
+          output="screen"
+          respawn="false">
+      <param name="guidance_strategy" value="intercept" />
+      <param name="uav_speed" value="7.0" />
+      <param name="intercept_time_horizon" value="5.0" />
+      <param name="v_max" value="5.0" />
+      <param name="a_max" value="10.0" />
+      <param name="pos_p_gain" value="1.0" />
+      <param name="vel_p_gain" value="0.5" />
+      <param name="thrust_weight" value="0.5" />
+      <param name="los_kp_yaw" value="1.5" />
+      <param name="los_kp_pitch" value="1.5" />
+      <param name="los_max_rate" value="1.2" />
+      <param name="los_debug_yaw_only" value="true" />
+      <param name="los_debug_fixed_thrust" value="true" />
+      <param name="los_debug_fixed_thrust_value" value="0.313" />
+      <param name="use_sim" value="false" />
+    </node>
+  </group>
+
+  <!-- ============================================================ -->
+  <!-- 6. 航点执行器节点 -->
+  <!-- ============================================================ -->
+  <group ns="uav0">
+    <node name="waypoint_executor_node"
+          pkg="multi_uav_strike"
+          type="waypoint_executor_node"
+          output="screen"
+          respawn="false">
+      <param name="executor_rate" value="50.0" />
+      <param name="uav_speed" value="5.0" />
+      <param name="arrival_threshold" value="2.0" />
+      <param name="flight_mode_position" value="2" />
+      <param name="flight_mode_velocity" value="0" />
+      <param name="avoidance_safe_distance" value="10.0" />
+      <param name="use_desired_yaw_from_wp" value="true" />
+      <param name="use_sim" value="false" />
+      <param name="ref_lat" value="36.096" />
+      <param name="ref_lon" value="114.392" />
+      <param name="ref_alt" value="100.0" />
+    </node>
+  </group>
+
+  <!-- ============================================================ -->
+  <!-- 7. 通信节点 -->
+  <!-- ============================================================ -->
+  <group ns="uav0">
+    <node name="comm_node"
+          pkg="multi_uav_strike"
+          type="comm_node"
+          output="screen"
+          respawn="false">
+      <param name="uav_name" value="uav0" />
+      <param name="neighbor_timeout" value="5.0" />
+      <param name="target_share_interval" value="1.0" />
+      <param name="telemetry_rate" value="10" />
+      <param name="use_sim" value="false" />
+    </node>
+  </group>
+
+  <!-- ============================================================ -->
+  <!-- 8. 任务管理器节点 -->
+  <!-- ============================================================ -->
+  <group ns="uav0">
+    <node name="mission_manager_node"
+          pkg="multi_uav_strike"
+          type="mission_manager_node"
+          output="screen"
+          respawn="false">
+      <param name="avoidance_safe_distance" value="10.0" />
+      <param name="low_speed_threshold" value="12.0" />
+      <param name="strike_distance_threshold" value="2.0" />
+      <param name="mission_loop_rate" value="50.0" />
+      <param name="target_lock_confidence" value="0.7" />
+      <param name="spiral_approach_duration" value="10.0" />
+      <param name="spiral_approach_radius" value="20.0" />
+      <param name="use_sim" value="false" />
+      <param name="takeoff_altitude" value="$(arg takeoff_altitude)" />
+    </node>
+  </group>
+
+  <!-- ============================================================ -->
+  <!-- 9. 地面站模拟器（仿真测试用） -->
+  <!-- ============================================================ -->
+  <node name="gs_simulator_node"
+        pkg="multi_uav_strike"
+        type="gs_simulator_node.py"
+        output="screen"
+        respawn="false"
+        args="">
+    <param name="mode" value="$(arg mode)" />
+    <param name="auto_pub" value="true" />
+  </node>
+
+  <!-- ============================================================ -->
+  <!-- 10. RViz 可视化 -->
+  <!-- ============================================================ -->
+  <node name="rviz" pkg="rviz" type="rviz"
+        args="-d $(find multi_uav_strike)/rviz/view_strike_SITL.rviz" />
+
+</launch>

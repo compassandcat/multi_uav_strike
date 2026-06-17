@@ -499,6 +499,8 @@ public:
      * - atan2(dy, dx) 给出从正北方向顺时针旋转的角度
      * - 正值 = 右转（东向）
      * - angular.z 作为角速率控制偏航
+     *
+     * PX4 SITL: 需要将 NED 转换为 ENU
      */
     void publishVelocityCommandWithYaw(double vx, double vy, double vz, double desired_yaw_ned) {
         geometry_msgs::Twist vel_cmd;
@@ -510,6 +512,19 @@ public:
         vel_cmd.angular.x = 0.0;
         vel_cmd.angular.y = 0.0;
         vel_cmd.angular.z = desired_yaw_ned;
+
+        // PX4 SITL: NED -> ENU 转换
+        if (!use_sim_) {
+            double ned_vx = vel_cmd.linear.x;
+            double ned_vy = vel_cmd.linear.y;
+            double ned_vz = vel_cmd.linear.z;
+            double ned_yaw = vel_cmd.angular.z;
+            // NED -> ENU: x_enu = y_ned, y_enu = x_ned, z_enu = -z_ned
+            vel_cmd.linear.x = ned_vy;
+            vel_cmd.linear.y = ned_vx;
+            vel_cmd.linear.z = -ned_vz;
+            vel_cmd.angular.z = -ned_yaw;
+        }
 
         setpoint_velocity_pub_.publish(vel_cmd);
 
