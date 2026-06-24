@@ -1,0 +1,15 @@
+# ============================================================================
+# target_motion_simulator_node 参数
+# 加载到节点的私有命名空间（/<ns>/<node_name>/）后，C++ 中
+# nh_private_.param("xxx", ...) 能直接读取
+# ============================================================================
+x_init: 0.0                # 初始 x 位置（米，NED）
+y_init: 0.0               # 初始 y 位置（米，NED）
+max_speed: 10.0             # 最大速度（m/s）
+min_speed: 0.0             # 最小速度（m/s）
+max_tangential_acc: 0.5    # 最大切向加速度（m/s²）
+max_normal_acc: 0.0        # 最大法向加速度（m/s²）
+sim_freq: 100.0            # 仿真频率（Hz）
+trigger_freq: 0.2         # 触发频率（Hz）
+marker_size: 1.0           # 目标标记大小
+marker_frame: "map"        # 目标标记参考坐标系

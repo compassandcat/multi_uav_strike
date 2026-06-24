@@ -1,0 +1,48 @@
+# ============================================================================
+# guidance_control_node 参数（含 guidance_strategies 加载的参数）
+# ============================================================================
+
+# 仿真/真机切换
+use_sim: false
+
+# GPS 参考点
+ref_lat: 36.096
+ref_lon: 114.392
+ref_alt: 100.0
+
+# 飞行模式
+flight_mode_velocity: 0
+flight_mode_attitude: 1
+
+# 制导策略
+guidance_strategy: "intercept"   # intercept / minsnap / los
+
+# 制导通用参数（被 guidance_strategies 加载）
+intercept_time_horizon: 5.0
+v_max: 5.0
+a_max: 10.0
+polynomial_order: 10
+sampling_interval: 0.01
+trajectory_lookahead: 0.5
+pos_p_gain: 1.0
+vel_p_gain: 0.5
+thrust_weight: 0.5
+
+# LOS 制导参数
+los_kp_yaw: 0.5
+los_kp_pitch: 1.5
+los_max_rate: 1.2
+
+# TRACK 模式参数
+track_altitude: 30.0
+track_horiz_dist: 8.0
+track_P: 1.0
+track_I: 0.1
+uav_speed: 5.0              # TRACK 模式最大速度（存入 track_max_speed_）
+# 距离→速度的连续斜率：每超出 stand-off 1m 速度增加多少 m/s
+# 用于消除接近目标时的硬切换（值越小接近越平缓）
+track_k_approach: 0.5
+
+# STRIKE 模式参数
+strike_distance_threshold: 2.0
+strike_min_altitude: 20.0

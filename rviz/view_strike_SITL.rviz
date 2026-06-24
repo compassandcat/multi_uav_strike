@@ -6,7 +6,7 @@ Panels:
       Expanded:
         - /Global Options1
         - /Status1
-        - /Marker3
+        - /Grid1
         - /Pose2
       Splitter Ratio: 0.5365853905677795
     Tree Height: 677
@@ -75,28 +75,28 @@ Visualization Manager:
       Shaft Length: 1
       Shaft Radius: 0.05000000074505806
       Shape: Arrow
-      Topic: /gimbal_pose
+      Topic: /uav0/gimbal_pose
       Unreliable: false
       Value: true
     - Class: rviz/Marker
       Enabled: true
-      Marker Topic: /target_estimated_marker
+      Marker Topic: /uav0/target_estimated_marker
       Name: Marker
       Namespaces:
-        {}
+        estimated_target: true
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
       Enabled: true
-      Marker Topic: /particles_marker_array
+      Marker Topic: /uav0/particles_marker_array
       Name: MarkerArray
       Namespaces:
-        {}
+        particles: true
       Queue Size: 100
       Value: true
     - Class: rviz/Marker
       Enabled: true
-      Marker Topic: /thrust_direction
+      Marker Topic: /uav0/thrust_direction
       Name: Marker
       Namespaces:
         {}
@@ -104,7 +104,7 @@ Visualization Manager:
       Value: true
     - Class: rviz/Marker
       Enabled: true
-      Marker Topic: /intercept_point
+      Marker Topic: /uav0/intercept_point
       Name: Marker
       Namespaces:
         {}
@@ -131,7 +131,7 @@ Visualization Manager:
       Radius: 0.029999999329447746
       Shaft Diameter: 0.10000000149011612
       Shaft Length: 0.10000000149011612
-      Topic: /waypoint_executor/waypoint_path
+      Topic: /uav0/waypoint_executor/waypoint_path
       Unreliable: false
       Value: true
     - Alpha: 1
@@ -178,7 +178,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 19.07278060913086
+      Distance: 71.98719024658203
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -186,17 +186,17 @@ Visualization Manager:
         Value: false
       Field of View: 1
       Focal Point:
-        X: 2.2832088470458984
-        Y: 1.0329948663711548
-        Z: 4.017976760864258
+        X: 4.2388596534729
+        Y: 16.33395004272461
+        Z: 17.00693702697754
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.7347966432571411
+      Pitch: 0.6597968339920044
       Target Frame: <Fixed Frame>
-      Yaw: 3.3492238521575928
+      Yaw: 3.284222364425659
     Saved: ~
 Window Geometry:
   Displays:
@@ -214,5 +214,5 @@ Window Geometry:
   Views:
     collapsed: false
   Width: 1848
-  X: 1152
-  Y: 874
+  X: 72
+  Y: 34

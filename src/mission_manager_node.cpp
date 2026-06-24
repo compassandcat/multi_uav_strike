@@ -153,10 +153,15 @@ private:
     // 邻居无人机
     struct NeighborUav {
         std::string name;
-        geometry_msgs::PoseStamped pose;
+        double ned_x, ned_y, ned_z;  // 本地 NED 坐标（机间避障用）
         ros::Time last_update;
     };
     std::vector<NeighborUav> neighbors_;
+
+    // GPS 参考点（机间避障时将邻居 GPS 转本地 NED）
+    double ref_lat_;
+    double ref_lon_;
+    double ref_alt_;
 
     // 避障参数
     double avoidance_safe_distance_;
@@ -191,11 +196,18 @@ private:
     bool is_offboard_mode_;        // 是否已切换到 OFFBOARD
     double takeoff_altitude_;      // 起飞目标高度 (NED: z 向下为正)
     double takeoff_check_interval_;
+    double takeoff_stable_time_;   // 高度达标后稳定等待（秒）
+    double takeoff_hover_time_;    // 悬停等待（秒）
     ros::Time takeoff_start_time_;
     mavros_msgs::State current_mavros_state_;
     geometry_msgs::PoseStamped takeoff_setpoint_; // 起飞位置 setpoint
     std::atomic<bool> setpoint_running_{false};
     std::thread setpoint_thread_;
+    int takeoff_retry_count_;        // 起飞重试次数
+    int max_takeoff_retries_;        // 最大重试次数
+    double takeoff_retry_delay_;     // 重试延迟（秒）
+    ros::Time takeoff_failed_time_;  // 进入 FAILED 状态的时间
+    bool takeoff_failed_logged_;     // 是否已打印 FAILED 日志（避免重复刷屏）
 
 public:
     MissionManager() : nh_private_("~"),
@@ -218,7 +230,13 @@ public:
         is_offboard_mode_(false),
         takeoff_state_(TakeoffState::TAKEOFF_IDLE),
         takeoff_altitude_(50.0),
-        takeoff_check_interval_(0.5) {
+        takeoff_check_interval_(0.5),
+        takeoff_stable_time_(1.0),     // 高度达标后稳定 1 秒（原 2 秒）
+        takeoff_hover_time_(0.5),      // 悬停 0.5 秒（原 2 秒）
+        takeoff_retry_count_(0),
+        max_takeoff_retries_(3),
+        takeoff_retry_delay_(5.0),
+        takeoff_failed_logged_(false) {
 
         initParams();
         initSubscribers();
@@ -242,6 +260,14 @@ public:
         // 仿真/真机切换
         nh_private_.param<bool>("use_sim", use_sim_, true);
         nh_private_.param<double>("takeoff_altitude", takeoff_altitude_, 50.0);
+        nh_private_.param<int>("max_takeoff_retries", max_takeoff_retries_, 3);
+        nh_private_.param<double>("takeoff_retry_delay", takeoff_retry_delay_, 5.0);
+        nh_private_.param<double>("takeoff_stable_time", takeoff_stable_time_, 1.0);  // 高度达标后稳定时间
+        nh_private_.param<double>("takeoff_hover_time", takeoff_hover_time_, 0.5);    // 悬停等待时间
+        // GPS 参考点（仿真时所有 UAV 共享，PX4 SITL 时各 UAV 用各自的 home）
+        nh_private_.param<double>("ref_lat", ref_lat_, 36.096);
+        nh_private_.param<double>("ref_lon", ref_lon_, 114.392);
+        nh_private_.param<double>("ref_alt", ref_alt_, 100.0);
 
         // 根据 use_sim 设置 topic
         if (use_sim_) {
@@ -452,14 +478,28 @@ public:
 
     void otherUavPosesCallback(const geometry_msgs::PoseArray::ConstPtr& msg) {
         // 更新邻居无人机列表
+        // 接收的是 GPS: pose.position.x=lat, .y=lon, .z=alt
         neighbors_.clear();
         for (size_t i = 0; i < msg->poses.size(); ++i) {
             NeighborUav neighbor;
-            neighbor.pose.header = msg->header;
-            neighbor.pose.pose = msg->poses[i];
+            gpsToNed(msg->poses[i].position.x, msg->poses[i].position.y, msg->poses[i].position.z,
+                     neighbor.ned_x, neighbor.ned_y, neighbor.ned_z);
             neighbor.last_update = ros::Time::now();
             neighbors_.push_back(neighbor);
         }
+    }
+
+    /**
+     * GPS (WGS84) -> NED 坐标转换
+     */
+    void gpsToNed(double lat, double lon, double alt,
+                  double& ned_x, double& ned_y, double& ned_z) {
+        const double EARTH_R = 6378137.0;
+        double d_lat = lat - ref_lat_;
+        ned_x = d_lat * M_PI / 180.0 * EARTH_R;  // 北向
+        double d_lon = lon - ref_lon_;
+        ned_y = d_lon * M_PI / 180.0 * EARTH_R * cos(ref_lat_ * M_PI / 180.0);  // 东向
+        ned_z = -(alt - ref_alt_);  // 下向
     }
 
     void interUavTargetCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
@@ -612,7 +652,7 @@ public:
                 double current_alt = -current_pose_.pose.position.z;
                 if (current_alt >= takeoff_altitude_) {
                     double elapsed = (ros::Time::now() - takeoff_start_time_).toSec();
-                    if (elapsed > 2.0) {  // 稳定 2 秒
+                    if (elapsed > takeoff_stable_time_) {  // 高度稳定时间（ROS 参数）
                         takeoff_state_ = TakeoffState::TAKEOFF_HOVERING;
                         takeoff_start_time_ = ros::Time::now();
                         ROS_WARN("[MissionManager] Takeoff altitude reached, hovering...");
@@ -634,7 +674,7 @@ public:
             case TakeoffState::TAKEOFF_HOVERING: {
                 // 悬停一段时间后进入任务
                 double elapsed = (ros::Time::now() - takeoff_start_time_).toSec();
-                if (elapsed > 2.0) {
+                if (elapsed > takeoff_hover_time_) {  // 悬停等待时间（ROS 参数）
                     takeoff_state_ = TakeoffState::TAKEOFF_COMPLETE;
                     ROS_WARN("[MissionManager] ===== TAKEOFF COMPLETE! Ready for mission execution =====");
                     stopSetpointPublisher();
@@ -646,9 +686,33 @@ public:
                 // 起飞完成，等待任务模式
                 break;
 
-            case TakeoffState::TAKEOFF_FAILED:
-                ROS_ERROR("[MissionManager] Takeoff failed!");
+            case TakeoffState::TAKEOFF_FAILED: {
+                if (!takeoff_failed_logged_) {
+                    ROS_ERROR("[MissionManager] Takeoff failed! Retry %d / %d in %.1f s",
+                              takeoff_retry_count_, max_takeoff_retries_, takeoff_retry_delay_);
+                    takeoff_failed_time_ = ros::Time::now();
+                    takeoff_failed_logged_ = true;
+                }
+
+                // 等待重试延迟后复位
+                double failed_elapsed = (ros::Time::now() - takeoff_failed_time_).toSec();
+                if (failed_elapsed < takeoff_retry_delay_) {
+                    break;
+                }
+
+                if (takeoff_retry_count_ < max_takeoff_retries_) {
+                    // 重试：复位到 IDLE 重新跑整个起飞流程
+                    takeoff_retry_count_++;
+                    takeoff_failed_logged_ = false;
+                    takeoff_state_ = TakeoffState::TAKEOFF_IDLE;
+                    ROS_WARN("[MissionManager] Retrying takeoff sequence (attempt %d / %d)...",
+                             takeoff_retry_count_, max_takeoff_retries_);
+                } else {
+                    ROS_ERROR_THROTTLE(5.0, "[MissionManager] Takeoff failed after %d retries. Giving up.",
+                                       max_takeoff_retries_);
+                }
                 break;
+            }
         }
     }
 
@@ -657,15 +721,34 @@ public:
         if (setpoint_running_) {
             return;
         }
+        // 等待首次位置数据（确保使用当前 UAV 位置作为起飞起点）
+        int wait_count = 0;
+        while (!is_pose_received_ && ros::ok() && wait_count < 200) {  // 最多等 4 秒
+            ros::Duration(0.02).sleep();
+            wait_count++;
+        }
+        if (!is_pose_received_) {
+            ROS_WARN("[MissionManager] No pose received before setpoint publisher start, using default (0,0)");
+            // mavros/setpoint_position/local 期望 ENU，0,0 直接发即可
+            takeoff_setpoint_.pose.position.x = 0;
+            takeoff_setpoint_.pose.position.y = 0;
+        } else {
+            // current_pose_ 是 NED（来自 selfPoseCallback 的 ENU→NED 转换）
+            // mavros/setpoint_position/local 期望 ENU：x_east = y_ned, y_north = x_ned
+            takeoff_setpoint_.pose.position.x = current_pose_.pose.position.y;  // y_ned → x_enu (east)
+            takeoff_setpoint_.pose.position.y = current_pose_.pose.position.x;  // x_ned → y_enu (north)
+            ROS_INFO("[MissionManager] Takeoff setpoint start: x=%.2f, y=%.2f (ENU, from NED pos=%.2f,%.2f)",
+                     takeoff_setpoint_.pose.position.x, takeoff_setpoint_.pose.position.y,
+                     current_pose_.pose.position.x, current_pose_.pose.position.y);
+        }
+
+        // 初始低高度（ENU z up=正，直接用正值即可）
+        takeoff_setpoint_.pose.position.z = 0.5;
+        takeoff_setpoint_.header.frame_id = "map";
+
         setpoint_running_ = true;
         setpoint_thread_ = std::thread([this]() {
             ROS_INFO("[MissionManager] Setpoint publisher thread started");
-            // 初始化 setpoint
-            takeoff_setpoint_.header.frame_id = "map";
-            takeoff_setpoint_.pose.position.x = 0;
-            takeoff_setpoint_.pose.position.y = 0;
-            takeoff_setpoint_.pose.position.z = 0.5;  // 初始低高度
-
             ros::Rate rate(50);  // 50Hz
             while (ros::ok() && setpoint_running_) {
                 takeoff_setpoint_.header.stamp = ros::Time::now();
@@ -883,9 +966,9 @@ public:
 
         // 计算机间避障向量（人工势场法）
         for (const auto& neighbor : neighbors_) {
-            double dx = current_pose_.pose.position.x - neighbor.pose.pose.position.x;
-            double dy = current_pose_.pose.position.y - neighbor.pose.pose.position.y;
-            double dz = current_pose_.pose.position.z - neighbor.pose.pose.position.z;
+            double dx = current_pose_.pose.position.x - neighbor.ned_x;
+            double dy = current_pose_.pose.position.y - neighbor.ned_y;
+            double dz = current_pose_.pose.position.z - neighbor.ned_z;
             double dist = sqrt(dx*dx + dy*dy + dz*dz);
 
             if (dist < avoidance_safe_distance_ && dist > 0.1) {

@@ -28,8 +28,8 @@ class GroundStationSimulator:
         self.auto_pub = auto_pub
 
         # 发布者
-        self.mode_pub = rospy.Publisher('/gs/mode_cmd', std_msgs.msg.String, queue_size=10)
-        self.waypoint_pub = rospy.Publisher('/gs/waypoint_upload', nav_msgs.msg.Path, queue_size=10, latch=True)
+        self.mode_pub = rospy.Publisher('gs/mode_cmd', std_msgs.msg.String, queue_size=10)
+        self.waypoint_pub = rospy.Publisher('gs/waypoint_upload', nav_msgs.msg.Path, queue_size=10, latch=True)
 
         # 航点列表（测试用 - 方形航线）
         self.waypoints = self.create_test_waypoints()

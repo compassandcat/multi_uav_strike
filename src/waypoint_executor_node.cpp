@@ -61,6 +61,7 @@ private:
     ros::Subscriber self_pose_sub_;          // 本机位置（NED）
     ros::Subscriber other_uav_poses_sub_;    // 邻居无人机位置
     ros::Subscriber control_sub_;            // 控制命令（来自 mission_manager）
+    ros::Subscriber mission_mode_sub_;       // 工作模式（SEARCH_ONLY/SEARCH_TRACK/SEARCH_STRIKE/IDLE）
 
     // ============== 发布 ==============
     ros::Publisher setpoint_velocity_pub_;    // NED 速度指令
@@ -128,6 +129,16 @@ private:
     // 无人机编号（用于区分颜色）
     int uav_id_;
 
+    // 最后一个航点到位后是否已打印过日志（避免每周期刷屏）
+    bool last_waypoint_reached_logged_;
+
+    // 最后一个航点 P-controller 增益（用于位置保持，避免震荡）
+    double hold_kp_;
+
+    // 当前工作模式（SEARCH_ONLY/SEARCH_TRACK/SEARCH_STRIKE/IDLE）
+    // 只有 SEARCH_ONLY 模式下航点执行器才发控制指令，其他模式交给 guidance_control
+    std::string current_work_mode_;
+
 public:
     WaypointExecutor() : nh_private_("~"),
         current_waypoint_index_(0),
@@ -143,7 +154,10 @@ public:
         ref_lon_(ANYANG_LON),
         ref_alt_(ANYANG_ALT),
         use_sim_(true),
-        avoidance_safe_distance_(10.0) {
+        avoidance_safe_distance_(10.0),
+        last_waypoint_reached_logged_(false),
+        hold_kp_(0.8),
+        current_work_mode_("SEARCH_ONLY") {
 
         initParams();
         initSubscribers();
@@ -163,6 +177,8 @@ public:
         nh_private_.param<int>("flight_mode_velocity", flight_mode_velocity_, 0);
         nh_private_.param<int>("flight_mode_position", flight_mode_position_, 2);
         nh_private_.param<double>("avoidance_safe_distance", avoidance_safe_distance_, 10.0);
+        // 最后一个航点位置保持的 P-controller 增益（1m 误差 → kp m/s）
+        nh_private_.param<double>("hold_kp", hold_kp_, 0.8);
 
         // 自动从命名空间获取 uav_id（如 ns="uav0" → id=0）
         std::string ns = ros::this_node::getNamespace();
@@ -213,6 +229,12 @@ public:
         control_sub_ = nh_.subscribe(
             "waypoint_executor/control", 10,
             &WaypointExecutor::controlCallback, this);
+
+        // 工作模式（来自 mission_manager 转发的地面站指令）
+        // 只有 SEARCH_ONLY 模式下航点执行器才发控制指令
+        mission_mode_sub_ = nh_.subscribe(
+            "mission/mode", 10,
+            &WaypointExecutor::missionModeCallback, this);
     }
 
     void initPublishers() {
@@ -308,6 +330,7 @@ public:
         current_waypoint_index_ = 0;
         is_waypoints_received_ = true;
         is_executing_ = true;
+        last_waypoint_reached_logged_ = false;
 
         // 发布航点给 RViz 显示
         publishWaypointsForRviz();
@@ -317,10 +340,22 @@ public:
     }
 
     void selfPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
-        // 飞控返回的是 NED 坐标系
-        current_ned_x_ = msg->pose.position.x;
-        current_ned_y_ = msg->pose.position.y;
-        current_ned_z_ = msg->pose.position.z;
+        // 注意：根据 use_sim 区分输入坐标系
+        //   - use_sim_=true  (jMAVSim):  /quad/pose 直接是 NED
+        //   - use_sim_=false (PX4 SITL): /mavros/local_position/pose 是 ENU (REP-103)
+        //                                必须先 ENU -> NED，否则后续 NED 减法/算速度全错
+        if (use_sim_) {
+            current_ned_x_ = msg->pose.position.x;
+            current_ned_y_ = msg->pose.position.y;
+            current_ned_z_ = msg->pose.position.z;
+        } else {
+            // ENU -> NED: x_ned = y_enu, y_ned = x_enu, z_ned = -z_enu
+            //   ENU: x=East,  y=North, z=Up
+            //   NED: x=North, y=East, z=Down
+            current_ned_x_ = msg->pose.position.y;   // ENU y (north) -> NED x
+            current_ned_y_ = msg->pose.position.x;   // ENU x (east)  -> NED y
+            current_ned_z_ = -msg->pose.position.z;  // ENU z (up)    -> NED z
+        }
 
         // 从四元数提取偏航角（NED，北偏东）
         // NED坐标系下：yaw = atan2(2*(w*z + x*y), 1 - 2*(y^2 + z^2))
@@ -342,9 +377,10 @@ public:
         neighbors_.clear();
         for (const auto& pose : msg->poses) {
             NeighborUav neighbor;
-            neighbor.ned_x = pose.position.x;
-            neighbor.ned_y = pose.position.y;
-            neighbor.ned_z = pose.position.z;
+            // 接收的是 GPS: pose.position.x=lat, .y=lon, .z=alt
+            // 转换为本地 NED
+            gpsToNed(pose.position.x, pose.position.y, pose.position.z,
+                     neighbor.ned_x, neighbor.ned_y, neighbor.ned_z);
             neighbors_.push_back(neighbor);
         }
     }
@@ -356,11 +392,44 @@ public:
             return;
         }
 
+        // 只有 SEARCH_ONLY 模式下才发航点控制指令
+        // 其他模式（SEARCH_TRACK/SEARCH_STRIKE/IDLE）由 guidance_control_node 接管
+        if (current_work_mode_ != "SEARCH_ONLY") {
+            return;
+        }
+
         if (!is_executing_ || !is_waypoints_received_) {
             return;
         }
 
         executeWaypointFlight();
+    }
+
+    // ============== 模式回调 ==============
+
+    void missionModeCallback(const std_msgs::String::ConstPtr& msg) {
+        std::string new_mode = msg->data;
+        if (new_mode == current_work_mode_) {
+            return;
+        }
+        ROS_WARN("[WaypointExecutor] Work mode changed: %s -> %s",
+                 current_work_mode_.c_str(), new_mode.c_str());
+        current_work_mode_ = new_mode;
+
+        // 切出 SEARCH_ONLY 模式时，立即停发指令并清空航点，避免与 guidance_control 抢控制权
+        if (new_mode != "SEARCH_ONLY") {
+            if (is_executing_) {
+                ROS_WARN("[WaypointExecutor] Not SEARCH_ONLY anymore, pausing waypoint control");
+            }
+            is_executing_ = false;
+            waypoint_queue_.clear();
+            publishZeroVelocity();
+        } else {
+            // 切回 SEARCH_ONLY：等新的 waypoint_cmd 到来再继续，不要自动 resume 旧航点
+            is_executing_ = false;
+            is_waypoints_received_ = false;
+            last_waypoint_reached_logged_ = false;
+        }
     }
 
     // ============== 执行逻辑 ==============
@@ -406,16 +475,30 @@ public:
 
         if (dist < arrival_threshold_) {
             waypoint_queue_[current_waypoint_index_].reached = true;
-            ROS_WARN("[WaypointExecutor] ===== Waypoint %zu reached! =====", current_waypoint_index_);
-            current_waypoint_index_++;
-            publishZeroVelocity();
-            return;
+
+            bool is_last = (current_waypoint_index_ == waypoint_queue_.size() - 1);
+            if (is_last) {
+                // 最后一个航点：不递增 index，持续发送速度指令维持位置
+                // 否则 SITL 会因为停止 setpoint 进入 RTL/降落。
+                if (!last_waypoint_reached_logged_) {
+                    ROS_WARN("[WaypointExecutor] ===== Last waypoint %zu reached, holding position =====",
+                             current_waypoint_index_);
+                    last_waypoint_reached_logged_ = true;
+                }
+                // 不 return，落到下面的速度计算（用 P-controller）
+            } else {
+                ROS_WARN("[WaypointExecutor] ===== Waypoint %zu reached! =====", current_waypoint_index_);
+                current_waypoint_index_++;
+                publishZeroVelocity();
+                return;
+            }
         }
 
-        // 计算速度指令
+        // 计算速度指令（最后一个航点用 P-controller 维持位置，避免震荡）
+        bool is_last = (current_waypoint_index_ == waypoint_queue_.size() - 1);
         double vx, vy, vz;
         computeVelocityCommand(current_wp.ned_x, current_wp.ned_y, current_wp.ned_z,
-                              vx, vy, vz);
+                              vx, vy, vz, is_last);
 
         // 机间避障（人工势场）
         applyInterUavAvoidance(vx, vy, vz);
@@ -430,16 +513,24 @@ public:
     }
 
     void computeVelocityCommand(double target_x, double target_y, double target_z,
-                                double& vx, double& vy, double& vz) {
+                                double& vx, double& vy, double& vz,
+                                bool position_hold = false) {
         double dx = target_x - current_ned_x_;
         double dy = target_y - current_ned_y_;
         double dz = target_z - current_ned_z_;
         double dist = sqrt(dx*dx + dy*dy + dz*dz);
 
         if (dist > 0.1) {
-            vx = (dx / dist) * uav_speed_;
-            vy = (dy / dist) * uav_speed_;
-            vz = (dz / dist) * uav_speed_;
+            if (position_hold) {
+                // 最后一个航点用 P-controller：速度 ∝ 距离，距离 → 0 速度 → 0，避免震荡
+                vx = hold_kp_ * dx;
+                vy = hold_kp_ * dy;
+                vz = hold_kp_ * dz;
+            } else {
+                vx = (dx / dist) * uav_speed_;
+                vy = (dy / dist) * uav_speed_;
+                vz = (dz / dist) * uav_speed_;
+            }
         } else {
             vx = vy = vz = 0.0;
         }
