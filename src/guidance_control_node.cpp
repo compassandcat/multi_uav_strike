@@ -500,10 +500,12 @@ public:
         switch (current_strategy_type_) {
             case multi_uav_strike::GuidanceStrategyType::INTERCEPT: {
 
-                // Set flight mode to velocity
-                std_msgs::Int16 mode_msg;
-                mode_msg.data = flight_mode_velocity_;
-                flight_mode_pub_.publish(mode_msg);
+                // Set flight mode to velocity (仅仿真模式发布；PX4 SITL 由 mission_manager 通过 mavros/set_mode 切换)
+                if (use_sim_) {
+                    std_msgs::Int16 mode_msg;
+                    mode_msg.data = flight_mode_velocity_;
+                    flight_mode_pub_.publish(mode_msg);
+                }
 
                 geometry_msgs::Twist vel_cmd;
                 if (current_mode_ == "track") {
@@ -775,10 +777,12 @@ public:
         thrust_cmd.data = cmd.thrust;
         thrust_cmd_pub_.publish(thrust_cmd);
 
-        // Set flight mode to attitude
-        std_msgs::Int16 mode_msg;
-        mode_msg.data = flight_mode_attitude_;
-        flight_mode_pub_.publish(mode_msg);
+        // Set flight mode to attitude (仅仿真模式发布；PX4 SITL 由 mission_manager 通过 mavros/set_mode 切换)
+        if (use_sim_) {
+            std_msgs::Int16 mode_msg;
+            mode_msg.data = flight_mode_attitude_;
+            flight_mode_pub_.publish(mode_msg);
+        }
 
         // Publish angular velocity (yaw_rate) via setpoint_attitude/cmd_vel
         geometry_msgs::TwistStamped vel_cmd;

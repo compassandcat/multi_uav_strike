@@ -27,14 +27,14 @@
   <arg name="uav_name" default="uav0" />
 
   <!-- Set GeographicLib data path -->
-  <env name="GEOGRAPHICLIB_DATA" value="$(env HOME)/.GeographicLib" />
+  <!-- <env name="GEOGRAPHICLIB_DATA" value="$(env HOME)/.GeographicLib" /> -->
 
   <!-- ====================================================================== -->
   <!-- 1. MAVROS + PX4 SITL                                                  -->
   <!-- ====================================================================== -->
   <group ns="$(arg uav_name)">
     <include file="$(find mavros)/launch/px4.launch">
-      <arg name="fcu_url" value="udp://:14540@127.0.0.1:14580" />
+      <arg name="fcu_url" value="/dev/ttyAMA0:921600" />
       <arg name="tgt_system" value="1" />
     </include>
   </group>
@@ -91,7 +91,7 @@
           pkg="multi_uav_strike"
           type="guidance_control_node"
           output="screen"
-          respawn="false">
+          respawn="true">
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
