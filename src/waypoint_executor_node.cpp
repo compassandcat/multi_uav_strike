@@ -473,10 +473,11 @@ public:
                           current_waypoint_index_, waypoint_queue_.size(), dist,
                           desired_yaw_ned * 180.0 / M_PI);
 
+        bool is_last = (current_waypoint_index_ == waypoint_queue_.size() - 1);
+
         if (dist < arrival_threshold_) {
             waypoint_queue_[current_waypoint_index_].reached = true;
 
-            bool is_last = (current_waypoint_index_ == waypoint_queue_.size() - 1);
             if (is_last) {
                 // 最后一个航点：不递增 index，持续发送速度指令维持位置
                 // 否则 SITL 会因为停止 setpoint 进入 RTL/降落。
@@ -485,7 +486,7 @@ public:
                              current_waypoint_index_);
                     last_waypoint_reached_logged_ = true;
                 }
-                // 不 return，落到下面的速度计算（用 P-controller）
+                // 不 return，落到下面的速度计算（此时 reached=true → P-controller 位置保持）
             } else {
                 ROS_WARN("[WaypointExecutor] ===== Waypoint %zu reached! =====", current_waypoint_index_);
                 current_waypoint_index_++;
@@ -494,11 +495,14 @@ public:
             }
         }
 
-        // 计算速度指令（最后一个航点用 P-controller 维持位置，避免震荡）
-        bool is_last = (current_waypoint_index_ == waypoint_queue_.size() - 1);
+        // 计算速度指令：
+        //   - 接近最后一个航点（is_last && !reached）：按巡航速度 uav_speed_ 飞过去（恒速，不放大）
+        //   - 已到达最后一个航点（is_last &&  reached）：切到 P-controller，缓慢收敛到 0，避免震荡
+        //   - 中间航点：按巡航速度飞（恒速）
+        bool position_hold = is_last && current_wp.reached;
         double vx, vy, vz;
         computeVelocityCommand(current_wp.ned_x, current_wp.ned_y, current_wp.ned_z,
-                              vx, vy, vz, is_last);
+                              vx, vy, vz, position_hold);
 
         // 机间避障（人工势场）
         applyInterUavAvoidance(vx, vy, vz);

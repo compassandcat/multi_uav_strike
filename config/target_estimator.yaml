@@ -1,5 +1,6 @@
 # ============================================================================
-# target_estimator_node 参数（粒子滤波）
+# target_estimator_node 专属参数（粒子滤波）
+# 共享参数（use_sim）在 common.yaml 中定义，由 launch 加载。
 # ============================================================================
 num_particles: 500              # 粒子数量
 init_dist_std_dev: 1.0          # 初始距离标准差
@@ -18,5 +19,5 @@ est_marker_r: 1.0               # 估计标记颜色 R
 est_marker_g: 0.0               # 估计标记颜色 G
 est_marker_b: 0.0               # 估计标记颜色 B
 est_marker_a: 1.0               # 估计标记透明度
-use_sim: false                  # 仿真/真机切换
-bypass_pf: true                # 旁路开关：true 时跳过粒子滤波，直接用 LOS+UAV高度 解算目标位置
+# 旁路开关：true 时跳过粒子滤波，直接用 LOS+UAV高度 解算目标位置
+bypass_pf: true

@@ -23,7 +23,7 @@
   <!-- ====================================================================== -->
   <!-- 命令行可覆盖参数                                                         -->
   <!-- ====================================================================== -->
-  <arg name="mode" default="SEARCH_TRACK" />
+  <arg name="mode" default="SEARCH_ONLY" />
   <arg name="uav_name" default="uav0" />
 
   <!-- Set GeographicLib data path -->
@@ -126,8 +126,6 @@
           respawn="false">
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
-      <rosparam command="load"
-                file="$(find multi_uav_strike)/config/comm.yaml" />
       <param name="uav_name" value="$(arg uav_name)" />
     </node>
   </group>
@@ -160,6 +158,8 @@
         launch-prefix="bash -c 'sleep 2; $@' --" >
     <param name="mode" value="$(arg mode)" />
     <param name="auto_pub" value="true" />
+    <rosparam command="load"
+                file="$(find multi_uav_strike)/config/common.yaml" />
   </node>
 
   <!-- ====================================================================== -->
