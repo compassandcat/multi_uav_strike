@@ -55,6 +55,13 @@ private:
     double target_z_weight_;       // 高度误差的权重（控制高度约束的强度）
     double angle_error_dist_gain_; // 角度误差的距离惩罚系数（放大远距粒子的角度误差）
 
+    // 仿真/真机切换
+    bool use_sim_;
+    std::string uav_pose_topic_;
+
+    // 旁路开关：true 时跳过粒子滤波，直接用 LOS+UAV高度 解算目标位置并发布
+    bool bypass_pf_;
+
     // 新增：估计目标marker颜色参数（launch可配置）
     double est_marker_r_;    // 红色通道 [0,1]
     double est_marker_g_;    // 绿色通道 [0,1]
@@ -106,12 +113,22 @@ public:
         est_marker_b_ = std::max(0.0, std::min(1.0, est_marker_b_));
         est_marker_a_ = std::max(0.0, std::min(1.0, est_marker_a_));
 
+        // 仿真/真机切换
+        n_param.param<bool>("use_sim", use_sim_, true);
+        if (use_sim_) {
+            uav_pose_topic_ = "quad/pose";
+        } else {
+            uav_pose_topic_ = "mavros/local_position/pose";
+        }
+        // 旁路开关：true 时跳过粒子滤波，直接用 LOS+UAV高度 解算
+        n_param.param<bool>("bypass_pf", bypass_pf_, false);
+
         unsigned int seed = std::chrono::system_clock::now().time_since_epoch().count();
         rng_.seed(seed);
         normal_dist_ = std::normal_distribution<double>(0.0, 1.0);
 
         gimbal_los_sub_ = nh_.subscribe("target_los_angle", 10, &TargetEstimator::gimbalLosCallback, this);
-        uav_pose_sub_ = nh_.subscribe("quad/pose", 10, &TargetEstimator::uavPoseCallback, this);
+        uav_pose_sub_ = nh_.subscribe(uav_pose_topic_, 10, &TargetEstimator::uavPoseCallback, this);
         real_target_sub_ = nh_.subscribe("/target_position", 10, &TargetEstimator::realTargetCallback, this);
 
         target_est_marker_pub_ = nh_.advertise<visualization_msgs::Marker>("target_estimated_marker", 10);
@@ -126,7 +143,7 @@ public:
                  num_particles_, init_dist_std_dev_, process_noise_std_dev_, observation_noise_std_dev_);
         ROS_INFO("New Params: dist_prior=%.2f, vel_consistency=%.2f",
                  dist_prior_weight_, vel_consistency_weight_);
-        ROS_INFO("Subscribed to: target_los=%s, uav_pose=%s", "/target_los_angle", "/quad/pose");
+        ROS_INFO("Subscribed to: target_los=%s, uav_pose=%s", "/target_los_angle", uav_pose_topic_.c_str());
         ROS_INFO("Publishing to: target_est_marker=%s, particles=%s, target_est_pose=%s",
                  "/target_estimated_marker", "/particles_marker_array", "/target_estimated_pose");
         ROS_INFO("Anti-collapse Params: target_z_prior=%.2fm, z_weight=%.2f, angle_dist_gain=%.3f",
@@ -144,16 +161,31 @@ public:
     }
 
     void uavPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
-        // ===== NED → NWU 坐标转换 =====
-        current_uav_pose_.pose.position.x = msg->pose.position.x;
-        current_uav_pose_.pose.position.y = -msg->pose.position.y;
-        current_uav_pose_.pose.position.z = -msg->pose.position.z;
+        if (use_sim_) {
+            // ===== NED → NWU 坐标转换 =====
+            current_uav_pose_.pose.position.x = msg->pose.position.x;
+            current_uav_pose_.pose.position.y = -msg->pose.position.y;
+            current_uav_pose_.pose.position.z = -msg->pose.position.z;
 
-        // 四元数：w,x不变, y,z取反 (等价于绕X轴旋转180度)
-        current_uav_pose_.pose.orientation.w = msg->pose.orientation.w;
-        current_uav_pose_.pose.orientation.x = msg->pose.orientation.x;
-        current_uav_pose_.pose.orientation.y = -msg->pose.orientation.y;
-        current_uav_pose_.pose.orientation.z = -msg->pose.orientation.z;
+            // 四元数：w,x不变, y,z取反 (等价于绕X轴旋转180度)
+            current_uav_pose_.pose.orientation.w = msg->pose.orientation.w;
+            current_uav_pose_.pose.orientation.x = msg->pose.orientation.x;
+            current_uav_pose_.pose.orientation.y = -msg->pose.orientation.y;
+            current_uav_pose_.pose.orientation.z = -msg->pose.orientation.z;
+        } else {
+            // ===== ENU → NED → NWU =====
+            // Mavros 输入是 ENU: X=East, Y=North, Z=Up
+            // 合成 ENU -> NWU: x = y_enu, y = -x_enu, z = z_enu
+            current_uav_pose_.pose.position.x = msg->pose.position.y;
+            current_uav_pose_.pose.position.y = -msg->pose.position.x;
+            current_uav_pose_.pose.position.z = msg->pose.position.z;
+
+            // 四元数: ENU->NED (180°绕X) + NED->NWU (180°绕X) = 恒等
+            current_uav_pose_.pose.orientation.w = msg->pose.orientation.w;
+            current_uav_pose_.pose.orientation.x = msg->pose.orientation.x;
+            current_uav_pose_.pose.orientation.y = -msg->pose.orientation.y;
+            current_uav_pose_.pose.orientation.z = -msg->pose.orientation.z;
+        }
 
         current_uav_pose_.header.stamp = msg->header.stamp;
         current_uav_pose_.header.frame_id = msg->header.frame_id;
@@ -169,6 +201,34 @@ public:
     void pfLoopCallback(const ros::TimerEvent&) {
         if (!is_los_received_ || !is_uav_pose_received_) {
             ROS_WARN_THROTTLE(1.0, "Waiting for gimbal LOS or UAV pose data...");
+            return;
+        }
+
+        // 旁路模式：跳过粒子滤波，直接用 LOS+UAV 几何解算目标位置并发布。
+        // 公式与 initializeParticles() 一致，避免坐标/符号重写引入误差。
+        if (bypass_pf_) {
+            double tx, ty, tz;
+            if (computeLosTargetPosition(tx, ty, tz)) {
+                estimated_target_pose_.pose.position.x = tx;
+                estimated_target_pose_.pose.position.y = ty;
+                estimated_target_pose_.pose.position.z = tz;
+                estimated_target_pose_.pose.orientation.w = 1.0;
+                estimated_target_pose_.pose.orientation.x = 0.0;
+                estimated_target_pose_.pose.orientation.y = 0.0;
+                estimated_target_pose_.pose.orientation.z = 0.0;
+                estimated_target_pose_.header.stamp = ros::Time::now();
+                estimated_target_pose_.header.frame_id = "map";
+
+                estimated_target_velocity_.twist.linear.x = 0.0;
+                estimated_target_velocity_.twist.linear.y = 0.0;
+                estimated_target_velocity_.twist.linear.z = 0.0;
+                estimated_target_velocity_.header.stamp = ros::Time::now();
+                estimated_target_velocity_.header.frame_id = "map";
+
+                publishEstimatedTargetMarker();
+                publishEstimatedTargetPose();
+                publishEstimatedTargetTwist();
+            }
             return;
         }
 
@@ -221,38 +281,60 @@ public:
         }
     }
 
+    /**
+     * 根据视线角 + UAV 当前位置直接计算目标位置（NWU，z 取 target_z_prior_）。
+     * 公式与 initializeParticles() 保持一致：
+     *   init_dist = uav_z / |sin(pitch)|
+     *   target_x = uav_x + init_dist * cos(pitch) * cos(yaw)
+     *   target_y = uav_y + init_dist * cos(pitch) * sin(yaw)
+     *   target_z = target_z_prior_
+     * 同样对距离做 max_init_dist 截断。
+     * 失败（pitch 太小）返回 false。
+     */
+    bool computeLosTargetPosition(double& target_x, double& target_y, double& target_z) {
+        double uav_x = current_uav_pose_.pose.position.x;
+        double uav_y = current_uav_pose_.pose.position.y;
+        double uav_z = current_uav_pose_.pose.position.z;
+        double pitch = current_los_angle_.y;
+        double yaw = current_los_angle_.x;
+
+        if (fabs(sin(pitch)) < 0.01) {
+            return false;
+        }
+
+        double dist = uav_z / fabs(sin(pitch));
+        const double max_dist = 1000.0;
+        if (dist > max_dist) {
+            dist = max_dist;
+        }
+
+        target_x = uav_x + dist * cos(pitch) * cos(yaw);
+        target_y = uav_y + dist * cos(pitch) * sin(yaw);
+        target_z = target_z_prior_;
+        return true;
+    }
+
     void initializeParticles() {
         particles_.clear();
         particles_.reserve(num_particles_);
 
-        double uav_x = current_uav_pose_.pose.position.x;
-        double uav_y = current_uav_pose_.pose.position.y;
-        double uav_z = current_uav_pose_.pose.position.z;
-
-        double pitch = current_los_angle_.y;
-        double yaw = current_los_angle_.x;
-
-        // 检查pitch是否过小，避免距离计算发散
-        if (fabs(sin(pitch)) < 0.01) {
-            ROS_ERROR("[INIT] Pitch too small (%.4f), cannot calculate init distance!", pitch);
+        double target_x_init, target_y_init, target_z_init;
+        if (!computeLosTargetPosition(target_x_init, target_y_init, target_z_init)) {
+            ROS_ERROR("[INIT] Pitch too small (%.4f), cannot calculate init distance!", current_los_angle_.y);
             return;
         }
 
+        double uav_x = current_uav_pose_.pose.position.x;
+        double uav_y = current_uav_pose_.pose.position.y;
+        double uav_z = current_uav_pose_.pose.position.z;
+        double pitch = current_los_angle_.y;
+        double yaw = current_los_angle_.x;
         double init_dist = uav_z / fabs(sin(pitch));
-
-        // 添加最大初始化距离限制，避免gimbal未锁定时产生巨大距离
-        double max_init_dist = 1000.0;  // 最大1000米，对于地面目标足够
-        if (init_dist > max_init_dist) {
-            ROS_WARN("[INIT] Init dist (%.2f) > max (%.2f), using default range", init_dist, max_init_dist);
-            init_dist = max_init_dist;
-        }
+        const double max_init_dist = 1000.0;
+        if (init_dist > max_init_dist) init_dist = max_init_dist;
 
         ROS_WARN("[INIT] UAV: (%.2f, %.2f, %.2f), yaw=%.2f, pitch=%.2f, dist=%.2f",
                  uav_x, uav_y, uav_z, yaw, pitch, init_dist);
-
-        double target_x_init = uav_x + init_dist * cos(pitch) * cos(yaw);
-        double target_y_init = uav_y + init_dist * cos(pitch) * sin(yaw);
-        double target_z_init = target_z_prior_; // 优先使用目标高度先验
         ROS_WARN("[INIT] Target init: (%.2f, %.2f, %.2f)", target_x_init, target_y_init, target_z_init);
 
         for (int i = 0; i < num_particles_; ++i) {

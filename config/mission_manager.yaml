@@ -1,0 +1,15 @@
+# ============================================================================
+# mission_manager_node 专属参数
+# 共享参数（use_sim / ref_lat/lon/alt / avoidance_safe_distance /
+#          strike_distance_threshold / takeoff_*）
+# 已在 common.yaml 中定义，由 launch 加载到本节点的私有命名空间。
+# ============================================================================
+
+mission_loop_rate: 50.0
+low_speed_threshold: 12.0
+target_lock_confidence: 0.7
+spiral_approach_duration: 10.0
+spiral_approach_radius: 20.0
+# 起飞高度达标后的等待时间（缩短起飞流程用）
+takeoff_stable_time: 1.0     # 高度达标后稳定时间（秒）
+takeoff_hover_time: 0.5      # 悬停等待时间（秒）

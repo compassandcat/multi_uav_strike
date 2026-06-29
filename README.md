@@ -17,6 +17,25 @@ cd ~/catkin_ws
 catkin_make --pkg multi_uav_strike
 ```
 
+## Deployment on a New Board (e.g. rk3588)
+Before building, install the required ROS dependencies and copy the MAVROS geographic lib data:
+
+```bash
+# ROS dependencies
+apt-get install ros-noetic-tf
+apt-get install ros-noetic-eigen-conversions
+apt-get install ros-noetic-mavros*
+
+# Ensure 'localhost' resolves (required by some ROS nodes)
+echo "127.0.0.1 localhost" >> /etc/hosts
+
+# Copy the egm96-5.pgm geoid file into the GeographicLib share dir
+# (assumes the MAVROS environment runs inside a docker container named 'rk3588_ros')
+docker cp egm96-5.pgm rk3588_ros:/usr/share/GeographicLib/geoids/egm96-5.pgm
+```
+
+Note: download the egm96-5.pgm beforehand from https://sourceforge.net/projects/geographiclib/files/geoids/egm96-5.pgm/download
+
 ## File Structure
 ```
 ├── launch/               # Simulation launch files

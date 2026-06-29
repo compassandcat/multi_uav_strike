@@ -30,6 +30,9 @@ private:
     std::string uav_pose_topic_;       // 无人机pose话题名，默认"/uav_pose"
     double loop_freq_;                 // 控制循环频率，默认100Hz
 
+    // 仿真/真机切换
+    bool use_sim_;
+
     // 图像识别噪声参数
     double image_noise_std_dev_;        // 噪声标准差（单位：m，控制抖动幅度，作为ROS参数输入）
     std::default_random_engine rng_;    // 随机数引擎
@@ -65,6 +68,16 @@ public:
         // 读取噪声参数（默认无噪声）
         n_param.param<double>("image_noise_std_dev", image_noise_std_dev_, 0.0);
 
+        // 仿真/真机切换
+        n_param.param<bool>("use_sim", use_sim_, true);
+
+        // 根据 use_sim 设置无人机位姿 topic
+        if (use_sim_) {
+            uav_pose_topic_ = "quad/pose";
+        } else {
+            uav_pose_topic_ = "mavros/local_position/pose";
+        }
+
         // 初始化随机数引擎（用系统时间做种子，保证每次运行噪声不同）
         rng_.seed(std::chrono::system_clock::now().time_since_epoch().count());
         // 初始化高斯噪声分布（均值0，标准差为配置的参数）
@@ -75,7 +88,7 @@ public:
 
         // 3. 创建订阅者
         target_sub_ = nh_.subscribe("/target_position", 10, &GimbalSimulator::targetCallback, this);
-        uav_pose_sub_ = nh_.subscribe("quad/pose", 10, &GimbalSimulator::uavPoseCallback, this);
+        uav_pose_sub_ = nh_.subscribe(uav_pose_topic_, 10, &GimbalSimulator::uavPoseCallback, this);
 
         // 4. 创建发布者
         los_angle_pub_ = nh_.advertise<geometry_msgs::Point>("target_los_angle", 10);
@@ -87,7 +100,8 @@ public:
         // ========== 修改1：修正ROS_INFO的变量名笔误 ==========
         ROS_INFO("Params: image=%dx%d, FOV=%.1f deg, P-gain=%.2f, max_yaw_rate=%.2f rad/s, max_pitch_rate=%.2f rad/s",
                  image_width_, image_height_, fov_deg_, gimbal_p_gain_, max_yaw_rate_, max_pitch_rate_);
-        ROS_INFO("Subscribed to: target=%s, uav_pose=quad/pose", "/target_position");
+        ROS_INFO("Mode: %s, Subscribed to: target=%s, uav_pose=%s",
+                 use_sim_ ? "SIMULATION" : "PX4 SITL", "/target_position", uav_pose_topic_.c_str());
         ROS_INFO("Publishing to: los_angle=%s, gimbal_pose=%s", "/target_los_angle", "/gimbal_pose");
     }
 
@@ -102,16 +116,31 @@ public:
 
     // 无人机位姿回调函数
     void uavPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
-        // ===== NED → NWU 坐标转换 =====
-        current_uav_pose_.pose.position.x = msg->pose.position.x;
-        current_uav_pose_.pose.position.y = -msg->pose.position.y;
-        current_uav_pose_.pose.position.z = -msg->pose.position.z;
+        if (use_sim_) {
+            // ===== NED → NWU 坐标转换 =====
+            current_uav_pose_.pose.position.x = msg->pose.position.x;
+            current_uav_pose_.pose.position.y = -msg->pose.position.y;
+            current_uav_pose_.pose.position.z = -msg->pose.position.z;
 
-        // 四元数：w,x不变, y,z取反 (等价于绕X轴旋转180度)
-        current_uav_pose_.pose.orientation.w = msg->pose.orientation.w;
-        current_uav_pose_.pose.orientation.x = msg->pose.orientation.x;
-        current_uav_pose_.pose.orientation.y = -msg->pose.orientation.y;
-        current_uav_pose_.pose.orientation.z = -msg->pose.orientation.z;
+            // 四元数：w,x不变, y,z取反 (等价于绕X轴旋转180度)
+            current_uav_pose_.pose.orientation.w = msg->pose.orientation.w;
+            current_uav_pose_.pose.orientation.x = msg->pose.orientation.x;
+            current_uav_pose_.pose.orientation.y = -msg->pose.orientation.y;
+            current_uav_pose_.pose.orientation.z = -msg->pose.orientation.z;
+        } else {
+            // ===== ENU → NED → NWU =====
+            // Mavros 输入是 ENU: X=East, Y=North, Z=Up
+            // 合成 ENU -> NWU: x = y_enu, y = -x_enu, z = z_enu
+            current_uav_pose_.pose.position.x = msg->pose.position.y;
+            current_uav_pose_.pose.position.y = -msg->pose.position.x;
+            current_uav_pose_.pose.position.z = msg->pose.position.z;
+
+            // 四元数: ENU->NED (180°绕X) + NED->NWU (180°绕X) = 恒等
+            current_uav_pose_.pose.orientation.w = msg->pose.orientation.w;
+            current_uav_pose_.pose.orientation.x = msg->pose.orientation.x;
+            current_uav_pose_.pose.orientation.y = -msg->pose.orientation.y;
+            current_uav_pose_.pose.orientation.z = -msg->pose.orientation.z;
+        }
 
         current_uav_pose_.header.stamp = msg->header.stamp;
         current_uav_pose_.header.frame_id = msg->header.frame_id;

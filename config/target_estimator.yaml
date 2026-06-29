@@ -1,0 +1,23 @@
+# ============================================================================
+# target_estimator_node 专属参数（粒子滤波）
+# 共享参数（use_sim）在 common.yaml 中定义，由 launch 加载。
+# ============================================================================
+num_particles: 500              # 粒子数量
+init_dist_std_dev: 1.0          # 初始距离标准差
+process_noise_std_dev: 0.2      # 过程噪声标准差
+observation_noise_std_dev: 0.1  # 观测噪声标准差
+min_confidence: 0.2             # 最小置信度阈值
+pf_loop_freq: 50.0              # 粒子滤波循环频率（Hz）
+uav_height_for_init: 10.0       # UAV 高度用于初始化
+dist_prior_weight: 0.3          # 距离先验权重
+optimal_observe_dist: 20.0      # 最优观测距离（米）
+vel_consistency_weight: 0.3     # 速度一致性权重
+target_z_prior: 0.0             # 目标 z 高度先验（地面目标 = 0）
+target_z_weight: 0.1            # 目标 z 高度权重
+angle_error_dist_gain: 0.01     # 角度误差距离增益
+est_marker_r: 1.0               # 估计标记颜色 R
+est_marker_g: 0.0               # 估计标记颜色 G
+est_marker_b: 0.0               # 估计标记颜色 B
+est_marker_a: 1.0               # 估计标记透明度
+# 旁路开关：true 时跳过粒子滤波，直接用 LOS+UAV高度 解算目标位置
+bypass_pf: true

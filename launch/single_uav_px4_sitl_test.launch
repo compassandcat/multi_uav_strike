@@ -1,0 +1,176 @@
+<?xml version="1.0"?>
+<!--
+  single_uav_px4_sitl_test.launch
+  单机 PX4 SITL 测试 launch
+
+  使用方法：
+  1. 先启动 PX4 SITL: ./src/PX4_Firmware/Tools/sitl_dual_run.sh
+  2. 再启动此 launch: roslaunch multi_uav_strike single_uav_px4_sitl_test.launch
+
+  参数组织：
+  - 跨节点共享参数：config/common.yaml（每个节点都加载一次）
+  - 各节点专属参数：config/<node_name>.yaml（平铺结构，键名与 C++ 完全一致）
+  - 命令行可覆盖参数：本文件顶部 <arg>
+
+  加载机制：
+  <rosparam command="load" file="..." /> 在 <node> 内部时，参数会被加载到该节点的
+  私有命名空间（/<ns>/<node_name>/），正好是 nh_private_.param 的查找路径。
+  关键：YAML 必须是平铺结构，不能有嵌套 group，否则会出现双层前缀
+  （如 <rosparam ns="gimbal" /> 加上 YAML 里的 gimbal: 嵌套，会变成
+   /<ns>/<node>/gimbal/gimbal/<key>，C++ 找不到）。
+-->
+<launch>
+  <!-- ====================================================================== -->
+  <!-- 命令行可覆盖参数                                                         -->
+  <!-- ====================================================================== -->
+  <!-- 默认 IDLE：飞机在地面等待，不会自动起飞。
+       切换流程示例：
+         rostopic pub -1 /gs/mode_cmd std_msgs/String "TAKEOFF"     # 起飞
+         rostopic pub -1 /gs/mode_cmd std_msgs/String "SEARCH_ONLY"  # 起飞后开始航点飞行
+  -->
+  <arg name="mode" default="IDLE" />
+  <arg name="uav_name" default="uav0" />
+
+  <!-- Set GeographicLib data path -->
+  <env name="GEOGRAPHICLIB_DATA" value="$(env HOME)/.GeographicLib" />
+
+  <!-- ====================================================================== -->
+  <!-- 1. MAVROS + PX4 SITL                                                  -->
+  <!-- ====================================================================== -->
+  <group ns="$(arg uav_name)">
+    <include file="$(find mavros)/launch/px4.launch">
+      <arg name="fcu_url" value="udp://:14540@127.0.0.1:14580" />
+      <arg name="tgt_system" value="1" />
+    </include>
+  </group>
+
+  <!-- ====================================================================== -->
+  <!-- 2. 目标运动模拟（仿真目标车辆）                                          -->
+  <!-- ====================================================================== -->
+  <node name="target_motion_simulator_node"
+        pkg="multi_uav_strike"
+        type="target_motion_simulator_node"
+        output="screen"
+        respawn="false">
+    <rosparam command="load"
+              file="$(find multi_uav_strike)/config/target_motion_simulator.yaml" />
+  </node>
+
+  <!-- ====================================================================== -->
+  <!-- 3. 云台模拟节点                                                          -->
+  <!-- ====================================================================== -->
+  <group ns="$(arg uav_name)">
+    <node name="gimbal_simulator_node"
+          pkg="multi_uav_strike"
+          type="gimbal_simulator_node"
+          output="screen"
+          respawn="false">
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/common.yaml" />
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/gimbal_simulator.yaml" />
+    </node>
+  </group>
+
+  <!-- ====================================================================== -->
+  <!-- 4. 目标估计节点（粒子滤波）                                              -->
+  <!-- ====================================================================== -->
+  <group ns="$(arg uav_name)">
+    <node name="target_estimator_node"
+          pkg="multi_uav_strike"
+          type="target_estimator_node"
+          output="screen"
+          respawn="false">
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/common.yaml" />
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/target_estimator.yaml" />
+    </node>
+  </group>
+
+  <!-- ====================================================================== -->
+  <!-- 5. 制导控制节点                                                          -->
+  <!-- ====================================================================== -->
+  <group ns="$(arg uav_name)">
+    <node name="guidance_control_node"
+          pkg="multi_uav_strike"
+          type="guidance_control_node"
+          output="screen"
+          respawn="false">
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/common.yaml" />
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/guidance_control.yaml" />
+    </node>
+  </group>
+
+  <!-- ====================================================================== -->
+  <!-- 6. 航点执行器节点                                                        -->
+  <!-- ====================================================================== -->
+  <group ns="$(arg uav_name)">
+    <node name="waypoint_executor_node"
+          pkg="multi_uav_strike"
+          type="waypoint_executor_node"
+          output="screen"
+          respawn="false">
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/common.yaml" />
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/waypoint_executor.yaml" />
+    </node>
+  </group>
+
+  <!-- ====================================================================== -->
+  <!-- 7. 通信节点                                                              -->
+  <!-- ====================================================================== -->
+  <group ns="$(arg uav_name)">
+    <node name="comm_node"
+          pkg="multi_uav_strike"
+          type="comm_node"
+          output="screen"
+          respawn="false">
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/common.yaml" />
+      <param name="uav_name" value="$(arg uav_name)" />
+    </node>
+  </group>
+
+  <!-- ====================================================================== -->
+  <!-- 8. 任务管理器节点                                                        -->
+  <!-- ====================================================================== -->
+  <group ns="$(arg uav_name)">
+    <node name="mission_manager_node"
+          pkg="multi_uav_strike"
+          type="mission_manager_node"
+          output="screen"
+          respawn="false">
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/common.yaml" />
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/mission_manager.yaml" />
+    </node>
+  </group>
+
+  <!-- ====================================================================== -->
+  <!-- 9. 地面站模拟器（仿真测试用）                                            -->
+  <!-- ====================================================================== -->
+  <node name="gs_simulator_node"
+        pkg="multi_uav_strike"
+        type="gs_simulator_node.py"
+        output="screen"
+        respawn="false"
+        args=""
+        launch-prefix="bash -c 'sleep 2; $@' --" >
+    <param name="mode" value="$(arg mode)" />
+    <param name="auto_pub" value="true" />
+    <rosparam command="load"
+                file="$(find multi_uav_strike)/config/common.yaml" />
+  </node>
+
+  <!-- ====================================================================== -->
+  <!-- 10. RViz 可视化                                                          -->
+  <!-- ====================================================================== -->
+  <node name="rviz" pkg="rviz" type="rviz"
+        args="-d $(find multi_uav_strike)/rviz/view_strike_SITL.rviz" />
+
+</launch>

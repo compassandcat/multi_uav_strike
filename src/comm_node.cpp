@@ -104,6 +104,11 @@ private:
     int telemetry_rate_;  // Hz
     bool use_sim_;        // 仿真/真机切换
 
+    // GPS 参考点（NED -> GPS 转换用）
+    double ref_lat_;      // 参考纬度（度）
+    double ref_lon_;      // 参考经度（度）
+    double ref_alt_;      // 参考高度（米）
+
 public:
     CommNode() : nh_private_("~"),
         neighbor_timeout_(5.0),
@@ -125,20 +130,23 @@ public:
         nh_private_.param<double>("target_share_interval", target_share_interval_, 1.0);
         nh_private_.param<int>("telemetry_rate", telemetry_rate_, 10);
         nh_private_.param<bool>("use_sim", use_sim_, true);
+        // GPS 参考点（仿真时所有 UAV 共享，PX4 SITL 时各 UAV 用各自的 home）
+        nh_private_.param<double>("ref_lat", ref_lat_, 36.096);
+        nh_private_.param<double>("ref_lon", ref_lon_, 114.392);
+        nh_private_.param<double>("ref_alt", ref_alt_, 100.0);
     }
 
     void initSubscribers() {
         // 本机位置
-        // 仿真：订阅 quad/pose；实机：订阅 mavros/local_position/pose（空着待硬件实现）
+        // 仿真：订阅 quad/pose；实机：订阅 mavros/local_position/pose
         if (use_sim_) {
             self_pose_sub_ = nh_.subscribe(
                 "quad/pose", 10,
                 &CommNode::selfPoseCallback, this);
         } else {
-            // TODO: 实机时从硬件读取位置（空着）
-            // self_pose_sub_ = nh_.subscribe(
-            //     "mavros/local_position/pose", 10,
-            //     &CommNode::selfPoseCallback, this);
+            self_pose_sub_ = nh_.subscribe(
+                "mavros/local_position/pose", 10,
+                &CommNode::selfPoseCallback, this);
         }
 
         // 订阅所有 UAV 发布的自己的位置（全局 topic）
@@ -153,7 +161,7 @@ public:
 
         // 地面站航点列表
         gs_waypoint_sub_ = nh_.subscribe(
-            "gs/waypoint_upload", 10,
+            "/gs/waypoint_upload", 10,
             &CommNode::gsWaypointCallback, this);
 
         // YOLO 检测结果（目标发现）
@@ -212,14 +220,53 @@ public:
     // ============== 回调函数 ==============
 
     void selfPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
-        current_self_pose_ = *msg;
+        // 先把输入转为统一 NED（本地坐标系）
+        double ned_x, ned_y, ned_z;
+        if (use_sim_) {
+            // 仿真输入是 NED 坐标系
+            ned_x = msg->pose.position.x;
+            ned_y = msg->pose.position.y;
+            ned_z = msg->pose.position.z;
+        } else {
+            // Mavros 输入是 ENU 坐标系
+            // ENU -> NED: x_ned = y_enu, y_ned = x_enu, z_ned = -z_enu
+            ned_x = msg->pose.position.y;
+            ned_y = msg->pose.position.x;
+            ned_z = -msg->pose.position.z;
+        }
+
+        // 转换 NED -> GPS（WGS84）用于机间共享
+        double lat, lon, alt;
+        nedToGps(ned_x, ned_y, ned_z, lat, lon, alt);
+
+        // 存为 GPS pose: position.x=lat, position.y=lon, position.z=alt
+        current_self_pose_.pose.position.x = lat;
+        current_self_pose_.pose.position.y = lon;
+        current_self_pose_.pose.position.z = alt;
+        current_self_pose_.pose.orientation = msg->pose.orientation;
+        current_self_pose_.header = msg->header;
         is_self_pose_received_ = true;
 
         // 设置 frame_id 为本机名，订阅方通过此过滤自己的消息
         current_self_pose_.header.frame_id = uav_name_;
 
-        // 广播本机位置给其他无人机（全局 topic）
+        // 广播本机 GPS 位置给其他无人机（全局 topic）
         self_pose_pub_.publish(current_self_pose_);
+    }
+
+    /**
+     * NED -> GPS 转换（使用参考点的小范围近似）
+     * 输入：ned_x (北), ned_y (东), ned_z (下)
+     * 输出：lat (度), lon (度), alt (米)
+     */
+    void nedToGps(double ned_x, double ned_y, double ned_z,
+                  double& lat, double& lon, double& alt) {
+        const double EARTH_R = 6378137.0;
+        double d_lat = ned_x / EARTH_R * 180.0 / M_PI;
+        double d_lon = ned_y / (EARTH_R * cos(ref_lat_ * M_PI / 180.0)) * 180.0 / M_PI;
+        lat = ref_lat_ + d_lat;
+        lon = ref_lon_ + d_lon;
+        alt = ref_alt_ - ned_z;  // NED: z 向下 -> alt: 海拔向上
     }
 
     void otherUavPosesCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
