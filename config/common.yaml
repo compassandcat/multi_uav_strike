@@ -21,7 +21,7 @@
 # true  = 使用 multimodequad_ros 仿真器（UAV 起始在指定高度，无须起飞）
 # false = 使用 PX4 SITL + MAVROS（UAV 起始在地面，需要起飞流程）
 use_sim: false
-,
+
 # ----------------------------------------------------------------------------
 # GPS 参考点 (GPS reference point)
 # 用于 NED <-> GPS 坐标转换、机间通信
