@@ -416,19 +416,32 @@ public:
                  current_work_mode_.c_str(), new_mode.c_str());
         current_work_mode_ = new_mode;
 
-        // 切出 SEARCH_ONLY 模式时，立即停发指令并清空航点，避免与 guidance_control 抢控制权
+        // 切出 SEARCH_ONLY 模式时：暂停执行并发零速，但**保留航点队列**，
+        // 这样之后切回 SEARCH_ONLY 时能从 current_waypoint_index_ 继续执行。
+        // 新航点可在任意时刻通过 /mission/waypoint_cmd 重新写入并 reset 队列。
         if (new_mode != "SEARCH_ONLY") {
             if (is_executing_) {
-                ROS_WARN("[WaypointExecutor] Not SEARCH_ONLY anymore, pausing waypoint control");
+                ROS_WARN("[WaypointExecutor] Left SEARCH_ONLY, pausing waypoint control (queue preserved)");
             }
             is_executing_ = false;
-            waypoint_queue_.clear();
             publishZeroVelocity();
         } else {
-            // 切回 SEARCH_ONLY：等新的 waypoint_cmd 到来再继续，不要自动 resume 旧航点
-            is_executing_ = false;
-            is_waypoints_received_ = false;
-            last_waypoint_reached_logged_ = false;
+            // 切回 SEARCH_ONLY：根据航点队列状态决定行为
+            if (waypoint_queue_.empty()) {
+                // 队列为空：没航点可飞，保持悬停并报错，等待新的 /mission/waypoint_cmd
+                ROS_ERROR("[WaypointExecutor] Mode is SEARCH_ONLY but waypoint queue is empty! "
+                          "Hovering. Send a new waypoint list via /mission/waypoint_cmd to resume.");
+                is_executing_ = false;
+                is_waypoints_received_ = false;
+            } else {
+                // 队列非空：可能是之前残留的旧航点（resume），也可能是 TRACK 期间收到的新航点
+                // （waypointCmdCallback 已 reset 队列到 index 0）。两种情况都直接开始执行。
+                ROS_WARN("[WaypointExecutor] Back to SEARCH_ONLY, resuming %lu waypoints from index %zu",
+                         waypoint_queue_.size(), current_waypoint_index_);
+                is_executing_ = true;
+                is_waypoints_received_ = true;
+                last_waypoint_reached_logged_ = false;
+            }
         }
     }
 
@@ -784,8 +797,10 @@ public:
     }
 
     void stop() {
+        // 与 missionModeCallback 切出 SEARCH_ONLY 一致：暂停执行但**保留航点队列**，
+        // 这样 mission_manager 在检测到目标发"stop"时不会破坏后续 resume 的能力。
+        // 如果真的需要清空航点，发个新的 waypoint_cmd 即可（会 reset 队列）。
         is_executing_ = false;
-        waypoint_queue_.clear();
         ROS_WARN("[WaypointExecutor] >>>>> stop() called, about to publish zero velocity");
         publishZeroVelocity();
         ROS_WARN("[WaypointExecutor] >>>>> stop() completed");

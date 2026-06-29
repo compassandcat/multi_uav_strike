@@ -486,6 +486,24 @@ public:
 
         if (!is_uav_pose_received_ || !is_target_pose_received_) {
             ROS_WARN_THROTTLE(1.0, "[Guidance] Waiting for UAV pose or target data...");
+            // ===== 关键：即使没收到目标，也要持续发零速度维持 PX4 OFFBOARD 心跳 =====
+            // PX4 OFFBOARD 模式要求 setpoint 频率 > 2Hz，否则触发 failsafe 自动降落。
+            // 起飞后切到 SEARCH_TRACK/STRIKE 时，目标通常还没出现，此时若 guidance
+            // 不发任何 setpoint，PX4 就会断流 → 降落。必须用零速度悬停来保活。
+            if (is_uav_pose_received_) {
+                geometry_msgs::Twist hover_cmd;
+                hover_cmd.linear.x = 0.0;
+                hover_cmd.linear.y = 0.0;
+                hover_cmd.linear.z = 0.0;
+                hover_cmd.angular.x = 0.0;
+                hover_cmd.angular.y = 0.0;
+                hover_cmd.angular.z = 0.0;
+                if (!use_sim_) {
+                    // NED -> ENU 转换（0 还是 0，不影响）
+                    convertVelNedToEnu(hover_cmd);
+                }
+                vel_cmd_pub_.publish(hover_cmd);
+            }
             return;
         }
 
@@ -493,6 +511,18 @@ public:
         if (!is_target_twist_received_ &&
             current_strategy_type_ == multi_uav_strike::GuidanceStrategyType::INTERCEPT) {
             ROS_WARN_THROTTLE(1.0, "[Guidance] Target velocity not available for intercept guidance");
+            // 同样的 OFFBOARD 保活：悬停等待 twist
+            geometry_msgs::Twist hover_cmd;
+            hover_cmd.linear.x = 0.0;
+            hover_cmd.linear.y = 0.0;
+            hover_cmd.linear.z = 0.0;
+            hover_cmd.angular.x = 0.0;
+            hover_cmd.angular.y = 0.0;
+            hover_cmd.angular.z = 0.0;
+            if (!use_sim_) {
+                convertVelNedToEnu(hover_cmd);
+            }
+            vel_cmd_pub_.publish(hover_cmd);
             return;
         }
 

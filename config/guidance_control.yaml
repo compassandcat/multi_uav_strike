@@ -28,7 +28,7 @@ track_horiz_dist: 8.0
 track_P: 1.0
 track_I: 0.1
 # TRACK 模式专属速度上限（节点专属，不放 common.yaml）
-uav_speed: 2.0
+uav_speed: 0.5
 # 距离→速度的连续斜率：每超出 stand-off 1m 速度增加多少 m/s
 # 用于消除接近目标时的硬切换（值越小接近越平缓）
 track_k_approach: 0.5

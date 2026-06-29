@@ -23,7 +23,12 @@
   <!-- ====================================================================== -->
   <!-- 命令行可覆盖参数                                                         -->
   <!-- ====================================================================== -->
-  <arg name="mode" default="SEARCH_STRIKE" />
+  <!-- 默认 IDLE：飞机在地面等待，不会自动起飞。
+       切换流程示例：
+         rostopic pub -1 /gs/mode_cmd std_msgs/String "TAKEOFF"     # 起飞
+         rostopic pub -1 /gs/mode_cmd std_msgs/String "SEARCH_ONLY"  # 起飞后开始航点飞行
+  -->
+  <arg name="mode" default="IDLE" />
   <arg name="uav_name" default="uav0" />
 
   <!-- Set GeographicLib data path -->

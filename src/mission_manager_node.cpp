@@ -59,7 +59,8 @@
 
 // 工作模式枚举
 enum class WorkMode {
-    IDLE,
+    IDLE,             // 等待：只获取 UAV 信息，不发任何控制指令（PX4 SITL 不发 setpoint）
+    TAKEOFF,          // 起飞：执行 PX4 SITL 起飞流程（OFFBOARD + ARM + 爬升），完成后保持悬停
     SEARCH_ONLY,      // 全图搜索
     SEARCH_TRACK,     // 搜索即跟踪
     SEARCH_STRIKE     // 搜索即打击
@@ -400,6 +401,11 @@ public:
     void modeCallback(const std_msgs::String::ConstPtr& msg) {
         std::string mode = msg->data;
 
+        // 重复模式（gs_simulator 1Hz 持续 latched、或地面站重复点击）早返回，避免日志刷屏
+        if (mode == workModeToString()) {
+            return;
+        }
+
         if (mode == "SEARCH_ONLY") {
             current_work_mode_ = WorkMode::SEARCH_ONLY;
             ROS_WARN("[MissionManager] Mode changed to SEARCH_ONLY - Guidance DISABLED");
@@ -409,16 +415,60 @@ public:
 
         } else if (mode == "SEARCH_TRACK") {
             current_work_mode_ = WorkMode::SEARCH_TRACK;
-            ROS_WARN("[MissionManager] Mode changed to SEARCH_TRACK");
+            ROS_WARN("[MissionManager] Mode changed to SEARCH_TRACK - enabling guidance");
+            // 切到 SEARCH_TRACK 立刻使能 guidance（即使没目标也发零速度 hover，避免 PX4 OFFBOARD 失联）
+            enableGuidance();
+            // 关键：立刻下发 guidance mode = "track"，不要等 startGuidanceApproach() 触发。
+            // guidance_control_node 默认 mode = "strike"，如果不先下发 mode，
+            //   目标出现前 guidance 会按 strike 处理（虽然没目标时只是发零速度，但一旦
+            //   startGuidanceApproach 触发前如果 subscriber 没收到 mode 消息，会沿用 strike）。
+            std_msgs::String guidance_mode_msg;
+            guidance_mode_msg.data = "track";
+            guidance_mode_pub_.publish(guidance_mode_msg);
+            // 停掉 waypoint_executor，避免和 guidance 抢 setpoint
+            std_msgs::String wp_cmd;
+            wp_cmd.data = "stop";
+            waypoint_control_pub_.publish(wp_cmd);
+
         } else if (mode == "SEARCH_STRIKE") {
             current_work_mode_ = WorkMode::SEARCH_STRIKE;
-            ROS_WARN("[MissionManager] Mode changed to SEARCH_STRIKE");
+            ROS_WARN("[MissionManager] Mode changed to SEARCH_STRIKE - enabling guidance");
+            // 切到 SEARCH_STRIKE 立刻使能 guidance（同 SEARCH_TRACK 原因）
+            enableGuidance();
+            // 立刻下发 guidance mode = "strike"
+            std_msgs::String guidance_mode_msg;
+            guidance_mode_msg.data = "strike";
+            guidance_mode_pub_.publish(guidance_mode_msg);
+            std_msgs::String wp_cmd;
+            wp_cmd.data = "stop";
+            waypoint_control_pub_.publish(wp_cmd);
+
+        } else if (mode == "TAKEOFF") {
+            current_work_mode_ = WorkMode::TAKEOFF;
+            ROS_WARN("[MissionManager] Mode changed to TAKEOFF - starting takeoff sequence...");
+            // 重置起飞状态机（让 runPx4TakeoffSequence() 从 TAKEOFF_IDLE 开始推进）
+            if (!use_sim_) {
+                takeoff_state_ = TakeoffState::TAKEOFF_IDLE;
+                takeoff_retry_count_ = 0;
+                takeoff_failed_logged_ = false;
+            }
+            // 清空目标状态（起飞阶段不需要管目标）
+            initTargetState();
+            stopMission();
         } else if (mode == "IDLE") {
             current_work_mode_ = WorkMode::IDLE;
+            ROS_WARN("[MissionManager] Mode changed to IDLE - stopping everything");
             stopMission();
             disableGuidance();
         } else {
             ROS_WARN("[MissionManager] Unknown mode: %s", mode.c_str());
+            // 未知模式不做任何事，直接返回
+            return;
+        }
+
+        // 离开 TAKEOFF 模式时统一停掉 setpoint 发布器（避免持续发送位置指令覆盖其他模块的速度指令）
+        if (current_work_mode_ != WorkMode::TAKEOFF && !use_sim_ && setpoint_running_) {
+            stopSetpointPublisher();
         }
 
         // 模式切换时重置目标状态
@@ -514,9 +564,9 @@ public:
         is_px4_connected_ = msg->connected;
         is_offboard_mode_ = (msg->mode == "OFFBOARD");
 
-        // 检测 OFFBOARD 模式切换
+        // 检测 OFFBOARD 模式切换（throttle 避免 mavros 1Hz 状态推送时刷屏）
         if (is_offboard_mode_ && !isTakeoffComplete()) {
-            ROS_WARN("[MissionManager] OFFBOARD mode detected, waiting for takeoff complete...");
+            ROS_WARN_THROTTLE(5.0, "[MissionManager] OFFBOARD mode detected, waiting for takeoff complete...");
         }
     }
 
@@ -597,6 +647,10 @@ public:
             case WorkMode::IDLE:
                 handleIdle();
                 break;
+            case WorkMode::TAKEOFF:
+                // 起飞流程由 runPx4TakeoffSequence() 推进；mission_loop 不做额外动作
+                // TAKEOFF_COMPLETE 后 UAV 在 setpoint 控制下悬停，等待用户切换到 SEARCH_*
+                break;
             case WorkMode::SEARCH_ONLY:
                 handleSearchOnly();
                 break;
@@ -614,9 +668,23 @@ public:
 
     // PX4 SITL: 执行起飞状态机
     void runPx4TakeoffSequence() {
+        // 关键门控：只有 TAKEOFF 模式下才推进起飞流程。
+        // 避免：用户在 IDLE 时 FCU 一连上就自动起飞。
+        if (current_work_mode_ != WorkMode::TAKEOFF) {
+            // 切出 TAKEOFF 模式时：停止 setpoint 发布器（避免持续发送位置指令覆盖其他模块）
+            if (setpoint_running_) {
+                stopSetpointPublisher();
+            }
+            // 重置到 IDLE，等用户再次切到 TAKEOFF 才会重启
+            if (takeoff_state_ != TakeoffState::TAKEOFF_IDLE) {
+                takeoff_state_ = TakeoffState::TAKEOFF_IDLE;
+            }
+            return;
+        }
+
         switch (takeoff_state_) {
             case TakeoffState::TAKEOFF_IDLE:
-                // 等待自动开始或外部触发
+                // 已在 TAKEOFF 模式：等待 FCU 连接后开始
                 if (!use_sim_ && is_px4_connected_) {
                     takeoff_state_ = TakeoffState::TAKEOFF_WAITING_FCU;
                     ROS_WARN("[MissionManager] Starting PX4 takeoff sequence...");
@@ -677,7 +745,10 @@ public:
                 if (elapsed > takeoff_hover_time_) {  // 悬停等待时间（ROS 参数）
                     takeoff_state_ = TakeoffState::TAKEOFF_COMPLETE;
                     ROS_WARN("[MissionManager] ===== TAKEOFF COMPLETE! Ready for mission execution =====");
-                    stopSetpointPublisher();
+                    // 关键：不要停掉 setpoint 发布器！否则 PX4 OFFBOARD 收不到 setpoint 会触发
+                    // failsafe 自动降落。让 setpoint 持续发起飞点位置 = UAV 原地悬停，
+                    // 直到用户在地面站切到 SEARCH_ONLY/TRACK/STRIKE 才会停掉。
+                    // （modeCallback 里离开 TAKEOFF 模式时会统一 stopSetpointPublisher()）
                 }
                 break;
             }
@@ -936,6 +1007,18 @@ public:
         ROS_INFO("[MissionManager] Guidance disabled for SEARCH_ONLY mode");
     }
 
+    void enableGuidance() {
+        is_guidance_active_ = true;
+
+        // 使能制导（guidance_control_node 在 enabled 但无目标时会持续发零速度，
+        // 维持 PX4 OFFBOARD 心跳，避免 UAV 因 setpoint 断流触发 failsafe 降落）
+        std_msgs::Bool enable;
+        enable.data = true;
+        guidance_enable_pub_.publish(enable);
+
+        ROS_INFO("[MissionManager] Guidance enabled");
+    }
+
     void checkEmergencyStop() {
         // 低速时检查毫米波雷达
         // TODO: 获取当前速度判断是否低于阈值
@@ -1038,6 +1121,7 @@ public:
     std::string workModeToString() {
         switch (current_work_mode_) {
             case WorkMode::IDLE: return "IDLE";
+            case WorkMode::TAKEOFF: return "TAKEOFF";
             case WorkMode::SEARCH_ONLY: return "SEARCH_ONLY";
             case WorkMode::SEARCH_TRACK: return "SEARCH_TRACK";
             case WorkMode::SEARCH_STRIKE: return "SEARCH_STRIKE";

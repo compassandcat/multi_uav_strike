@@ -10,7 +10,15 @@ gs_simulator_node.py
 - 支持命令行参数配置
 
 使用方法：
-$ rosrun multi_uav_strike gs_simulator_node.py _mode:=SEARCH_STRIKE
+$ rosrun multi_uav_strike gs_simulator_node.py _mode:=IDLE
+# 起飞后切换：
+$ rostopic pub -1 /gs/mode_cmd std_msgs/String "TAKEOFF"
+$ rostopic pub -1 /gs/mode_cmd std_msgs/String "SEARCH_ONLY"
+
+模式约定（与 mission_manager 同步）：
+- IDLE        ：飞机在地面等待，不发控制指令
+- TAKEOFF     ：执行 PX4 SITL 起飞流程（切 OFFBOARD + 解锁 + 爬升 + 悬停）
+- SEARCH_ONLY / SEARCH_TRACK / SEARCH_STRIKE ：任务模式，起飞后切换
 
 航点坐标系约定（重要）：
 - 内部 waypoints_local 以"参考 GPS 点为原点的局部 NED 偏移 + 相对高度"为单位
@@ -140,9 +148,9 @@ class GroundStationSimulator:
                 if not hasattr(self, '_waypoints_published'):
                     self.publish_waypoints()
                     self._waypoints_published = True
-
+                    self.publish_mode(self.mode)
                 # 持续发布模式（确保订阅者收到）
-                self.publish_mode(self.mode)
+                
 
             rate.sleep()
 
@@ -155,7 +163,8 @@ def main():
     rospy.init_node('gs_simulator_node', anonymous=False)
 
     # 获取参数
-    mode = rospy.get_param('~mode', 'SEARCH_ONLY')
+    # 默认 IDLE：飞机在地面等待，不发任何控制指令
+    mode = rospy.get_param('~mode', 'IDLE')
     auto_pub = rospy.get_param('~auto_pub', True)
 
     # 参考 GPS 点（默认值与 common.yaml 当前配置一致：北京）
