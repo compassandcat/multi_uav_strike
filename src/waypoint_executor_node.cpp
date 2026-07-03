@@ -99,6 +99,7 @@ private:
 
     // 速度参数
     double uav_speed_;   // 飞行速度 (m/s)
+    double uav_vertical_speed_; // Vertical speed
     double arrival_threshold_;  // 到达阈值 (m)
 
     // ============== 参数 ==============
@@ -146,6 +147,7 @@ public:
         is_executing_(false),
         is_pose_received_(false),
         uav_speed_(5.0),
+        uav_vertical_speed_(1.0),
         arrival_threshold_(2.0),
         executor_rate_(50.0),
         flight_mode_velocity_(0),
@@ -173,6 +175,7 @@ public:
     void initParams() {
         nh_private_.param<double>("executor_rate", executor_rate_, 50.0);
         nh_private_.param<double>("uav_speed", uav_speed_, 5.0);
+        nh_private_.param<double>("uav_vertical_speed", uav_vertical_speed_, 1.0);
         nh_private_.param<double>("arrival_threshold", arrival_threshold_, 2.0);
         nh_private_.param<int>("flight_mode_velocity", flight_mode_velocity_, 0);
         nh_private_.param<int>("flight_mode_position", flight_mode_position_, 2);
@@ -284,7 +287,7 @@ public:
         ned_y = d_lon * M_PI / 180.0 * EARTH_R * cos(ref_lat_ * M_PI / 180.0);
 
         // 高度差 -> D (下向)
-        ned_z = -(alt - ref_alt_);
+        ned_z = -(alt);// - ref_alt_);
     }
 
     // ============== 回调函数 ==============
@@ -535,18 +538,24 @@ public:
         double dx = target_x - current_ned_x_;
         double dy = target_y - current_ned_y_;
         double dz = target_z - current_ned_z_;
-        double dist = sqrt(dx*dx + dy*dy + dz*dz);
+        double horizontal_dist = sqrt(dx*dx + dy*dy);
+        double vertical_dist = fabs(dz);
 
-        if (dist > 0.1) {
+        if (horizontal_dist > 0.1) {
             if (position_hold) {
                 // 最后一个航点用 P-controller：速度 ∝ 距离，距离 → 0 速度 → 0，避免震荡
                 vx = hold_kp_ * dx;
                 vy = hold_kp_ * dy;
                 vz = hold_kp_ * dz;
             } else {
-                vx = (dx / dist) * uav_speed_;
-                vy = (dy / dist) * uav_speed_;
-                vz = (dz / dist) * uav_speed_;
+                vx = (dx / horizontal_dist) * uav_speed_;
+                vy = (dy / horizontal_dist) * uav_speed_;
+		if (vertical_dist > 1)
+		  vz = (dz / vertical_dist) * uav_vertical_speed_;
+		else
+		  vz = hold_kp_ * dz;
+                if (vz > uav_vertical_speed_) vz = uav_vertical_speed_;
+                if (vz < -uav_vertical_speed_) vz = -uav_vertical_speed_;
             }
         } else {
             vx = vy = vz = 0.0;

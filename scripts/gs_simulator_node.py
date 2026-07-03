@@ -148,7 +148,7 @@ class GroundStationSimulator:
                 if not hasattr(self, '_waypoints_published'):
                     self.publish_waypoints()
                     self._waypoints_published = True
-                    self.publish_mode(self.mode)
+                    # self.publish_mode(self.mode)
                 # 持续发布模式（确保订阅者收到）
                 
 

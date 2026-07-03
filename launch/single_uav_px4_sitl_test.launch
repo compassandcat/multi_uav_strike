@@ -160,12 +160,25 @@
         output="screen"
         respawn="false"
         args=""
-        launch-prefix="bash -c 'sleep 2; $@' --" >
+        launch-prefix="bash -c 'sleep 2; $@' --" > 
     <param name="mode" value="$(arg mode)" />
     <param name="auto_pub" value="true" />
     <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
   </node>
+ 
+  <!--group ns="$(arg uav_name)"-->
+    <node pkg="starling_bridge" type="starling_bridge" name="starling_bridge" output="screen">
+      <!-- 地面站 IP 和端口 -->
+      <param name="gcs_ip" value="192.168.43.17" />
+      <param name="gcs_udp_port" value="14550" />
+      <param name="gcs_kcp_port" value="18990" />
+      <param name="device_name" value="uav2" />
+      <param name="device_sn" value="5678" />
+      <!--param name="uav_id" value="2" />
+      <param name="device_sn" value="MAVLink_2_1" /-->
+    </node>
+  <!--/group-->
 
   <!-- ====================================================================== -->
   <!-- 10. RViz 可视化                                                          -->
