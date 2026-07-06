@@ -28,12 +28,12 @@ use_sim: false
 # 仿真模式：所有 UAV 共享一个参考点
 # PX4 SITL：每个 UAV 用各自的 home position
 # ----------------------------------------------------------------------------
-ref_lat: 36.058800          # 安阳纬度
-ref_lon: 114.557221         # 安阳经度
-ref_alt: 63.0               # 安阳海拔（米）
-# ref_lat: 40.151347         # 北京纬度
-# ref_lon: 116.980590        # 北京经度
-# ref_alt: 31.0              # 北京海拔（米）
+ref_lat: 36.058800        # 与 PX4 SITL 实例 0 的 home 对齐
+ref_lon: 114.557221       # (lat/lon 由 /uav0/mavros/global_position/global 提供)
+ref_alt: 63.0             # (实测 PX4 home altitude)
+# ref_lat: 36.058800        # 旧值,保留作参考
+# ref_lon: 114.557221
+# ref_alt: 63.0
 
 # ----------------------------------------------------------------------------
 # 飞行模式代码 (PX4 flight mode codes)

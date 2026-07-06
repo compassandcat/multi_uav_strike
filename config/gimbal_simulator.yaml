@@ -10,3 +10,7 @@ max_yaw_rate: 1.2          # 最大偏航角速度（rad/s）
 max_pitch_rate: 1.2        # 最大俯仰角速度（rad/s）
 loop_freq: 100.0           # 控制循环频率（Hz）
 image_noise_std_dev: 0.0   # 图像噪声标准差
+
+# === Phase 1: 相机相对机体偏角(给 detection_simulator 用) ===
+cam_yaw_offset_deg: 0.0    # 相机相对机体正前方的偏航偏差(度,默认 0)
+cam_pitch_deg: -90.0       # 相机相对机体水平面的俯仰(度,-90=垂直下视)

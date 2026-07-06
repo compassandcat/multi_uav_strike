@@ -40,10 +40,18 @@
 #include <std_msgs/String.h>
 #include <std_msgs/Int16.h>
 #include <sensor_msgs/NavSatFix.h>
+#include <mavros_msgs/HomePosition.h>
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
 #include <cmath>
 #include <vector>
+#include <sstream>
+#include <algorithm>
+
+// === Phase 4: 类型化消息 ===
+#include "multi_uav_strike/Skill.h"
+#include "multi_uav_strike/WaypointStatus.h"
+#include "multi_uav_strike/AvoidanceCmd.h"
 
 // 安阳基准点（用于 GPS → NED 转换）
 const double ANYANG_LAT = 36.096;      // 安阳纬度
@@ -69,6 +77,13 @@ private:
     ros::Publisher status_pub_;              // 执行状态
     ros::Publisher waypoints_rviz_pub_;     // 航点显示（RViz）
     ros::Publisher waypoint_path_pub_;      // 航点路径（RViz Path显示）
+    // === Phase 4: 类型化发布 ===
+    ros::Publisher waypoint_status_pub_;    // typed WaypointStatus(给 mission_manager 用)
+    ros::Publisher current_target_pub_;     // 当前航段终点 PoseStamped(给 uav_avoidance_node 用)
+
+    // === Phase 4: 类型化订阅 ===
+    ros::Subscriber skill_sub_;             // /waypoint_executor/skill(mission_manager 下发)
+    ros::Subscriber avoidance_cmd_sub_;     // /avoidance/cmd(uav_avoidance_node 下发)
 
     // ============== 定时器 ==============
     ros::Timer executor_timer_;
@@ -90,6 +105,24 @@ private:
     bool is_waypoints_received_;
     bool is_executing_;
 
+    // === Phase 4: 分段航点状态(必须放在 Waypoint 之后)===
+    enum class SegmentPhase { IDLE, ARRIVE, SKILL_AREA, HOLD, COMPLETE };
+    SegmentPhase segment_phase_;
+    std::string  active_flow_id_;
+    std::string  active_skill_id_;
+    std::vector<Waypoint> arrive_queue_;    // arrive_path 转 Waypoint 队列
+    std::vector<Waypoint> skill_area_queue_; // skill_area_path 转 Waypoint 队列
+    size_t arrive_idx_;
+    size_t skill_area_idx_;
+    double seg_start_x_;                    // 当前段起点(对 idx=0 是进入段时锁存的飞机位置,后续不再刷新)
+    double seg_start_y_;                    //   ——区分于 current_ned_x_/y_(每帧刷新,作为飞机当前位置)
+    double cruise_speed_;                   // 进场巡航速度(覆盖 uav_speed_,ARRIVE 段用)
+    double task_speed_;                     // 任务区速度(覆盖 uav_speed_,SKILL_AREA 段用)
+
+    // 最新 AvoidanceCmd(默认值:全不约束)
+    multi_uav_strike::AvoidanceCmd latest_avoidance_;
+    bool has_latest_avoidance_;
+
 // 本机状态（NED）
     double current_ned_x_;
     double current_ned_y_;
@@ -101,16 +134,23 @@ private:
     double uav_speed_;   // 飞行速度 (m/s)
     double uav_vertical_speed_; // Vertical speed
     double arrival_threshold_;  // 到达阈值 (m)
+    double final_approach_threshold_;  // 终段直接逼近距离阈值 (m) — L1 在小 cross 时 v_lateral 太小
+                                      // 进不了 arrival_threshold 会卡死,最后这段切直接朝航点飞
+
+    // 航向控制(P-controller 输出角速度用)
+    double yaw_max_rate_;       // 最大角速度 rad/s(由 ~yaw_max_rate 配置)
 
     // ============== 参数 ==============
     double executor_rate_;
     int flight_mode_velocity_;
     int flight_mode_position_;
 
-    // 基准点参数
+    // 基准点参数(由 PX4 /mavros/home_position/home 自动填充,不再硬编码)
     double ref_lat_;
     double ref_lon_;
     double ref_alt_;
+    bool ref_initialized_ = false;
+    ros::Subscriber home_position_sub_;  // 一次订阅,拿 PX4 home
 
     // 仿真/真机切换
     bool use_sim_;
@@ -148,18 +188,27 @@ public:
         is_pose_received_(false),
         uav_speed_(5.0),
         uav_vertical_speed_(1.0),
-        arrival_threshold_(2.0),
+        arrival_threshold_(1.0),
         executor_rate_(50.0),
         flight_mode_velocity_(0),
         flight_mode_position_(2),
-        ref_lat_(ANYANG_LAT),
-        ref_lon_(ANYANG_LON),
-        ref_alt_(ANYANG_ALT),
+        ref_lat_(0.0),
+        ref_lon_(0.0),
+        ref_alt_(0.0),
         use_sim_(true),
         avoidance_safe_distance_(10.0),
         last_waypoint_reached_logged_(false),
         hold_kp_(0.8),
-        current_work_mode_("SEARCH_ONLY") {
+        yaw_max_rate_(1.0),
+        current_work_mode_("SEARCH_ONLY"),
+        segment_phase_(SegmentPhase::IDLE),
+        arrive_idx_(0),
+        skill_area_idx_(0),
+        seg_start_x_(0.0),
+        seg_start_y_(0.0),
+        cruise_speed_(5.0),
+        task_speed_(5.0),
+        has_latest_avoidance_(false) {
 
         initParams();
         initSubscribers();
@@ -176,12 +225,17 @@ public:
         nh_private_.param<double>("executor_rate", executor_rate_, 50.0);
         nh_private_.param<double>("uav_speed", uav_speed_, 5.0);
         nh_private_.param<double>("uav_vertical_speed", uav_vertical_speed_, 1.0);
-        nh_private_.param<double>("arrival_threshold", arrival_threshold_, 2.0);
+        nh_private_.param<double>("arrival_threshold", arrival_threshold_, 1.0);
+        // 终段直接逼近阈值 — 当飞机距航点 < 此值时,从 L1 压航线切到直接朝航点飞
+        // (默认 2.5m:大于 arrival_threshold,留出从 L1 切到直接逼近的过渡区)
+        nh_private_.param<double>("final_approach_threshold", final_approach_threshold_, 2.5);
         nh_private_.param<int>("flight_mode_velocity", flight_mode_velocity_, 0);
         nh_private_.param<int>("flight_mode_position", flight_mode_position_, 2);
         nh_private_.param<double>("avoidance_safe_distance", avoidance_safe_distance_, 10.0);
         // 最后一个航点位置保持的 P-controller 增益（1m 误差 → kp m/s）
         nh_private_.param<double>("hold_kp", hold_kp_, 0.8);
+        // 航向角速度限幅(rad/s)——避免 P-controller 输出过大旋转指令
+        nh_private_.param<double>("yaw_max_rate", yaw_max_rate_, 1.0);
 
         // 自动从命名空间获取 uav_id（如 ns="uav0" → id=0）
         std::string ns = ros::this_node::getNamespace();
@@ -193,7 +247,8 @@ public:
             uav_id_ = 0;
         }
 
-        // 基准点参数（默认为安阳）
+        // 基准点参数: 不再硬编码,而由 homePositionCallback() 从 PX4 自动加载
+        // 这里 param() 只在 fallback(没收到 PX4 home)时给个粗略初值
         nh_private_.param<double>("ref_lat", ref_lat_, ANYANG_LAT);
         nh_private_.param<double>("ref_lon", ref_lon_, ANYANG_LON);
         nh_private_.param<double>("ref_alt", ref_alt_, ANYANG_ALT);
@@ -238,6 +293,21 @@ public:
         mission_mode_sub_ = nh_.subscribe(
             "mission/mode", 10,
             &WaypointExecutor::missionModeCallback, this);
+
+        // === Phase 4: Skill(分段航点) — mission_manager 下发 ===
+        skill_sub_ = nh_.subscribe(
+            "waypoint_executor/skill", 10,
+            &WaypointExecutor::skillCallback, this);
+
+        // === Phase 6: AvoidanceCmd — uav_avoidance_node 下发(横向严禁 + 高度 bias + 速度 scale)===
+        avoidance_cmd_sub_ = nh_.subscribe(
+            "avoidance/cmd", 10,
+            &WaypointExecutor::avoidanceCmdCallback, this);
+
+        // === PX4 home 自动加载(ref_lat/lon/alt 的唯一权威来源)===
+        home_position_sub_ = nh_.subscribe(
+            "mavros/home_position/home", 10,
+            &WaypointExecutor::homePositionCallback, this);
     }
 
     void initPublishers() {
@@ -250,9 +320,9 @@ public:
         flight_mode_pub_ = nh_.advertise<std_msgs::Int16>(
             flight_mode_topic, 10);
 
-        // 执行状态
+        // 执行状态(legacy std_msgs::String,挪到独立 topic 不与 typed WaypointStatus 冲突)
         status_pub_ = nh_.advertise<std_msgs::String>(
-            "waypoint_executor/status", 10);
+            "waypoint_executor/legacy_status", 10);
 
         // 航点显示（RViz - NWU 坐标系）
         waypoints_rviz_pub_ = nh_.advertise<visualization_msgs::MarkerArray>(
@@ -261,6 +331,22 @@ public:
         // 航点路径（RViz Path显示）
         waypoint_path_pub_ = nh_.advertise<nav_msgs::Path>(
             "waypoint_executor/waypoint_path", 10);
+
+        // === Phase 4: typed WaypointStatus(mission_manager 用作 Skill 状态机门控)===
+        waypoint_status_pub_ = nh_.advertise<multi_uav_strike::WaypointStatus>(
+            "waypoint_executor/status", 10);
+
+        // === Phase 6: 当前航段终点(uav_avoidance_node 用于"我方当前线段终点"参考)===
+        current_target_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(
+            "waypoint_executor/current_target", 10);
+
+        // 默认 avoidance:全不约束
+        latest_avoidance_.lateral_blocked = true;
+        latest_avoidance_.lateral_max     = 0.0;
+        latest_avoidance_.vertical_bias   = 0.0;
+        latest_avoidance_.speed_scale     = 1.0;
+        latest_avoidance_.reverse_allowed = false;
+        has_latest_avoidance_ = false;
     }
 
     void initTimers() {
@@ -288,6 +374,23 @@ public:
 
         // 高度差 -> D (下向)
         ned_z = -(alt);// - ref_alt_);
+    }
+
+    /**
+     * PX4 home 一次性回调
+     * - 第一次收到就把 ref_lat_/ref_lon_/ref_alt_ 锁定到 PX4 当前 home
+     */
+    void homePositionCallback(const mavros_msgs::HomePosition::ConstPtr& msg) {
+        if (ref_initialized_) return;
+        if (msg->geo.latitude == 0.0 && msg->geo.longitude == 0.0) {
+            return;  // PX4 home 未稳定前发 0/0,忽略
+        }
+        ref_lat_ = msg->geo.latitude;
+        ref_lon_ = msg->geo.longitude;
+        ref_alt_ = msg->geo.altitude;
+        ref_initialized_ = true;
+        ROS_WARN("[WaypointExecutor] >>>> PX4 home loaded: lat=%.7f lon=%.7f alt=%.2f",
+                 ref_lat_, ref_lon_, ref_alt_);
     }
 
     // ============== 回调函数 ==============
@@ -362,11 +465,17 @@ public:
 
         // 从四元数提取偏航角（NED，北偏东）
         // NED坐标系下：yaw = atan2(2*(w*z + x*y), 1 - 2*(y^2 + z^2))
-        // 但更通用的公式（假设绕Z轴旋转）是：
-        double qx = msg->pose.orientation.x;
-        double qy = msg->pose.orientation.y;
-        double qz = msg->pose.orientation.z;
-        double qw = msg->pose.orientation.w;
+        // 四元数 ENU/FLU -> NED/FRD:
+        //   q_ned = q_T * q_enu * q_S
+        //   q_T = (1/√2, 1/√2, 0, 0)  世界系 ENU→NED(绕(1,1,0)轴 180°)
+        //   q_S = (1, 0, 0, 0)         机体系 FLU→FRD(绕 x 轴 180°)
+        // 展开后:
+        const double kSqrtHalf = 0.7071067811865475;
+        const auto& qe = msg->pose.orientation;
+        double qw = kSqrtHalf * (qe.w + qe.z);
+        double qx = kSqrtHalf * (qe.x + qe.y);
+        double qy = kSqrtHalf * (qe.x - qe.y);
+        double qz = kSqrtHalf * (qe.w - qe.z);
 
         // NED坐标系下从四元数提取yaw（ZYX顺序）
         // yaw (heading) = atan2(2*(qw*qz + qx*qy), 1 - 2*(qy^2 + qz^2))
@@ -395,8 +504,19 @@ public:
             return;
         }
 
-        // 只有 SEARCH_ONLY 模式下才发航点控制指令
-        // 其他模式（SEARCH_TRACK/SEARCH_STRIKE/IDLE）由 guidance_control_node 接管
+        // === Phase 4: 分段航点执行(若 active skill)===
+        if (segment_phase_ == SegmentPhase::ARRIVE ||
+            segment_phase_ == SegmentPhase::SKILL_AREA) {
+            executeSegmentFlight();
+            // 持续发 WaypointStatus(mission_manager 状态机门控)
+            publishWaypointStatus();
+            // 持续发当前航段终点(uav_avoidance_node 用)
+            publishCurrentTarget();
+            return;
+        }
+
+        // 兼容老路径:只有 SEARCH_ONLY 模式下才发航点控制指令
+        // 其他模式(SEARCH_TRACK/SEARCH_STRIKE/IDLE)由 guidance_control_node 接管
         if (current_work_mode_ != "SEARCH_ONLY") {
             return;
         }
@@ -405,7 +525,250 @@ public:
             return;
         }
 
-        executeWaypointFlight();
+        // executeWaypointFlight();
+    }
+
+    /**
+     * 分段航点执行(Phase 4)
+     * - 当前段(arrive_queue_ 或 skill_area_queue_)取当前 idx 航点
+     * - 沿切向飞(压航线:不补横向偏差,只算段方向)
+     * - 距离 ≤ arrival_threshold_ → idx++(段末则 advanceSegmentPhase)
+     * - SKILL_AREA 段速度 = task_speed_ 而不是 uav_speed_
+     * - 应用 AvoidanceCmd(lateral_blocked → 横向置零 / vertical_bias / speed_scale)
+     */
+    void executeSegmentFlight() {
+        // 选当前队列
+        std::vector<Waypoint>* cur_queue = nullptr;
+        size_t* cur_idx = nullptr;
+        double cur_speed = uav_speed_;
+        if (segment_phase_ == SegmentPhase::ARRIVE) {
+            cur_queue = &arrive_queue_;
+            cur_idx   = &arrive_idx_;
+            cur_speed = cruise_speed_ > 0.0 ? cruise_speed_ : uav_speed_;
+        } else if (segment_phase_ == SegmentPhase::SKILL_AREA) {
+            cur_queue = &skill_area_queue_;
+            cur_idx   = &skill_area_idx_;
+            cur_speed = task_speed_ > 0.0 ? task_speed_ : uav_speed_;
+        }
+        if (!cur_queue || cur_queue->empty()) {
+            advanceSegmentPhase();
+            return;
+        }
+
+        // idx 越界 → 完成
+        if (*cur_idx >= cur_queue->size()) {
+            advanceSegmentPhase();
+            return;
+        }
+
+        // === 段方向(压航线:用前一个点(或锁存的段起点)→ 当前点)===
+        // 首点:用锁存的 seg_start_(进入当前段时的飞机位置,不再刷新),保证段线固定,真正压线
+        // 后续:用上一个航点 → 当前航点
+        double seg_x0, seg_y0;
+        if (*cur_idx == 0) {
+            seg_x0 = seg_start_x_;
+            seg_y0 = seg_start_y_;
+        } else {
+            const auto& prev = (*cur_queue)[*cur_idx - 1];
+            seg_x0 = prev.ned_x;
+            seg_y0 = prev.ned_y;
+        }
+        const Waypoint& target_wp = (*cur_queue)[*cur_idx];
+
+        double dx_to_target = target_wp.ned_x - current_ned_x_;
+        double dy_to_target = target_wp.ned_y - current_ned_y_;
+        double dz_to_target = target_wp.ned_z - current_ned_z_;
+        double dist_to_target = sqrt(dx_to_target*dx_to_target +
+                                     dy_to_target*dy_to_target +
+                                     dz_to_target*dz_to_target);
+
+        // === 水平距离(终段切换判定用)===
+        double dist_h = sqrt(dx_to_target*dx_to_target + dy_to_target*dy_to_target);
+
+        double vx, vy;
+        double bearing;
+
+        // === 终段 P-control(水平面位置误差 → 速度,平滑收敛到 0)===
+        // 参考 PX4 位置控制器外环: pos_error → vel_sp (P-control),内环 PID 再做 att_sp + thrust
+        //   与现有 hold_kp_ 一致,行为可预测: v = hold_kp * dist_h
+        //     dist_h = 2.5m → 2.0 m/s(平顺接管)
+        //     dist_h = 1.0m → 0.8 m/s(慢速接近 arrival)
+        //     dist_h = 0.0m → 0.0 m/s(自然悬停)
+        // 与 L1 的对比:
+        //   - L1 用段方向算横向补偿,小 cross 时 v_lateral ≈ 0 + 切向刹停 v_along ≈ 0 → 卡死
+        //   - P-control 直接对位置误差反应,不依赖段方向,水平位置永远在收敛
+        if (dist_h < final_approach_threshold_) {
+            // P-control 速度(距离 → 速度,自然悬停)
+            double v_p = hold_kp_ * dist_h;
+            // 防御性限速(避免 hold_kp_ 配大时冲到 cur_speed 以上)
+            if (v_p > cur_speed) v_p = cur_speed;
+
+            if (dist_h > 0.01) {
+                vx = (dx_to_target / dist_h) * v_p;
+                vy = (dy_to_target / dist_h) * v_p;
+            } else {
+                // 距离极小(数值上几乎到点),直接悬停
+                vx = 0.0;
+                vy = 0.0;
+            }
+            // bearing 取直接朝航点(避免段方向偏差,支持在航点上 hover)
+            bearing = atan2(dy_to_target, dx_to_target);
+        } else {
+            // === L1 压航线控制(参考 PX4 旋翼外环控制:横距 → 横向速度)===
+            double seg_dx = target_wp.ned_x - seg_x0;
+            double seg_dy = target_wp.ned_y - seg_y0;
+            double seg_len = sqrt(seg_dx*seg_dx + seg_dy*seg_dy);
+
+            if (seg_len < 0.1) {
+                // 段退化为点(连续两航点重合 或 第一点已在到达半径内):
+                // 飞机离目标已经很近,无需再算速度,交给 arrival_threshold 推进
+                vx = 0.0;
+                vy = 0.0;
+            } else {
+                // 段方向单位向量 + 段法线(右手系,逆时针 90°)
+                double ux = seg_dx / seg_len;
+                double uy = seg_dy / seg_len;
+                double nx = -uy;
+                double ny =  ux;
+
+                // 飞机相对段起点的向量 → 切向 / 横向投影
+                double rx = current_ned_x_ - seg_x0;
+                double ry = current_ned_y_ - seg_y0;
+                double along = rx * ux + ry * uy;   // 切向(沿段方向投影)
+                double cross = rx * nx + ry * ny;   // 横向(带符号偏离段线)
+
+                // === 切向速度:物理限速(平方减速)保证无超调 ===
+                // 物理刹停距离: v² ≤ 2·a·d  →  v ≤ sqrt(2·a·d)
+                // 沿段方向剩余距离 dist_along_to_target > 0 时限速,< 0 时停止切向(由 L1 横向 + arrival_threshold 推进)
+                const double a_decel = 2.0;  // 减速度 m/s²(可按机型调,2~5)
+                double dist_along_to_target = seg_len - along;
+                double v_along;
+                if (dist_along_to_target <= 0.0) {
+                    // 已过目标(沿段正方向超出),切向速度置 0
+                    v_along = 0.0;
+                } else {
+                    // 在段上或段前:取 cur_speed 与物理刹停速度的较小值
+                    double v_max_brake = sqrt(2.0 * a_decel * dist_along_to_target);
+                    v_along = std::min(cur_speed, v_max_brake);
+                }
+
+                // === L1 横向补偿:把飞机压回航线 ===
+                // 参考 PX4 旋翼外环控制:横距误差 → 横向速度(简化版 P 控制)
+                const double l1_kp = 2.0;
+                double v_lateral = -l1_kp * cross;
+                // 限幅:横向速度不超过切向速度的 50%,避免大转向时失稳
+                double v_lateral_max = 0.5 * cur_speed;
+                if (v_lateral >  v_lateral_max) v_lateral =  v_lateral_max;
+                if (v_lateral < -v_lateral_max) v_lateral = -v_lateral_max;
+
+                // 合成 NED 速度(切向 + 横向)
+                vx = ux * v_along + nx * v_lateral;
+                vy = uy * v_along + ny * v_lateral;
+            }
+            // L1 模式下 bearing 取段方向(避免频繁切向)
+            bearing = atan2(seg_dy, seg_dx);
+        }
+        // 打印当前位置、目标位置、距离、段方位角
+        ROS_INFO_THROTTLE(1.0, "[WaypointExecutor] SegmentPhase=%d, idx=%lu, cur=(%.2f,%.2f,%.2f), target=(%.2f,%.2f,%.2f), dist=%.2f, bearing=%.1fdeg",
+                           static_cast<int>(segment_phase_), *cur_idx,
+                           current_ned_x_, current_ned_y_, current_ned_z_,
+                           target_wp.ned_x, target_wp.ned_y, target_wp.ned_z,
+                           dist_to_target, bearing * 180.0 / M_PI);
+
+        // === 垂直速度(参考 executeWaypointFlight 的限幅)===
+        double vz;
+        if (fabs(dz_to_target) > 1.0) {
+            vz = (dz_to_target > 0 ? 1.0 : -1.0) * uav_vertical_speed_;
+        } else {
+            vz = hold_kp_ * dz_to_target;
+        }
+        // 限幅(防御性,虽然上面已经限到 ±uav_vertical_speed_)
+        if (vz >  uav_vertical_speed_) vz =  uav_vertical_speed_;
+        if (vz < -uav_vertical_speed_) vz = -uav_vertical_speed_;
+
+        // === 应用 AvoidanceCmd(横向严禁需要段方向来分解速度,清掉横向补偿)===
+        applyAvoidanceCmd(vx, vy, vz, bearing);
+
+        // === 距离判定 ===
+        if (dist_to_target < arrival_threshold_) {
+            (*cur_queue)[*cur_idx].reached = true;
+            (*cur_idx)++;
+
+            if (*cur_idx >= cur_queue->size()) {
+                // 段末 → 切下一段
+                advanceSegmentPhase();
+                publishZeroVelocity();
+                return;
+            }
+
+            // 段内下一航点:继续按新段方向飞
+            publishZeroVelocity();
+            publishWaypointStatus();
+            return;
+        }
+
+        // === 发布速度+航向(沿段方向,不是目标方向)===
+        publishVelocityCommandWithYaw(vx, vy, vz, bearing);
+    }
+
+    /**
+     * 把 AvoidanceCmd 应用到速度指令
+     * 横向严禁(lateral_blocked=true)→ 强制 vx,vy = 沿段方向分量(去掉横向偏差)
+     * vertical_bias → 加到 vz
+     * speed_scale → 乘到 vx,vy(速度调整)
+     * reverse_allowed 且仍需让 → 允许 vx,vy 反向(简化:不实现)
+     *
+     * @param seg_bearing_ned 段方位角(NED),用于横向严禁时把速度投影到段方向
+     */
+    void applyAvoidanceCmd(double& vx, double& vy, double& vz, double seg_bearing_ned) {
+        if (!has_latest_avoidance_) return;
+
+        // 1. 高度 bias(直接加)
+        vz += static_cast<double>(latest_avoidance_.vertical_bias);
+
+        // 2. 速度缩放
+        double scale = static_cast<double>(latest_avoidance_.speed_scale);
+        vx *= scale;
+        vy *= scale;
+
+        // 3. 横向严禁 — L1 压航线后 vx,vy 有切向 + 横向分量,
+        //    把速度投影到段方向上,只保留切向,清除横向偏差补偿
+        if (latest_avoidance_.lateral_blocked) {
+            double cos_b = cos(seg_bearing_ned);
+            double sin_b = sin(seg_bearing_ned);
+            double v_along = vx * cos_b + vy * sin_b;
+            vx = cos_b * v_along;
+            vy = sin_b * v_along;
+            ROS_DEBUG_THROTTLE(5.0, "[WaypointExecutor] lateral_blocked=true (投影到段方向,横向清零)");
+        }
+
+        // reverse_allowed:本批次简化不实现
+    }
+
+    /**
+     * 发布当前航段终点(给 uav_avoidance_node 用于"我方当前线段终点"参考)
+     */
+    void publishCurrentTarget() {
+        geometry_msgs::PoseStamped cur;
+        cur.header.stamp    = ros::Time::now();
+        cur.header.frame_id = "map";
+        std::vector<Waypoint>* q = nullptr;
+        size_t* idx = nullptr;
+        if (segment_phase_ == SegmentPhase::ARRIVE) {
+            q = &arrive_queue_; idx = &arrive_idx_;
+        } else if (segment_phase_ == SegmentPhase::SKILL_AREA) {
+            q = &skill_area_queue_; idx = &skill_area_idx_;
+        }
+        if (q && !q->empty() && *idx < q->size()) {
+            const auto& wp = (*q)[*idx];
+            cur.pose.position.x = wp.ned_x;
+            cur.pose.position.y = wp.ned_y;
+            cur.pose.position.z = wp.ned_z;
+            cur.pose.orientation.w = 1.0;
+        } else {
+            cur.pose.orientation.w = 1.0;
+        }
+        current_target_pub_.publish(cur);
     }
 
     // ============== 模式回调 ==============
@@ -550,10 +913,10 @@ public:
             } else {
                 vx = (dx / horizontal_dist) * uav_speed_;
                 vy = (dy / horizontal_dist) * uav_speed_;
-		if (vertical_dist > 1)
-		  vz = (dz / vertical_dist) * uav_vertical_speed_;
-		else
-		  vz = hold_kp_ * dz;
+                if (vertical_dist > 1)
+                    vz = (dz / vertical_dist) * uav_vertical_speed_;
+                else
+                    vz = hold_kp_ * dz;
                 if (vz > uav_vertical_speed_) vz = uav_vertical_speed_;
                 if (vz < -uav_vertical_speed_) vz = -uav_vertical_speed_;
             }
@@ -625,23 +988,43 @@ public:
         vel_cmd.linear.y = vy;
         vel_cmd.linear.z = vz;
 
-        // angular.z 直接发送期望航向角（rad），由飞控完成控制
+        // === 航向控制:P-controller ===
+        // mavros setpoint_velocity.angular.z 是机体角速度(ENU:左转/CCW 为正,rad/s),
+        // 不是绝对航向角。需要根据 current_yaw_ned_ 和 desired_yaw_ned_ 算误差 → 角速率。
+        double yaw_error_ned = desired_yaw_ned - current_yaw_ned_;
+        // 角度环绕到 [-π, π](避免 ±180° 边界时选错方向)
+        while (yaw_error_ned >  M_PI) yaw_error_ned -= 2.0 * M_PI;
+        while (yaw_error_ned < -M_PI) yaw_error_ned += 2.0 * M_PI;
+        // P 控制 + 死区 + 限幅
+        const double yaw_kp       = 2.0;   // 比例增益(典型 1.0~3.0)
+        const double yaw_deadband = 0.05;  // ~3° 死区,避免小幅抖动
+        double yaw_rate_ned = 0.0;
+        if (fabs(yaw_error_ned) > yaw_deadband) {
+            yaw_rate_ned = yaw_kp * yaw_error_ned;
+            if (yaw_rate_ned >  yaw_max_rate_) yaw_rate_ned =  yaw_max_rate_;
+            if (yaw_rate_ned < -yaw_max_rate_) yaw_rate_ned = -yaw_max_rate_;
+        }
+        // NED → ENU 角速度(NED 是 CW+,ENU 是 CCW+,所以取反)
         vel_cmd.angular.x = 0.0;
         vel_cmd.angular.y = 0.0;
-        vel_cmd.angular.z = desired_yaw_ned;
+        vel_cmd.angular.z = -yaw_rate_ned;
 
-        // PX4 SITL: NED -> ENU 转换
+        // PX4 SITL: NED -> ENU 线性速度转换
         if (!use_sim_) {
             double ned_vx = vel_cmd.linear.x;
             double ned_vy = vel_cmd.linear.y;
             double ned_vz = vel_cmd.linear.z;
-            double ned_yaw = vel_cmd.angular.z;
-            // NED -> ENU: x_enu = y_ned, y_enu = x_ned, z_enu = -z_ned
+            // NED -> ENU 速度: x_enu = y_ned, y_enu = x_ned, z_enu = -z_ned
             vel_cmd.linear.x = ned_vy;
             vel_cmd.linear.y = ned_vx;
             vel_cmd.linear.z = -ned_vz;
-            vel_cmd.angular.z = -ned_yaw;
+            // angular.z 已经在上面算成 ENU 角速度,这里不需要再转换
         }
+        // 打印调试信息
+        ROS_INFO_THROTTLE(1.0, "[WaypointExecutor] Publishing velocity command: vx=%.2f, vy=%.2f, vz=%.2f, desired_yaw_ned=%.2fdeg， angular rate=%.2fdeg",
+                 vel_cmd.linear.x, vel_cmd.linear.y, vel_cmd.linear.z,
+                 desired_yaw_ned * 180.0 / M_PI,
+                 vel_cmd.angular.z * 180.0 / M_PI);
 
         setpoint_velocity_pub_.publish(vel_cmd);
 
@@ -827,6 +1210,172 @@ public:
             is_executing_ = true;
             ROS_INFO("[WaypointExecutor] Resumed");
         }
+    }
+
+    // ============== Phase 4: Skill + AvoidanceCmd 回调 ==============
+
+    /**
+     * Skill 回调(mission_manager 下发)
+     * 收到 Skill 后:
+     *   1. 保存 active_flow_id_/active_skill_id_/task_speed_
+     *   2. arrive_path 转 Waypoint 队列 → arrive_queue_
+     *   3. skill_area_path 转 Waypoint 队列 → skill_area_queue_
+     *   4. 重置 arrive_idx_=0 / skill_area_idx_=0
+     *   5. segment_phase_ = ARRIVE(若 arrive_path 非空)或 SKILL_AREA(若 arrive_path 为空)
+     *   6. 触发 RViz 显示
+     */
+    void skillCallback(const multi_uav_strike::Skill::ConstPtr& msg) {
+        ROS_WARN("[WaypointExecutor] >>>> Skill received: id=%s type=%u arrive=%lu skill=%lu",
+                 msg->skill_id.c_str(),
+                 static_cast<unsigned>(msg->skill_type),
+                 msg->arrive_path.poses.size(),
+                 msg->skill_area_path.poses.size());
+
+        active_flow_id_  = "";  // TaskFlow 里的 flow_id 需要额外下发,这里先用 skill_id
+        active_skill_id_ = msg->skill_id;
+        cruise_speed_    = msg->cruise_speed > 0.0 ? msg->cruise_speed : uav_speed_;
+        task_speed_      = msg->task_speed > 0.0 ? msg->task_speed : uav_speed_;
+
+        // arrive_path
+        arrive_queue_.clear();
+        for (const auto& pose : msg->arrive_path.poses) {
+            arrive_queue_.push_back(poseToWaypoint(pose));
+        }
+        arrive_idx_ = 0;
+
+        // skill_area_path
+        skill_area_queue_.clear();
+        for (const auto& pose : msg->skill_area_path.poses) {
+            skill_area_queue_.push_back(poseToWaypoint(pose));
+        }
+        skill_area_idx_ = 0;
+
+        // 段状态
+        if (!arrive_queue_.empty()) {
+            segment_phase_ = SegmentPhase::ARRIVE;
+            // 锁存段起点(进入 ARRIVE 时的飞机位置),后续 idx=0 用此值算段线
+            seg_start_x_ = current_ned_x_;
+            seg_start_y_ = current_ned_y_;
+        } else if (!skill_area_queue_.empty()) {
+            segment_phase_ = SegmentPhase::SKILL_AREA;
+            // 直接 SKILL_AREA(无 ARRIVE):同样锁存当前位置
+            seg_start_x_ = current_ned_x_;
+            seg_start_y_ = current_ned_y_;
+        } else {
+            segment_phase_ = SegmentPhase::IDLE;
+            ROS_WARN("[WaypointExecutor] >>>> Skill has NO paths, segment_phase=IDLE");
+        }
+
+        is_waypoints_received_ = true;
+        is_executing_          = true;
+        last_waypoint_reached_logged_ = false;
+        // 打印所有航点信息
+        ROS_WARN("[WaypointExecutor] >>>> Skill waypoints: ARRIVE=%lu, SKILL_AREA=%lu, cruise_speed=%.2f, task_speed=%.2f",
+                 arrive_queue_.size(), skill_area_queue_.size(), cruise_speed_, task_speed_);
+        for (size_t i = 0; i < arrive_queue_.size(); ++i) {
+            const auto& wp = arrive_queue_[i];
+            ROS_WARN("[WaypointExecutor] ARRIVE[%zu]: lat=%.6f lon=%.6f alt=%.2f ned=(%.2f, %.2f, %.2f) yaw=%.1fdeg",
+                     i, wp.lat, wp.lon, wp.alt, wp.ned_x, wp.ned_y, wp.ned_z, wp.desired_yaw_ned * 180.0 / M_PI);
+        }
+        for (size_t i = 0; i < skill_area_queue_.size(); ++i) {
+            const auto& wp = skill_area_queue_[i];
+            ROS_WARN("[WaypointExecutor] SKILL_AREA[%zu]: lat=%.6f lon=%.6f alt=%.2f ned=(%.2f, %.2f, %.2f) yaw=%.1fdeg",
+                     i, wp.lat, wp.lon, wp.alt, wp.ned_x, wp.ned_y, wp.ned_z, wp.desired_yaw_ned * 180.0 / M_PI);
+        }
+        publishSegmentForRviz();
+        publishWaypointStatus();
+    }
+
+    /** PoseStamped(GPS in position) → Waypoint */
+    Waypoint poseToWaypoint(const geometry_msgs::PoseStamped& pose) {
+        Waypoint wp;
+        wp.lat = pose.pose.position.x;
+        wp.lon = pose.pose.position.y;
+        wp.alt = pose.pose.position.z;
+        gpsToNed(wp.lat, wp.lon, wp.alt, wp.ned_x, wp.ned_y, wp.ned_z);
+
+        // orientation (四元数 → yaw)
+        double qx = pose.pose.orientation.x;
+        double qy = pose.pose.orientation.y;
+        double qz = pose.pose.orientation.z;
+        double qw = pose.pose.orientation.w;
+        if (fabs(qw - 1.0) < 0.01 && fabs(qx) < 0.01 && fabs(qy) < 0.01 && fabs(qz) < 0.01) {
+            wp.desired_yaw_ned = 0.0;
+        } else {
+            wp.desired_yaw_ned = atan2(2.0 * (qw * qz + qx * qy),
+                                       1.0 - 2.0 * (qy * qy + qz * qz));
+        }
+        wp.reached = false;
+        return wp;
+    }
+
+    /**
+     * AvoidanceCmd 回调(uav_avoidance_node 下发)
+     * 仅缓存,executorTimerCallback() 读 latest_avoidance_ 应用
+     */
+    void avoidanceCmdCallback(const multi_uav_strike::AvoidanceCmd::ConstPtr& msg) {
+        latest_avoidance_ = *msg;
+        has_latest_avoidance_ = true;
+    }
+
+    /**
+     * typed WaypointStatus 发布 — mission_manager 用作 Skill 状态机门控
+     */
+    void publishWaypointStatus() {
+        multi_uav_strike::WaypointStatus ws;
+        ws.flow_id  = active_flow_id_;
+        ws.skill_id = active_skill_id_;
+
+        switch (segment_phase_) {
+            case SegmentPhase::IDLE:        ws.phase = multi_uav_strike::WaypointStatus::PHASE_IDLE;        break;
+            case SegmentPhase::ARRIVE:      ws.phase = multi_uav_strike::WaypointStatus::PHASE_ARRIVE;      break;
+            case SegmentPhase::SKILL_AREA:  ws.phase = multi_uav_strike::WaypointStatus::PHASE_SKILL_AREA;  break;
+            case SegmentPhase::HOLD:        ws.phase = multi_uav_strike::WaypointStatus::PHASE_HOLD;        break;
+            case SegmentPhase::COMPLETE:    ws.phase = multi_uav_strike::WaypointStatus::PHASE_COMPLETE;    break;
+        }
+        ws.arrive_idx   = static_cast<uint32_t>(arrive_idx_);
+        ws.arrive_total = static_cast<uint32_t>(arrive_queue_.size());
+        ws.skill_idx    = static_cast<uint32_t>(skill_area_idx_);
+        ws.skill_total  = static_cast<uint32_t>(skill_area_queue_.size());
+
+        waypoint_status_pub_.publish(ws);
+    }
+
+    /** 发布当前航段队列给 RViz(到达段 / 任务段二选一) */
+    void publishSegmentForRviz() {
+        waypoint_queue_.clear();
+        if (segment_phase_ == SegmentPhase::ARRIVE) {
+            waypoint_queue_ = arrive_queue_;
+            current_waypoint_index_ = arrive_idx_;
+        } else if (segment_phase_ == SegmentPhase::SKILL_AREA) {
+            waypoint_queue_ = skill_area_queue_;
+            current_waypoint_index_ = skill_area_idx_;
+        }
+        publishWaypointsForRviz();
+    }
+
+    /**
+     * 切到下一段(ARRIVE → SKILL_AREA → COMPLETE)
+     */
+    void advanceSegmentPhase() {
+        if (segment_phase_ == SegmentPhase::ARRIVE) {
+            if (!skill_area_queue_.empty()) {
+                segment_phase_ = SegmentPhase::SKILL_AREA;
+                skill_area_idx_ = 0;
+                // 锁存段起点(ARRIVE→SKILL_AREA 切换时飞机位置,即最后一个 ARRIVE 航点附近)
+                seg_start_x_ = current_ned_x_;
+                seg_start_y_ = current_ned_y_;
+                ROS_WARN("[WaypointExecutor] ===== ARRIVE to SKILL_AREA =====");
+                publishSegmentForRviz();
+            } else {
+                segment_phase_ = SegmentPhase::COMPLETE;
+                ROS_WARN("[WaypointExecutor] ===== ARRIVE to COMPLETE (no skill_area) =====");
+            }
+        } else if (segment_phase_ == SegmentPhase::SKILL_AREA) {
+            segment_phase_ = SegmentPhase::COMPLETE;
+            ROS_WARN("[WaypointExecutor] ===== SKILL_AREA to COMPLETE =====");
+        }
+        publishWaypointStatus();
     }
 };
 

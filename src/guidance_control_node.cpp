@@ -8,6 +8,7 @@
 #include <std_msgs/Float32.h>
 #include <std_msgs/Bool.h>
 #include <std_msgs/String.h>
+#include <mavros_msgs/Thrust.h>
 #include <visualization_msgs/Marker.h>
 #include <limits>
 #include <Eigen/Eigen>
@@ -266,7 +267,7 @@ public:
         attitude_rates_pub_ = nh_.advertise<geometry_msgs::TwistStamped>(
             attitude_rates_topic_, 10);
 
-        thrust_cmd_pub_ = nh_.advertise<std_msgs::Float32>(
+        thrust_cmd_pub_ = nh_.advertise<mavros_msgs::Thrust>(
             thrust_cmd_topic_, 10);
 
         // flight_mode_pub_ 在仿真模式使用 quad/flight_mode，PX4 模式不使用（通过 mavros/set_mode 切换）
@@ -802,9 +803,10 @@ public:
         att_cmd.pose.orientation.z = -cmd.attitude.z();  // NWU -> NED
         attitude_cmd_pub_.publish(att_cmd);
 
-        // Publish thrust
-        std_msgs::Float32 thrust_cmd;
-        thrust_cmd.data = cmd.thrust;
+        // Publish thrust(mavros setpoint_attitude/thrust 要求 mavros_msgs::Thrust)
+        mavros_msgs::Thrust thrust_cmd;
+        thrust_cmd.header.stamp = ros::Time::now();
+        thrust_cmd.thrust = cmd.thrust;
         thrust_cmd_pub_.publish(thrust_cmd);
 
         // Set flight mode to attitude (仅仿真模式发布；PX4 SITL 由 mission_manager 通过 mavros/set_mode 切换)

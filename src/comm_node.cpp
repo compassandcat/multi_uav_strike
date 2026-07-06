@@ -1,9 +1,8 @@
 /**
  * comm_node.cpp
- * 通信节点：统一处理机间通信和地面站通信
+ * 通信节点：机间通信(地面站通信改由 typed TaskFlow 直达 mission_manager,不再走本节点)
  *
  * 职责：
- * - 接收地面站指令（工作模式、航点列表）
  * - 广播本机位置给其他无人机
  * - 汇总邻居无人机位置
  * - 共享目标发现信息
@@ -11,19 +10,15 @@
  * 订阅：
  * - /mavros/local_position/pose    - 本机位置（来自飞控）
  * - /inter_uav/other_uav_poses     - 邻居无人机位置
- * - /gs/mode_cmd                   - 地面站工作模式指令
- * - /gs/waypoint_upload            - 地面站航点列表
- * - /detection/yolo_result         - YOLO检测结果（目标发现）
+ * - /inter_uav/uav_status          - 邻居 UAV 心跳(Phase 7)
+ * - /detection/yolo_result         - YOLO检测结果（typed YoloDetection）
  * - /target_estimated_pose         - 目标估计位置（共享给队友）
  *
  * 发布：
- * - /inter_uav/self_pose           - 本机位置（发给其他无人机）
- * - /inter_uav/other_uav_poses    - 邻居无人机位置列表
- * - /inter_uav/target_info         - 目标信息（共享给队友）
- * - /gs/telemetry                  - 无人机状态回传
- * - /gs/target_report              - 目标检测/定位报告
- * - /mission/mode                   - 工作模式（转发地面站指令）
- * - /mission/waypoint_cmd           - 航点命令（转发地面站）
+ * - /inter_uav/self_pose           - 本机位置
+ * - /inter_uav/other_uav_poses     - 邻居无人机位置列表
+ * - /inter_uav/target_info         - 目标信息
+ * - /inter_uav/uav_status          - 本机状态心跳
  */
 
 #include <ros/ros.h>
@@ -36,11 +31,19 @@
 #include <geometry_msgs/Twist.h>
 #include <nav_msgs/Path.h>
 #include <sensor_msgs/NavSatFix.h>
+#include <mavros_msgs/HomePosition.h>
 
 // 自定义消息：目标信息
 // 后续可扩展为 custom_msgs/TargetInfo
 #include <vector>
 #include <string>
+#include <cstdint>
+#include <algorithm>
+
+// === Phase 7: 类型化心跳 ===
+#include "multi_uav_strike/InterUavStatus.h"
+#include "multi_uav_strike/UavGatherStatus.h"
+#include "multi_uav_strike/YoloDetection.h"
 
 class CommNode {
 private:
@@ -51,19 +54,19 @@ private:
     // ============== 订阅 ==============
     ros::Subscriber self_pose_sub_;          // 本机位置（来自飞控）
     ros::Subscriber other_uav_poses_sub_;    // 邻居无人机位置
-    ros::Subscriber gs_mode_cmd_sub_;        // 地面站工作模式
-    ros::Subscriber gs_waypoint_sub_;        // 地面站航点列表
-    ros::Subscriber yolo_result_sub_;        // YOLO检测结果
+    ros::Subscriber yolo_result_sub_;        // YOLO检测结果(typed YoloDetection)
     ros::Subscriber target_est_pose_sub_;    // 目标估计位置
+    // === Phase 7: 其他 UAV 心跳 ===
+    ros::Subscriber inter_uav_status_sub_;
+    // === PX4 home 自动加载 ===
+    ros::Subscriber home_position_sub_;
 
     // ============== 发布 ==============
-    ros::Publisher self_pose_pub_;           // 本机位置（发给其他无人机）
+    ros::Publisher self_pose_pub_;           // 本机位置(发给其他无人机)
     ros::Publisher other_uav_poses_pub_;     // 邻居无人机位置列表
     ros::Publisher target_info_pub_;         // 目标信息
-    ros::Publisher gs_telemetry_pub_;        // 无人机状态回传
-    ros::Publisher gs_target_report_pub_;    // 目标报告
-    ros::Publisher mission_mode_pub_;        // 工作模式（转发）
-    ros::Publisher mission_waypoint_pub_;    // 航点命令（转发）
+    // === Phase 7: 类型化心跳 ===
+    ros::Publisher inter_uav_status_pub_;
 
     // ============== 状态 ==============
     geometry_msgs::PoseStamped current_self_pose_;
@@ -78,10 +81,7 @@ private:
     std::vector<NeighborUav> neighbors_;
     double neighbor_timeout_;  // 邻居超时时间（秒）
 
-    // 地面站指令缓冲
-    std::string current_work_mode_ = "SEARCH_ONLY";
-    nav_msgs::Path current_waypoints_;
-    bool is_waypoints_received_ = false;
+    // (legacy /gs/* 状态缓冲已移除,任务入口由 typed TaskFlow 直达 mission_manager)
 
     // 目标信息
     struct TargetInfo {
@@ -96,24 +96,45 @@ private:
     ros::Time last_target_share_time_;
 
     // 定时器
-    ros::Timer telemetry_timer_;     // 状态回传定时器
     ros::Timer neighbor_check_timer_; // 邻居检查定时器
+    // === Phase 7: 心跳定时器(频率自适应 1/5/20Hz)===
+    ros::Timer inter_uav_status_timer_;
+
+    // === Phase 7: 心跳调频相关 ===
+    double heartbeat_base_rate_;    // 基础频率 (Hz,默认 1)
+    double heartbeat_near_rate_;    // 邻居 ≤40m 时频率 (Hz,默认 5)
+    double heartbeat_close_rate_;   // 邻居 ≤20m 时频率 (Hz,默认 20)
+    double heartbeat_near_thresh_;  // ≤此距离进入 near 频率 (m,默认 40)
+    double heartbeat_close_thresh_; // ≤此距离进入 close 频率 (m,默认 20)
+    double current_heartbeat_rate_; // 当前实际频率
+    uint8_t current_typed_work_mode_;   // 来自 mission_manager 的 typed mode(占位)
+    int32_t current_skill_type_;        // 当前 skill_type(占位)
+    std::string current_skill_id_;      // 当前 skill_id(占位)
+
+    // 邻居心跳缓存(用于调频 + 集结判断)
+    struct NeighborHeartbeat {
+        std::string sn;
+        multi_uav_strike::InterUavStatus::ConstPtr latest;
+        ros::Time last_update;
+    };
+    std::vector<NeighborHeartbeat> neighbor_heartbeats_;
 
     // 参数
     std::string uav_name_;
-    int telemetry_rate_;  // Hz
     bool use_sim_;        // 仿真/真机切换
 
-    // GPS 参考点（NED -> GPS 转换用）
-    double ref_lat_;      // 参考纬度（度）
-    double ref_lon_;      // 参考经度（度）
-    double ref_alt_;      // 参考高度（米）
+    // GPS 参考点（NED <-> GPS 转换用）。默认初始化为 0/0/0:
+    // 启动后由 homePositionCallback() 自动从 /<ns>/mavros/home_position/home 拉取 PX4 当前 home,
+    // 不再依赖 yaml 硬编码 (用户最新指示: 不应该硬编码 ref_*)。
+    double ref_lat_ = 0.0;      // 参考纬度（度）
+    double ref_lon_ = 0.0;      // 参考经度（度）
+    double ref_alt_ = 0.0;      // 参考高度（米）
+    bool ref_initialized_ = false;  // 是否已收到 PX4 home
 
 public:
     CommNode() : nh_private_("~"),
         neighbor_timeout_(5.0),
-        target_share_interval_(1.0),
-        telemetry_rate_(10) {
+        target_share_interval_(1.0) {
 
         initParams();
         initSubscribers();
@@ -121,19 +142,27 @@ public:
         initTimers();
 
         ROS_INFO("[Comm] CommNode initialized for UAV: %s", uav_name_.c_str());
-        ROS_INFO("[Comm] Telemetry rate: %d Hz", telemetry_rate_);
     }
 
     void initParams() {
         nh_private_.param<std::string>("uav_name", uav_name_, "uav0");
         nh_private_.param<double>("neighbor_timeout", neighbor_timeout_, 5.0);
         nh_private_.param<double>("target_share_interval", target_share_interval_, 1.0);
-        nh_private_.param<int>("telemetry_rate", telemetry_rate_, 10);
         nh_private_.param<bool>("use_sim", use_sim_, true);
-        // GPS 参考点（仿真时所有 UAV 共享，PX4 SITL 时各 UAV 用各自的 home）
-        nh_private_.param<double>("ref_lat", ref_lat_, 36.096);
-        nh_private_.param<double>("ref_lon", ref_lon_, 114.392);
-        nh_private_.param<double>("ref_alt", ref_alt_, 100.0);
+
+        // === Phase 7: 心跳调频参数 ===
+        nh_private_.param<double>("heartbeat_base_rate",  heartbeat_base_rate_,  1.0);
+        nh_private_.param<double>("heartbeat_near_rate",  heartbeat_near_rate_,  5.0);
+        nh_private_.param<double>("heartbeat_close_rate", heartbeat_close_rate_, 20.0);
+        nh_private_.param<double>("heartbeat_near_thresh",  heartbeat_near_thresh_,  40.0);
+        nh_private_.param<double>("heartbeat_close_thresh", heartbeat_close_thresh_, 20.0);
+        current_heartbeat_rate_ = heartbeat_base_rate_;
+        current_typed_work_mode_ = 0;
+        current_skill_type_ = 0;
+        // GPS 参考点不再从 yaml 硬编码,而由 PX4 /mavros/home_position/home 自动填充
+        nh_private_.param<double>("ref_lat", ref_lat_, ref_lat_);
+        nh_private_.param<double>("ref_lon", ref_lon_, ref_lon_);
+        nh_private_.param<double>("ref_alt", ref_alt_, ref_alt_);
     }
 
     void initSubscribers() {
@@ -154,16 +183,6 @@ public:
             "/inter_uav/self_pose", 10,
             &CommNode::otherUavPosesCallback, this);
 
-        // 地面站工作模式指令
-        gs_mode_cmd_sub_ = nh_.subscribe(
-            "/gs/mode_cmd", 10,
-            &CommNode::gsModeCmdCallback, this);
-
-        // 地面站航点列表
-        gs_waypoint_sub_ = nh_.subscribe(
-            "/gs/waypoint_upload", 10,
-            &CommNode::gsWaypointCallback, this);
-
         // YOLO 检测结果（目标发现）
         yolo_result_sub_ = nh_.subscribe(
             "detection/yolo_result", 10,
@@ -173,6 +192,16 @@ public:
         target_est_pose_sub_ = nh_.subscribe(
             "target_estimated_pose", 10,
             &CommNode::targetEstPoseCallback, this);
+
+        // === Phase 7: 其他 UAV 心跳(全局 topic)===
+        inter_uav_status_sub_ = nh_.subscribe(
+            "/inter_uav/uav_status", 50,
+            &CommNode::interUavStatusCallback, this);
+
+        // === PX4 home 自动加载(ref_lat/lon/alt 的唯一来源,不再硬编码)===
+        home_position_sub_ = nh_.subscribe(
+            "mavros/home_position/home", 10,
+            &CommNode::homePositionCallback, this);
     }
 
     void initPublishers() {
@@ -188,33 +217,21 @@ public:
         target_info_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(
             "inter_uav/target_info", 10);
 
-        // 无人机状态回传地面站
-        gs_telemetry_pub_ = nh_.advertise<std_msgs::String>(
-            "gs/telemetry", 10);
-
-        // 目标检测/定位报告回传地面站
-        gs_target_report_pub_ = nh_.advertise<std_msgs::String>(
-            "gs/target_report", 10);
-
-        // 工作模式（转发给 mission_manager）
-        mission_mode_pub_ = nh_.advertise<std_msgs::String>(
-            "mission/mode", 10);
-
-        // 航点命令（转发给 waypoint_executor）
-        mission_waypoint_pub_ = nh_.advertise<nav_msgs::Path>(
-            "mission/waypoint_cmd", 10);
+        // === Phase 7: 类型化心跳(全局 topic)===
+        inter_uav_status_pub_ = nh_.advertise<multi_uav_strike::InterUavStatus>(
+            "/inter_uav/uav_status", 50);
     }
 
     void initTimers() {
-        // 状态回传定时器
-        telemetry_timer_ = nh_.createTimer(
-            ros::Duration(1.0 / telemetry_rate_),
-            &CommNode::telemetryTimerCallback, this);
-
         // 邻居检查定时器（1Hz）
         neighbor_check_timer_ = nh_.createTimer(
             ros::Duration(1.0),
             &CommNode::neighborCheckTimerCallback, this);
+
+        // === Phase 7: 心跳定时器(频率自适应)===
+        inter_uav_status_timer_ = nh_.createTimer(
+            ros::Duration(1.0 / current_heartbeat_rate_),
+            &CommNode::interUavStatusTimerCallback, this);
     }
 
     // ============== 回调函数 ==============
@@ -269,6 +286,25 @@ public:
         alt = ref_alt_ - ned_z;  // NED: z 向下 -> alt: 海拔向上
     }
 
+    /**
+     * PX4 home 一次性回调
+     * - 第一次收到就把 ref_lat_/ref_lon_/ref_alt_ 锁定到 PX4 当前 home
+     * - 之后再收也不覆盖,避免飞行中 home 突变导致 NED 跳变
+     */
+    void homePositionCallback(const mavros_msgs::HomePosition::ConstPtr& msg) {
+        if (ref_initialized_) return;
+        if (msg->geo.latitude == 0.0 && msg->geo.longitude == 0.0) {
+            // PX4 在 home 未稳定前可能发 0/0,忽略
+            return;
+        }
+        ref_lat_ = msg->geo.latitude;
+        ref_lon_ = msg->geo.longitude;
+        ref_alt_ = msg->geo.altitude;
+        ref_initialized_ = true;
+        ROS_WARN("[Comm] >>>> PX4 home loaded: lat=%.7f lon=%.7f alt=%.2f",
+                 ref_lat_, ref_lon_, ref_alt_);
+    }
+
     void otherUavPosesCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
         // 忽略自己的消息
         if (msg->header.frame_id == uav_name_) {
@@ -299,33 +335,15 @@ public:
         publishOtherUavPoses();
     }
 
-    void gsModeCmdCallback(const std_msgs::String::ConstPtr& msg) {
-        current_work_mode_ = msg->data;
-        ROS_INFO("[Comm] Received mode command from GS: %s", current_work_mode_.c_str());
-
-        // 转发给 mission_manager
-        std_msgs::String mode_msg;
-        mode_msg.data = current_work_mode_;
-        mission_mode_pub_.publish(mode_msg);
-    }
-
-    void gsWaypointCallback(const nav_msgs::Path::ConstPtr& msg) {
-        current_waypoints_ = *msg;
-        is_waypoints_received_ = true;
-        ROS_INFO("[Comm] Received %lu waypoints from GS", msg->poses.size());
-
-        // 转发给 waypoint_executor
-        mission_waypoint_pub_.publish(current_waypoints_);
-    }
-
-    void yoloResultCallback(const std_msgs::String::ConstPtr& msg) {
-        // 收到 YOLO 检测结果，记录目标信息
-        // 格式： "class,confidence,x,y,z" 或简单处理
-        // TODO: 定义具体的 YOLO 消息格式
-
-        // ROS_INFO("[Comm] YOLO detection: %s", msg->data.c_str());
-
-        // 这里可以解析并存储目标信息，后续共享
+    void yoloResultCallback(const multi_uav_strike::YoloDetection::ConstPtr& msg) {
+        // 收到 typed YoloDetection(multi_uav_strike/YoloDetection)
+        // comm_node 当前仅做日志/转发占位,具体目标信息上报逻辑后续再做
+        if (!msg->is_in_fov) {
+            return;  // 矩形 FOV 外不处理
+        }
+        ROS_DEBUG("[Comm] YOLO detection: %s conf=%.2f bbox=[%.2f,%.2f,%.2f,%.2f]",
+                  msg->label.c_str(), msg->confidence,
+                  msg->x_min, msg->y_min, msg->x_max, msg->y_max);
     }
 
     void targetEstPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
@@ -343,31 +361,9 @@ public:
         target_info_pub_.publish(target_info);
 
         last_target_share_time_ = now;
-
-        // 回传地面站
-        reportTargetToGs(*msg);
     }
 
     // ============== 定时器回调 ==============
-
-    void telemetryTimerCallback(const ros::TimerEvent&) {
-        if (!is_self_pose_received_) {
-            return;
-        }
-
-        // 组装遥测数据
-        std_msgs::String telemetry;
-        std::ostringstream oss;
-        oss << "uav:" << uav_name_ << ";"
-            << "x:" << current_self_pose_.pose.position.x << ";"
-            << "y:" << current_self_pose_.pose.position.y << ";"
-            << "z:" << current_self_pose_.pose.position.z << ";"
-            << "mode:" << current_work_mode_ << ";"
-            << "neighbors:" << neighbors_.size();
-        telemetry.data = oss.str();
-
-        gs_telemetry_pub_.publish(telemetry);
-    }
 
     void neighborCheckTimerCallback(const ros::TimerEvent&) {
         // 清理超时的邻居
@@ -400,17 +396,104 @@ public:
         other_uav_poses_pub_.publish(pose_array);
     }
 
-    void reportTargetToGs(const geometry_msgs::PoseStamped& target_pose) {
-        std_msgs::String report;
-        std::ostringstream oss;
-        oss << "target_found:"
-            << "x:" << target_pose.pose.position.x << ";"
-            << "y:" << target_pose.pose.position.y << ";"
-            << "z:" << target_pose.pose.position.z << ";"
-            << "detected_by:" << uav_name_;
-        report.data = oss.str();
+    // ============== Phase 7: 类型化心跳 ==============
 
-        gs_target_report_pub_.publish(report);
+    /**
+     * 收到其他 UAV 的心跳 — 缓存 + 用于自适应调频
+     */
+    void interUavStatusCallback(const multi_uav_strike::InterUavStatus::ConstPtr& msg) {
+        if (msg->sn == uav_name_) {
+            return;  // 忽略自己的
+        }
+        bool found = false;
+        for (auto& nh : neighbor_heartbeats_) {
+            if (nh.sn == msg->sn) {
+                nh.latest = msg;
+                nh.last_update = ros::Time::now();
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            NeighborHeartbeat n;
+            n.sn = msg->sn;
+            n.latest = msg;
+            n.last_update = ros::Time::now();
+            neighbor_heartbeats_.push_back(n);
+            ROS_INFO("[Comm] New heartbeat neighbor: %s", msg->sn.c_str());
+        }
+    }
+
+    /**
+     * 心跳定时器回调:发布本机 InterUavStatus + 自适应调频
+     */
+    void interUavStatusTimerCallback(const ros::TimerEvent&) {
+        if (!is_self_pose_received_) return;
+
+        // 1. 发本机心跳
+        multi_uav_strike::InterUavStatus hs;
+        hs.sn            = uav_name_;
+        hs.work_mode     = current_typed_work_mode_;
+        hs.skill_type    = current_skill_type_;
+        hs.skill_id      = current_skill_id_;
+        hs.timestamp_us  = ros::Time::now().toNSec() / 1000;
+        hs.lat           = current_self_pose_.pose.position.x;
+        hs.lon           = current_self_pose_.pose.position.y;
+        hs.alt           = current_self_pose_.pose.position.z;
+        hs.yaw           = 0.0;  // 简化:暂不发 yaw
+        inter_uav_status_pub_.publish(hs);
+
+        // 2. 清理超时心跳
+        ros::Time now = ros::Time::now();
+        neighbor_heartbeats_.erase(
+            std::remove_if(neighbor_heartbeats_.begin(), neighbor_heartbeats_.end(),
+                           [&](const NeighborHeartbeat& n) {
+                               return (now - n.last_update).toSec() > neighbor_timeout_;
+                           }),
+            neighbor_heartbeats_.end());
+
+        // 3. 自适应调频:取最近邻居距离,据此选频率
+        double min_dist = computeClosestNeighborDistance();
+        double new_rate = heartbeat_base_rate_;
+        if (min_dist < heartbeat_close_thresh_) {
+            new_rate = heartbeat_close_rate_;
+        } else if (min_dist < heartbeat_near_thresh_) {
+            new_rate = heartbeat_near_rate_;
+        }
+
+        // 频率变化时才 setPeriod(避免每个 tick 重建 timer)
+        if (std::fabs(new_rate - current_heartbeat_rate_) > 0.01) {
+            current_heartbeat_rate_ = new_rate;
+            inter_uav_status_timer_.setPeriod(ros::Duration(1.0 / current_heartbeat_rate_));
+            ROS_INFO("[Comm] >>>> Heartbeat rate adjusted to %.1f Hz (closest UAV: %.1f m)",
+                     current_heartbeat_rate_, min_dist);
+        }
+    }
+
+    /**
+     * 计算最近邻居距离(米),无邻居返回 1e9
+     * 用心跳缓存的 lat/lon/alt 做粗算(同 uav_avoidance_node 算法)
+     */
+    double computeClosestNeighborDistance() {
+        if (neighbor_heartbeats_.empty()) return 1e9;
+
+        double self_lat = current_self_pose_.pose.position.x;
+        double self_lon = current_self_pose_.pose.position.y;
+        double self_alt = current_self_pose_.pose.position.z;
+
+        double min_dist = 1e9;
+        for (const auto& n : neighbor_heartbeats_) {
+            if (!n.latest) continue;
+            double dlat = n.latest->lat - self_lat;
+            double dlon = n.latest->lon - self_lon;
+            double dalt = n.latest->alt - self_alt;
+            double cos_lat = std::max(0.1, std::cos(self_lat * M_PI / 180.0));
+            double dx = dlat * 111000.0;
+            double dy = dlon * 111000.0 * cos_lat;
+            double dist = std::sqrt(dx*dx + dy*dy + dalt*dalt);
+            if (dist < min_dist) min_dist = dist;
+        }
+        return min_dist;
     }
 };
 

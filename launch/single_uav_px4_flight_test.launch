@@ -24,12 +24,16 @@
   <!-- 命令行可覆盖参数                                                         -->
   <!-- ====================================================================== -->
   <!-- 默认 IDLE：飞机在地面等待，不会自动起飞。
-       切换流程示例：
-         rostopic pub -1 /gs/mode_cmd std_msgs/String "TAKEOFF"     # 起飞
-         rostopic pub -1 /gs/mode_cmd std_msgs/String "SEARCH_ONLY"  # 起飞后开始航点飞行
+       flow 选定后由 gs_simulator_node.py 发布 typed TaskFlow 到 /<ns>/mission/task_flow,
+       mission_manager 根据首发 skill 自动切 work_mode。
+       可选 flow:
+         - ground_search_strike  (地面起飞 + 搜索 + 打击)
+         - ground_search_track   (地面起飞 + 搜索跟踪)
+         - ground_gather_search  (地面起飞 + 集结 + 搜索)
+         - catapult_search_return(弹射起飞 + 搜索 + 返航)
   -->
-  <arg name="mode" default="IDLE" />
   <arg name="uav_name" default="uav0" />
+  <arg name="flow" default="" />
 
   <!-- Set GeographicLib data path -->
   <!-- <env name="GEOGRAPHICLIB_DATA" value="$(env HOME)/.GeographicLib" /> -->
@@ -158,6 +162,34 @@
     </node>
   </group>
 
+  <!-- 8b. 检测模拟节点(基于相机 FOV 矩形判定) -->
+  <group ns="$(arg uav_name)">
+    <node name="detection_simulator_node"
+          pkg="multi_uav_strike"
+          type="detection_simulator_node"
+          output="screen"
+          respawn="false">
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/common.yaml" />
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/detection_simulator.yaml" />
+    </node>
+  </group>
+
+  <!-- 8c. 机间避障决策节点 -->
+  <group ns="$(arg uav_name)">
+    <node name="uav_avoidance_node"
+          pkg="multi_uav_strike"
+          type="uav_avoidance_node"
+          output="screen"
+          respawn="false">
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/common.yaml" />
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/uav_avoidance.yaml" />
+    </node>
+  </group>
+
   <!-- ====================================================================== -->
   <!-- 9. 地面站模拟器（仿真测试用）                                            -->
   <!-- ====================================================================== -->
@@ -168,8 +200,8 @@
       <param name="gcs_ip" value="192.168.1.1" />
       <param name="gcs_udp_port" value="14550" />
       <param name="gcs_kcp_port" value="18990" />
-      <param name="device_name" value="uav3" />
-      <param name="device_sn" value="5678" />
+      <param name="device_name" value="$(arg uav_name)" />
+      <param name="device_sn" value="$(arg uav_name)" />
       <!--param name="uav_id" value="3" /-->
       <!--param name="device_sn" value="MAVLink_3_1" /-->
     </node>

@@ -1,0 +1,8 @@
+# MAV_CMD_ATTACK(51001) 的 typed 版本
+# 仅在跟踪状态(SEARCH_TRACK 模式下识别到目标)时有效
+# action:
+#   0 = 打击(解保,触发打击流程)
+#   1 = 忽略(取消跟踪,目标不上报)
+#   2 = 暂存(取消跟踪,目标按 type=2 上报)
+uint8    action
+float32  strike_speed

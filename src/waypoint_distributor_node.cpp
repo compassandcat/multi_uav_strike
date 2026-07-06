@@ -1,18 +1,14 @@
 /**
  * waypoint_distributor_node.cpp
- * 航点分发器：将地面站航点分别发送给各架无人机
+ * (DEPRECATED STUB) — 已移除 /gs/waypoint_upload 订阅:
+ *   新地面站不再走 /gs/* String 路径,所有指令均通过 typed TaskFlow 抵达 mission_manager,
+ *   本节点只保留 UAV 动态发现 + 空 publisher 占位,等待后续多机协同指令改造时再决定去留。
  *
- * 动态发现无人机数量：通过扫描 uav*_wp0_lat_offset 参数自动识别
+ * 历史订阅：
+ * - /gs/waypoint_upload  - 地面站原始航点(已移除)
  *
- * 订阅：
- * - /gs/waypoint_upload  - 地面站原始航点
- *
- * 发布：
- * - /uav0/mission/waypoint_cmd - UAV0 航点
- * - /uav1/mission/waypoint_cmd - UAV1 航点
- * - /uavN/mission/waypoint_cmd - UAVN 航点（N自动发现）
- *
- * 各无人机航点通过 launch 文件参数配置偏移量
+ * 历史发布：
+ * - /uavN/mission/waypoint_cmd - UAVN 航点(已无数据源,保留 publisher 占位)
  */
 
 #include <ros/ros.h>
@@ -38,21 +34,17 @@ private:
     };
     std::vector<UavWaypoints> uav_list_;
 
-    ros::Subscriber waypoint_sub_;
     double ref_alt_;
 
 public:
     WaypointDistributor() {
         nh_.param<double>("ref_alt", ref_alt_, 100.0);
 
-        // 动态发现无人机
+        // 动态发现无人机(保留 launch 参数扫描机制,确保老的多机 launch 不报错)
         discoverUavs();
 
-        waypoint_sub_ = nh_.subscribe(
-            "gs/waypoint_upload", 10,
-            &WaypointDistributor::waypointCallback, this);
-
-        ROS_INFO("[WaypointDistributor] Initialized with %zu UAVs:", uav_list_.size());
+        ROS_INFO("[WaypointDistributor] (deprecated stub) Initialized with %zu UAVs:",
+                 uav_list_.size());
     }
 
     void discoverUavs() {
@@ -93,28 +85,7 @@ public:
         }
     }
 
-    void waypointCallback(const nav_msgs::Path::ConstPtr& msg) {
-        for (size_t i = 0; i < uav_list_.size(); i++) {
-            UavWaypoints& uav = uav_list_[i];
-            nav_msgs::Path path;
-            path.header.stamp = ros::Time::now();
-            path.header.frame_id = "map";
-
-            for (size_t j = 0; j < uav.offsets.size() && j < msg->poses.size(); j++) {
-                geometry_msgs::PoseStamped wp = msg->poses[j];
-                wp.pose.position.x += uav.offsets[j].lat_offset;
-                wp.pose.position.y += uav.offsets[j].lon_offset;
-                wp.pose.position.z = uav.offsets[j].alt;
-                path.poses.push_back(wp);
-            }
-
-            if (!path.poses.empty()) {
-                uav.pub.publish(path);
-                ROS_INFO("[WaypointDistributor] Published %zu waypoints to %s",
-                         path.poses.size(), uav.name.c_str());
-            }
-        }
-    }
+    // 已移除 waypointCallback(): /gs/waypoint_upload 无数据源,数据流改走 typed TaskFlow
 };
 
 int main(int argc, char** argv) {
