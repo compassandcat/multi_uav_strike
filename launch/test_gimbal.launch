@@ -158,8 +158,11 @@
   </group>
 
   <!-- ====================================================================== -->
-  <!-- 8b. 机间避障决策节点(基于优先级,横向严禁 + 高度 bias + 速度 scale)        -->
-  <!--    注: 检测功能已合并到 gimbal_simulator_node(FOV 由当前云台角度决定)   -->
+  <!-- 8b. 已移除 detection_simulator_node: 检测功能已合并到 gimbal_simulator_node -->
+  <!-- ====================================================================== -->
+
+  <!-- ====================================================================== -->
+  <!-- 8c. 机间避障决策节点(基于优先级,横向严禁 + 高度 bias + 速度 scale)        -->
   <!-- ====================================================================== -->
   <group ns="$(arg uav_name)">
     <node name="uav_avoidance_node"
@@ -177,18 +180,7 @@
   <!-- ====================================================================== -->
   <!-- 9. 地面站模拟器（仿真测试用）                                            -->
   <!-- ====================================================================== -->
-  <node name="gs_simulator_node"
-        pkg="multi_uav_strike"
-        type="gs_simulator_node.py"
-        output="screen"
-        respawn="false"
-        args=""
-        launch-prefix="bash -c 'sleep 2; $@' --" >
-    <param name="flow" value="$(arg flow)" />
-    <param name="uav_ns" value="$(arg uav_name)" />
-    <rosparam command="load"
-                file="$(find multi_uav_strike)/config/common.yaml" />
-  </node>
+
  
   <!--group ns="$(arg uav_name)"-->
     <node pkg="starling_bridge" type="starling_bridge" name="starling_bridge" output="screen">

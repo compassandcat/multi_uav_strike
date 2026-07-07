@@ -140,16 +140,8 @@ target_link_libraries(waypoint_distributor_node
 add_dependencies(waypoint_distributor_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 
 # ========== Phase 1+: 新增节点 ==========
-# 9. 检测模拟节点(基于相机 FOV 几何投屏 + is_in_fov)
-add_executable(detection_simulator_node
-  src/detection_simulator_node.cpp
-)
-target_link_libraries(detection_simulator_node
-  ${catkin_LIBRARIES}
-)
-add_dependencies(detection_simulator_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
-
-# 10. 机间避障决策节点(优先级排序 + 压航线兼容)
+# 注: detection_simulator_node 已合并到 gimbal_simulator_node (2026-07-07)
+# 9. 机间避障决策节点(优先级排序 + 压航线兼容)
 add_executable(uav_avoidance_node
   src/uav_avoidance_node.cpp
 )
@@ -168,7 +160,6 @@ install(TARGETS
   waypoint_executor_node
   mission_manager_node
   waypoint_distributor_node
-  detection_simulator_node
   uav_avoidance_node
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

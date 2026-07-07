@@ -45,6 +45,7 @@
 #include <std_msgs/String.h>
 #include <std_msgs/Bool.h>
 #include <std_msgs/Int16.h>
+#include <std_msgs/Float32.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/TwistStamped.h>
 #include <geometry_msgs/PoseArray.h>
@@ -207,6 +208,7 @@ private:
     ros::Publisher guidance_enable_pub_;
     ros::Publisher guidance_mode_pub_;       // 模式："strike" 或 "track"
     ros::Publisher guidance_target_pub_;
+    ros::Publisher guidance_speed_pub_;  // 拦截速度(下发到 guidance_control)
     ros::Publisher avoidance_vector_pub_;
     ros::Publisher emergency_stop_pub_;
     ros::Publisher status_pub_;
@@ -268,6 +270,9 @@ private:
     // 毫米波避障参数
     double low_speed_threshold_;  // 12 m/s
     bool is_obstacle_detected_;
+
+    // 下发给 guidance_control_node 的拦截速度(InterceptGuidance 用)
+    double guidance_speed_;
     double obstacle_distance_;
 
     // 螺旋接近参数
@@ -373,6 +378,7 @@ public:
         low_speed_threshold_(12.0),
         is_spiral_active_(false),
         is_guidance_active_(false),
+        guidance_speed_(10.0),    // 默认 10 m/s,可在 mission_manager.yaml 的 ~max_speed 覆盖
         strike_distance_threshold_(2.0),
         mission_loop_rate_(50.0),
         target_lock_confidence_(0.7),
@@ -579,6 +585,9 @@ public:
 
         guidance_mode_pub_ = nh_.advertise<std_msgs::String>(
             "guidance/mode", 10);
+
+        guidance_speed_pub_ = nh_.advertise<std_msgs::Float32>(
+            "guidance/guidance_speed", 10);
 
         guidance_target_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(
             "guidance/target_pose", 10);
@@ -1229,6 +1238,7 @@ public:
             ROS_WARN("[MissionManager] >>>> YOLO+Attack+IN_TASK [STRIKE]: trigger strike "
                      "(yolo_age=%.2fs conf=%.2f)",
                      yolo_age, latest_yolo_->confidence);
+            guidance_speed_ = sr.msg.task_speed;
             triggerStrike();
         } else {
             // SEARCH_TRACK:锁目标等 attack_cmd
@@ -1297,7 +1307,11 @@ public:
     // PX4 SITL: 执行起飞状态机
     void runPx4TakeoffSequence() {
         // 关键门控：只有 PHASE_TAKING_OFF 或 PHASE_HOVERING 才推进起飞流程（避免 GROUND_IDLE 时 FCU 一连上就自动起飞）。
-        if (current_phase_ != MissionPhase::PHASE_TAKING_OFF && current_phase_ != MissionPhase::PHASE_HOVERING) {
+        // 注:HOLDING 也豁免 — enterHoldState() 需要 setpoint publisher 持续发 OFFBOARD setpoint 来稳悬停
+        //    (taskFlowCallback 会在新 flow 到达时显式 stop, 这里早 return 不会漏停)
+        if (current_phase_ != MissionPhase::PHASE_TAKING_OFF &&
+            current_phase_ != MissionPhase::PHASE_HOVERING &&
+            current_phase_ != MissionPhase::PHASE_HOLDING) {
             // 切出 TAKING_OFF 时：停止 setpoint 发布器（避免持续发送位置指令覆盖其他模块）
             if (setpoint_running_) {
                 stopSetpointPublisher();
@@ -1570,6 +1584,18 @@ public:
     // 与 takeoff 的区别仅在于 z 目标:起飞是 takeoff_altitude_,holding 是当前高度
     // PX4 OFFBOARD 持续 setpoint 才能稳悬停,这是最简单可控的 hold 方案
     void enterHoldState() {
+        if (is_pose_received_) {
+        ROS_WARN("[MissionManager] HOLDING current_pose (NED): x=%.2f y=%.2f z=%.2f",
+            current_pose_.pose.position.x,
+            current_pose_.pose.position.y,
+            current_pose_.pose.position.z);
+        }
+
+        // 幂等:advanceSkillStateMachine() 在 10Hz 重复 tick,只要 last_skill 仍是 COMPLETE 就会再次进入这里。
+        // 已经在 HOLDING 时直接 return,避免反复 start/stop setpoint publisher。
+        if (current_phase_ == MissionPhase::PHASE_HOLDING) {
+            return;
+        }
         current_phase_ = MissionPhase::PHASE_HOLDING;
         // has_task_flow_ 保持 true(队列不清,用于 MissionState 上报 last_skill_type 供 GS 观测)
         // skill_queue_ 也不清
@@ -2081,15 +2107,17 @@ public:
                              current_skill_index_, sr.msg.skill_id.c_str());
                     break;
                 }
-                // 普通门控:executor 报告 phase=ARRIVE 且 arrive_idx=arrive_total-1
+                // 普通门控:executor 报告 phase=ARRIVE 且 arrive_idx 走完 (arrive_idx >= arrive_total)
+                // 修复:原来是 arrive_idx + 1 >= arrive_total,会在 idx = total - 1 (即飞机刚开始
+                //   飞向最后一个 arrive 航点)时就触发,导致 COMPLETE 太早、enterHoldState 在中途捕获 pose,
+                //   飞机继续飞到末点后又飞回捕获点。改为 idx >= total,等最后一个 arrive 航点 *到达* 才推进。
                 if (!latest_wp_status_) break;
-                if (latest_wp_status_->phase == multi_uav_strike::WaypointStatus::PHASE_ARRIVE &&
-                    latest_wp_status_->arrive_idx + 1 >= latest_wp_status_->arrive_total &&
+                if (latest_wp_status_->arrive_idx >= latest_wp_status_->arrive_total &&
                     latest_wp_status_->skill_id == sr.msg.skill_id) {
                     sr.state = SkillState::ENTRY_PENDING;
                     sr.state_enter_time = now;
                     sr.entry_gate_enter_time = now;
-                    sr.last_event = "TRANSIT to ENTRY_PENDING (arrive last point)";
+                    sr.last_event = "TRANSIT to ENTRY_PENDING (arrive last point reached)";
                     ROS_WARN("[MissionManager] Skill[%zu] id=%s to ENTRY_PENDING",
                              current_skill_index_, sr.msg.skill_id.c_str());
                 }
@@ -2163,10 +2191,14 @@ public:
                     break;
                 }
 
-                // 其它 skill_type:门控 = phase=SKILL_AREA 且 skill_idx 走完
+                // 其它 skill_type:门控 = skill_idx 走完 (idx >= total),不限定 phase
+                // 修复:原来是 skill_idx + 1 >= skill_total,会在 idx = total - 1 (即飞机刚开始
+                //   飞向最后一个 skill_area 航点)时就触发,导致 enterHoldState 在中途捕获 pose,
+                //   飞机继续飞到末点后又飞回捕获点。改为 idx >= total,等最后一个 skill_area 航点
+                //   *到达* 才推进。此时 phase 已切到 SKILL_AREA(或 COMPLETE,无 skill_area),但 idx >= total
+                //   仍成立。
                 if (!latest_wp_status_) break;
-                if (latest_wp_status_->phase == multi_uav_strike::WaypointStatus::PHASE_SKILL_AREA &&
-                    latest_wp_status_->skill_idx + 1 >= latest_wp_status_->skill_total &&
+                if (latest_wp_status_->skill_idx >= latest_wp_status_->skill_total &&
                     latest_wp_status_->skill_id == sr.msg.skill_id) {
                     sr.state = SkillState::EXIT_PENDING;
                     sr.state_enter_time = now;
@@ -2371,10 +2403,16 @@ public:
         mode_msg.data = guidance_mode;
         guidance_mode_pub_.publish(mode_msg);
 
-        // 发送目标给制导
+        // 发送目标给制导,目前没有用
         guidance_target_pub_.publish(current_target_.pose);
 
-        ROS_WARN_THROTTLE(5.0, "[MissionManager] Starting guidance approach to target (mode: %s)", guidance_mode.c_str());
+        // 同步下发拦截速度(InterceptGuidance 用)
+        std_msgs::Float32 speed_msg;
+        speed_msg.data = static_cast<float>(guidance_speed_);
+        guidance_speed_pub_.publish(speed_msg);
+
+        ROS_WARN_THROTTLE(5.0, "[MissionManager] Starting guidance approach to target (mode: %s, guidance_speed_=%.2f)",
+                          guidance_mode.c_str(), guidance_speed_);
     }
 
     void disableGuidance() {
@@ -2388,17 +2426,22 @@ public:
         ROS_INFO("[MissionManager] Guidance disabled for SEARCH_ONLY mode");
     }
 
-    void enableGuidance() {
-        is_guidance_active_ = true;
+    // void enableGuidance() {
+    //     is_guidance_active_ = true;
 
-        // 使能制导（guidance_control_node 在 enabled 但无目标时会持续发零速度，
-        // 维持 PX4 OFFBOARD 心跳，避免 UAV 因 setpoint 断流触发 failsafe 降落）
-        std_msgs::Bool enable;
-        enable.data = true;
-        guidance_enable_pub_.publish(enable);
+    //     // 使能制导（guidance_control_node 在 enabled 但无目标时会持续发零速度，
+    //     // 维持 PX4 OFFBOARD 心跳，避免 UAV 因 setpoint 断流触发 failsafe 降落）
+    //     std_msgs::Bool enable;
+    //     enable.data = true;
+    //     guidance_enable_pub_.publish(enable);
 
-        ROS_INFO("[MissionManager] Guidance enabled");
-    }
+    //     // 同步下发拦截速度(InterceptGuidance 用)
+    //     std_msgs::Float32 speed_msg;
+    //     speed_msg.data = static_cast<float>(guidance_speed_);
+    //     guidance_speed_pub_.publish(speed_msg);
+
+    //     ROS_INFO("[MissionManager] Guidance enabled (strike_speed=%.2f m/s)", guidance_speed_);
+    // }
 
     void checkEmergencyStop() {
         // 低速时检查毫米波雷达

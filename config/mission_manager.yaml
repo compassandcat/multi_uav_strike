@@ -10,6 +10,8 @@ low_speed_threshold: 12.0
 target_lock_confidence: 0.7
 spiral_approach_duration: 10.0
 spiral_approach_radius: 20.0
+# 拦截速度(下发到 InterceptGuidance 替代 guidance_control.yaml 里的 uav_speed)
+max_speed: 10.0
 # 起飞高度达标后的等待时间（缩短起飞流程用）
 takeoff_stable_time: 1.0     # 高度达标后稳定时间（秒）
 takeoff_hover_time: 0.5      # 悬停等待时间（秒）

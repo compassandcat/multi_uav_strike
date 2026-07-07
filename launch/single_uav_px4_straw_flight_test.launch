@@ -155,19 +155,7 @@
     </node>
   </group>
 
-  <!-- 8b. 检测模拟节点(基于相机 FOV 矩形判定) -->
-  <group ns="$(arg uav_name)">
-    <node name="detection_simulator_node"
-          pkg="multi_uav_strike"
-          type="detection_simulator_node"
-          output="screen"
-          respawn="false">
-      <rosparam command="load"
-                file="$(find multi_uav_strike)/config/common.yaml" />
-      <rosparam command="load"
-                file="$(find multi_uav_strike)/config/detection_simulator.yaml" />
-    </node>
-  </group>
+  <!-- 8b. 已移除 detection_simulator_node: 检测功能已合并到 gimbal_simulator_node -->
 
   <!-- 8c. 机间避障决策节点 -->
   <group ns="$(arg uav_name)">

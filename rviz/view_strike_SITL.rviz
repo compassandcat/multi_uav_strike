@@ -7,6 +7,7 @@ Panels:
         - /Global Options1
         - /Status1
         - /Grid1
+        - /Pose1
         - /Pose2
       Splitter Ratio: 0.5365853905677795
     Tree Height: 1551
@@ -75,7 +76,7 @@ Visualization Manager:
       Shaft Length: 1
       Shaft Radius: 0.05000000074505806
       Shape: Arrow
-      Topic: /uav0/gimbal_pose
+      Topic: /uav0/camera/pose
       Unreliable: false
       Value: true
     - Class: rviz/Marker
@@ -83,7 +84,7 @@ Visualization Manager:
       Marker Topic: /uav0/target_estimated_marker
       Name: Marker
       Namespaces:
-        {}
+        estimated_target: true
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -178,7 +179,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 213.73062133789062
+      Distance: 210.8227996826172
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -186,17 +187,17 @@ Visualization Manager:
         Value: false
       Field of View: 1
       Focal Point:
-        X: -2.4229233264923096
-        Y: -15.495800971984863
-        Z: 35.296207427978516
+        X: -20.165294647216797
+        Y: -23.146167755126953
+        Z: 8.902006149291992
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.48479723930358887
+      Pitch: 0.4297974109649658
       Target Frame: <Fixed Frame>
-      Yaw: 3.1992270946502686
+      Yaw: 3.114225149154663
     Saved: ~
 Window Geometry:
   Displays:

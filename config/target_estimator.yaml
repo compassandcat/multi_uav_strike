@@ -17,7 +17,7 @@ target_z_weight: 0.1            # 目标 z 高度权重
 angle_error_dist_gain: 0.01     # 角度误差距离增益
 est_marker_r: 1.0               # 估计标记颜色 R
 est_marker_g: 0.0               # 估计标记颜色 G
-est_marker_b: 0.0               # 估计标记颜色 B
+est_marker_b: 1.0               # 估计标记颜色 B
 est_marker_a: 1.0               # 估计标记透明度
 # 旁路开关：true 时跳过粒子滤波，直接用 LOS+UAV高度 解算目标位置
 bypass_pf: true

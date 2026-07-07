@@ -507,6 +507,17 @@ public:
         // === Phase 4: 分段航点执行(若 active skill)===
         if (segment_phase_ == SegmentPhase::ARRIVE ||
             segment_phase_ == SegmentPhase::SKILL_AREA) {
+            // 衔接修复:attack/track handoff 时 mission_manager 发 "stop" → stop() 把
+            //   is_executing_ 置 false(但保留 segment_phase_ 和航点队列以便 resume)。
+            //   必须在这里拦截,否则 50Hz 定时器仍会调 executeSegmentFlight() 发非零速度,
+            //   与 guidance_control 的 setpoint 冲突,导致 PX4 OFFBOARD 看到速度跳变。
+            //   老路径(下方 SEARCH_ONLY 分支)本来就检查 is_executing_,但 Phase 4 漏了。
+            if (!is_executing_) {
+                //publishZeroVelocity();
+                publishWaypointStatus();  // 仍上报(mission_manager 门控依赖)
+                publishCurrentTarget();   // 仍上报(uav_avoidance 用)
+                return;
+            }
             executeSegmentFlight();
             // 持续发 WaypointStatus(mission_manager 状态机门控)
             publishWaypointStatus();

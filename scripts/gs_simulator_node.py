@@ -242,6 +242,42 @@ DEMO_FLOWS = {
             },
         ],
     },
+
+    # ---------- Demo 5: 地面起飞 + 搜索 (用于调试gimbal和目标定位) ----------
+    "ground_search": {
+        "flow_id": "demo_ground_search_001",
+        "work_mode": 3,  # SEARCH_ONLY — 仅搜索
+        "skills": [
+            # 1) Takeoff (地面起飞, takeoff_subtype=0)
+            {
+                "skill_id": "takeoff_001",
+                "skill_type": 100,
+                "takeoff_subtype": 0,
+                "takeoff_altitude": 30.0,  # 相对 PX4 home,目标 alt = home_alt + 30
+                "priority": 100,
+                "cruise_speed": 8.0,
+                "task_speed": 8.0,
+                "arrive_path": [],  # 起飞不需 arrive_path
+                "skill_area_path": [],
+            },
+            # 2) Search(到达搜索区,识别目标)
+            {
+                "skill_id": "search_001",
+                "skill_type": 102,
+                "priority": 100,
+                "cruise_speed": 8.0,
+                "task_speed": 6.0,
+                "arrive_path": [
+                    (0.0, -30.0, 30.0),   # 原地起飞到 30m 后先飞往搜索线南端上方
+                ],
+                "skill_area_path": [
+                    (-30.0, -30.0, 30.0),  # 搜索线南端 (目标在 y=10,这里在下边)
+                    (-30.0, 10.0, 30.0),   # 正对目标 (y=10 与目标 x/y 一致) — 应该在这里看到目标
+                    (-30.0, 30.0, 30.0),   # 越过目标继续搜索
+                ],
+            },
+        ],
+    },
 }
 
 

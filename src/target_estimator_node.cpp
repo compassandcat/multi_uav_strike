@@ -296,7 +296,7 @@ public:
         double uav_y = current_uav_pose_.pose.position.y;
         double uav_z = current_uav_pose_.pose.position.z;
         double pitch = current_los_angle_.y;
-        double yaw = current_los_angle_.x;
+        double yaw = -current_los_angle_.x;
 
         if (fabs(sin(pitch)) < 0.01) {
             return false;

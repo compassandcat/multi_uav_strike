@@ -29,6 +29,7 @@ private:
     ros::Subscriber real_target_sub_;  // 真实目标位置用于评估
     ros::Subscriber enable_sub_;       // 使能控制（来自 mission_manager）
     ros::Subscriber mode_sub_;        // 模式控制："strike" 或 "track"
+    ros::Subscriber uav_speed_sub_;   // 拦截速度(来自 mission_manager, 下发到 InterceptGuidance)
     ros::Subscriber other_uav_poses_sub_;  // 邻居无人机位置
 
     // Publishers
@@ -251,6 +252,11 @@ public:
             "guidance/mode", 10,
             &GuidanceControlNode::modeCallback, this);
 
+        // 拦截速度(来自 mission_manager,转发给 InterceptGuidance)
+        uav_speed_sub_ = nh_.subscribe(
+            "guidance/guidance_speed", 10,
+            &GuidanceControlNode::uavSpeedCallback, this);
+
         // 邻居无人机位置订阅（机间避障用）
         other_uav_poses_sub_ = nh_.subscribe(
             "inter_uav/other_uav_poses", 10,
@@ -365,6 +371,21 @@ public:
     void modeCallback(const std_msgs::String::ConstPtr& msg) {
         current_mode_ = msg->data;
         ROS_WARN_THROTTLE(5.0, "[Guidance] Mode changed to: %s", current_mode_.c_str());
+    }
+
+    void uavSpeedCallback(const std_msgs::Float32::ConstPtr& msg) {
+        const double speed = static_cast<double>(msg->data);
+        if (speed <= 0.0) {
+            ROS_WARN_THROTTLE(5.0, "[Guidance] Ignoring non-positive uav_speed: %.2f", speed);
+            return;
+        }
+        // 更新本节点的速度上限(用于 applyInterUavAvoidance 和 vel cmd 限速)
+        track_max_speed_ = speed;
+        // 下发到当前激活的策略(目前只有 Intercept 用到)
+        if (guidance_strategy_) {
+            guidance_strategy_->setUavSpeed(speed);
+        }
+        ROS_INFO("[Guidance] uav_speed updated to %.2f m/s", speed);
     }
 
     // 邻居无人机位置回调（机间避障用）
