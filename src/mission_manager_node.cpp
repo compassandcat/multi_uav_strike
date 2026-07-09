@@ -80,14 +80,20 @@
 #include "multi_uav_strike/UavGatherStatus.h"
 
 // 工作模式枚举
-// WorkMode 只表达「在任务区域内做什么」(对应 TZS MAV_CMD_SET_WORKMODE 0/1/2/3 语义)。
-// 起飞阶段不归 WorkMode 管,由 MissionPhase::PHASE_TAKING_OFF 表达,
-// 落地、返航、集结等阶段也不归 WorkMode,见 MissionPhase。
+// WorkMode 只表达「在任务区域内做什么」(对应 TZS MAV_CMD_SET_WORKMODE 语义)。
+// 起飞/落地/返航/集结等阶段不归 WorkMode 管,由 MissionPhase 表达。
+// 与 WorkMode.msg 同步:
+//   IDLE              = 0  (保留,UAV 空闲)
+//   SEARCH_ONLY       = 1
+//   SEARCH_TRACK      = 2
+//   SEARCH_STRIKE     = 3
+//   DENIED_ENV_FLIGHT = 4  (预留,未实现)
 enum class WorkMode {
-    IDLE,             // 等待：只获取 UAV 信息，不发任何控制指令（PX4 SITL 不发 setpoint）
+    IDLE,             // 等待:只获取 UAV 信息,不发任何控制指令(PX4 SITL 不发 setpoint)
     SEARCH_ONLY,      // 全图搜索
     SEARCH_TRACK,     // 搜索即跟踪
-    SEARCH_STRIKE     // 搜索即打击
+    SEARCH_STRIKE,    // 搜索即打击
+    DENIED_ENV_FLIGHT // 拒止环境飞行(预留,GPS 拒止/强对抗场景,未实现)
 };
 
 // 任务状态
@@ -156,7 +162,7 @@ struct SkillRuntime {
     std::string              last_event;
 };
 
-// === Phase 5: 目标锁定状态(供 attack_cmd 决策前置) ===
+// === Phase 5: 目标锁定状态(供 attack_cmd 决��前置) ===
 enum class TrackLockState {
     NOT_LOCKED,        // 未识别或识别后已退出
     LOCKED_WAIT_CONFIRM, // SEARCH_TRACK 模式:识别到目标,等地面站 attack_cmd
@@ -323,6 +329,20 @@ private:
     ros::Time takeoff_failed_time_;  // 进入 FAILED 状态的时间
     bool takeoff_failed_logged_;     // 是否已打印 FAILED 日志（避免重复刷屏）
 
+    // ============== PX4 返航降落 (Return skill 完成后) ==============
+    // 当任务流的最后一个 skill 是 Return(skill_type=103)且其 COMPLETE 时,
+    // mission_manager 切到 PHASE_RETURNING 并通过 setMode("AUTO.LAND") 让 PX4
+    // 自带降落+着陆后自动 disarm。落地后保持 RETURNING,UAV 不再起 setpoint publisher。
+    // 适用:
+    //   - 任务流结束于返航 → 自动落地收尾
+    //   - 任务流中段包含 Return → 仅落地,不结束任务(交给后续 skill)
+    //     (但当前业务上 Return 一般作为最后一条 skill)
+    // 多机协同:其他 UAV 不应把 PHASE_RETURNING 当成"可抢占",应继续执行各自任务。
+    bool        is_landing_in_progress_;     // 是否正在执行 AUTO.LAND 流程
+    ros::Time   landing_start_time_;         // 触发 AUTO.LAND 的时刻(用于安全超时)
+    bool        landing_complete_logged_;    // 是否已打印"落地完成"日志(避免刷屏)
+    double      landing_safety_timeout_sec_; // 着陆后仍未 disarm 的兜底超时(秒)
+
     // ============== MissionPhase 状态机 ==============
     MissionPhase current_phase_;         // 当前任务执行阶段
     bool is_waypoints_received_;         // 地面站是否已下发航点
@@ -396,6 +416,10 @@ public:
         max_takeoff_retries_(3),
         takeoff_retry_delay_(5.0),
         takeoff_failed_logged_(false),
+        is_landing_in_progress_(false),
+        landing_start_time_(ros::Time()),
+        landing_complete_logged_(false),
+        landing_safety_timeout_sec_(120.0),  // AUTO.LAND 兜底超时 120s
         current_phase_(MissionPhase::PHASE_GROUND_IDLE),
         is_waypoints_received_(false),
         current_waypoint_count_(0),
@@ -449,10 +473,11 @@ public:
         {
             std::string post_takeoff_mode_str;
             nh_private_.param<std::string>("post_takeoff_work_mode", post_takeoff_mode_str, "SEARCH_ONLY");
-            if      (post_takeoff_mode_str == "IDLE")         post_takeoff_work_mode_ = WorkMode::IDLE;
-            else if (post_takeoff_mode_str == "SEARCH_ONLY")  post_takeoff_work_mode_ = WorkMode::SEARCH_ONLY;
-            else if (post_takeoff_mode_str == "SEARCH_TRACK") post_takeoff_work_mode_ = WorkMode::SEARCH_TRACK;
-            else if (post_takeoff_mode_str == "SEARCH_STRIKE")post_takeoff_work_mode_ = WorkMode::SEARCH_STRIKE;
+            if      (post_takeoff_mode_str == "IDLE")              post_takeoff_work_mode_ = WorkMode::IDLE;
+            else if (post_takeoff_mode_str == "SEARCH_ONLY")       post_takeoff_work_mode_ = WorkMode::SEARCH_ONLY;
+            else if (post_takeoff_mode_str == "SEARCH_TRACK")      post_takeoff_work_mode_ = WorkMode::SEARCH_TRACK;
+            else if (post_takeoff_mode_str == "SEARCH_STRIKE")     post_takeoff_work_mode_ = WorkMode::SEARCH_STRIKE;
+            else if (post_takeoff_mode_str == "DENIED_ENV_FLIGHT") post_takeoff_work_mode_ = WorkMode::DENIED_ENV_FLIGHT;
             else {
                 ROS_WARN_THROTTLE(5.0, "[MissionManager] Unknown ~post_takeoff_work_mode='%s', fallback to SEARCH_ONLY",
                                   post_takeoff_mode_str.c_str());
@@ -836,6 +861,18 @@ public:
             return;
         }
 
+        // === 返航中收到新 task_flow 的兜底 ===
+        // 场景:Return skill 触发了 AUTO.LAND,但中途(未 disarm 前)GS 决定不降了,下发新任务
+        // 处理:清掉 is_landing_in_progress_,让 advanceSkillStateMachine 推新 skill
+        //   不需要切 PX4 mode(下面会触发起飞流程,OFFBOARD+ARM 序列会接管)
+        if (is_landing_in_progress_) {
+            ROS_WARN("[MissionManager] New TaskFlow arrived during AUTO.LAND — aborting landing, "
+                     "will reset to PHASE_GROUND_IDLE for fresh takeoff");
+            is_landing_in_progress_  = false;
+            landing_complete_logged_ = false;
+            current_phase_          = MissionPhase::PHASE_GROUND_IDLE;
+        }
+
         // 防御：如果当前 setpoint publisher 在跑(说明前序 flow 结束后进入 PHASE_HOLDING 或正在 takeoff),
         // 新 task_flow 到达时先停掉,避免与 waypoint_executor 双发 setpoint 冲突。
         if (setpoint_running_) {
@@ -916,7 +953,7 @@ public:
             }
         }
 
-        // 立刻把第一个 skill 推到 waypoint_executor
+        // 立刻把第一个 skill 推到 waypoint_executor (takeoff 守卫在 pushCurrentSkillToExecutor 内部)
         if (!skill_queue_.empty()) {
             pushCurrentSkillToExecutor();
         }
@@ -955,6 +992,15 @@ public:
             return;
         }
         const auto& sr = skill_queue_[current_skill_index_];
+        // === 守卫:takeoff skill 不推给 executor ===
+        // 起飞走 phase 通道 (runPx4TakeoffSequence() + performTakeoffHandoff()),
+        //   不归 executor 管。如果把 arrive_path 推给 executor,它会立即开始飞,
+        //   而 takeoff 还没爬升到目标高度,两套控制打架(handoff 强制 COMPLETE 也晚了一步)。
+        //   即使 arrive_path 为空也不推 — 保持"takeoff 不下发"的语义一致,让
+        //   后续 search/gather 真正要飞的航点从下一条 skill 开始下发。
+        if (sr.msg.skill_type == 100) {
+            return;
+        }
         // 推到 executor
         waypoint_skill_pub_.publish(sr.msg);
 
@@ -971,35 +1017,20 @@ public:
     /**
      * 类型化 WorkMode 回调
      * - 唯一的工作模式入口(已移除 /mission/mode String 兼容路径)
+     * - WorkMode 只表达"在任务区域内做什么",阶段语义由 MissionPhase 承载
      */
     void typedWorkModeCallback(const multi_uav_strike::WorkMode::ConstPtr& msg) {
         typed_work_mode_ = msg->mode;
         typed_work_mode_set_time_ = ros::Time::now();
         has_typed_work_mode_ = true;
 
-        // 映射 typed mode → 内部 WorkMode / MissionPhase
-        // 协议语义:SET_WORKMODE 表示"在任务区域内做什么",因此:
-        //   - IDLE / SEARCH_*       → 写 work_mode(行为)
-        //   - TAKEOFF / GATHER / RETURN / LAND → 写 phase(阶段),不动 work_mode
-        //   - typed TAKEOFF 与 taskFlowCallback 收到 Takeoff skill 走同一条 phase 推进路径,
-        //     保证两条入口都进入 PHASE_TAKING_OFF
+        // 映射 typed mode → 内部 WorkMode
+        // (WorkMode.msg 已精简,本 switch 只处理当前活跃的 5 个值)
         WorkMode new_mode = current_work_mode_;
         switch (msg->mode) {
             case multi_uav_strike::WorkMode::IDLE:
                 new_mode = WorkMode::IDLE;
                 break;
-            case multi_uav_strike::WorkMode::TAKEOFF:
-                if (current_phase_ != MissionPhase::PHASE_TAKING_OFF) {
-                    phase_before_takeoff_ = current_phase_;
-                    current_phase_ = MissionPhase::PHASE_TAKING_OFF;
-                    ROS_WARN("[MissionManager] Typed WorkMode=TAKEOFF to phase=TAKING_OFF (cached prev=%s)",
-                             missionPhaseToString().c_str());
-                }
-                return;  // 不动 work_mode
-            case multi_uav_strike::WorkMode::GATHER:
-                // 暂无内部 GATHER phase;仅记录意图,work_mode 不动
-                ROS_WARN_THROTTLE(5.0, "[MissionManager] Typed WorkMode=GATHER not yet implemented as phase");
-                return;
             case multi_uav_strike::WorkMode::SEARCH_ONLY:
                 new_mode = WorkMode::SEARCH_ONLY;
                 break;
@@ -1009,13 +1040,9 @@ public:
             case multi_uav_strike::WorkMode::SEARCH_STRIKE:
                 new_mode = WorkMode::SEARCH_STRIKE;
                 break;
-            case multi_uav_strike::WorkMode::RETURN:
-                // 暂无内部 RETURN phase;仅记录意图
-                ROS_WARN_THROTTLE(5.0, "[MissionManager] Typed WorkMode=RETURN not yet implemented as phase");
-                return;
-            case multi_uav_strike::WorkMode::LAND:
-                ROS_WARN_THROTTLE(5.0, "[MissionManager] Typed WorkMode=LAND not yet implemented as phase");
-                return;
+            case multi_uav_strike::WorkMode::DENIED_ENV_FLIGHT:
+                new_mode = WorkMode::DENIED_ENV_FLIGHT;
+                break;
             default:
                 ROS_WARN_THROTTLE(5.0, "[MissionManager] Unknown typed work_mode=%u", msg->mode);
                 return;
@@ -1208,8 +1235,11 @@ public:
      *          YOLO 回调只负责数据缓存和 GS 上报,职责单一。
      */
     void checkYoloDrivenStrike(const SkillRuntime& sr) {
-        // 门控 1:Attack skill 才参与决策(Search skill 只回传)
-        if (sr.msg.skill_type != 105) return;
+        // 门控 6:work_mode 必须是 STRIKE/TRACK
+        if (current_work_mode_ != WorkMode::SEARCH_STRIKE &&
+            current_work_mode_ != WorkMode::SEARCH_TRACK) return;
+        // 门控 1:搜索阶段可以进track，strike skill则可直接切入
+        if (sr.msg.skill_type != 105 && sr.msg.skill_type != 102) return;
         // 门控 2:必须已到 IN_TASK(执行区域第一个点之后)
         if (sr.state != SkillState::IN_TASK) return;
         // 门控 3:已在制导中,跳过(避免重复 trigger)
@@ -1221,9 +1251,7 @@ public:
         if (!latest_yolo_->is_in_fov) return;
         double yolo_age = (ros::Time::now() - latest_yolo_time_).toSec();
         if (yolo_age > 1.0) return;  // 超过 1s 视为过期,等下一次 YOLO 命中
-        // 门控 6:work_mode 必须是 STRIKE/TRACK
-        if (current_work_mode_ != WorkMode::SEARCH_STRIKE &&
-            current_work_mode_ != WorkMode::SEARCH_TRACK) return;
+
 
         // === 触发 ===
         if (current_work_mode_ == WorkMode::SEARCH_STRIKE) {
@@ -1248,7 +1276,8 @@ public:
             tracked_target_.latest     = dt_ptr;
             tracked_target_.lock_state = TrackLockState::LOCKED_WAIT_CONFIRM;
             tracked_target_.locked_at  = ros::Time::now();
-
+            guidance_speed_ = sr.msg.task_speed;
+            startGuidanceApproach();
             ROS_WARN("[MissionManager] >>>> YOLO+Attack+IN_TASK [TRACK]: target locked, "
                      "waiting for attack_cmd (yolo_age=%.2fs conf=%.2f)",
                      yolo_age, latest_yolo_->confidence);
@@ -1278,6 +1307,9 @@ public:
                 // 起飞未完成，跳过任务执行
                 return;
             }
+            // === 返航落地监控 (必须在 isTakeoffComplete 早 return 之后调用,避免落地检查被卡) ===
+            // 正常情况下 AUTO.LAND 流程中 takeoff_state_ 仍是 COMPLETE,这里能跑到
+            checkLandingComplete();
         }
 
         // 检查急停条件（毫米波雷达）
@@ -1297,6 +1329,9 @@ public:
                 break;
             case WorkMode::SEARCH_STRIKE:
                 handleSearchStrike();
+                break;
+            case WorkMode::DENIED_ENV_FLIGHT:
+                handleDeniedEnvFlight();
                 break;
         }
 
@@ -1585,7 +1620,7 @@ public:
     // PX4 OFFBOARD 持续 setpoint 才能稳悬停,这是最简单可控的 hold 方案
     void enterHoldState() {
         if (is_pose_received_) {
-        ROS_WARN("[MissionManager] HOLDING current_pose (NED): x=%.2f y=%.2f z=%.2f",
+        ROS_WARN_THROTTLE(1.0, "[MissionManager] HOLDING current_pose (NED): x=%.2f y=%.2f z=%.2f",
             current_pose_.pose.position.x,
             current_pose_.pose.position.y,
             current_pose_.pose.position.z);
@@ -1624,6 +1659,123 @@ public:
         }
 
         ROS_WARN("[MissionManager] ===== HOLDING: pose+heading locked, awaiting next task_flow =====");
+    }
+
+    // === RETURN + PX4 AUTO.LAND 落地 ===
+    // 由 advanceSkillStateMachine COMPLETE 分支(最后一个 skill = 103)调用
+    // 流程:
+    //   1. 停 waypoint_executor (避免与 PX4 内部控制冲突)
+    //   2. 停 setpoint publisher (AUTO.LAND 接管,不需要 OFFBOARD setpoint)
+    //   3. 禁用制导 (如有)
+    //   4. setMode("AUTO.LAND") — PX4 自带降落 + 着陆后自动 disarm
+    //   5. 标志 is_landing_in_progress_=true,phase=PHASE_RETURNING
+    //   6. 后续由 checkLandingComplete() 在 missionTimer 中监控 current_mavros_state_.armed
+    //      → false 判定落地完成
+    // 注意:
+    //   - PX4 AUTO.LAND 需要 UAV 已解锁(armed=true),否则会拒绝
+    //   - PX4 着陆后自动 disarm(配置 COM_DISARM_LAND),无需我们再发 disarm 命令
+    //   - 兜底:落地安全超时 landing_safety_timeout_sec_(默认 120s) 后若仍未 disarm,
+    //     强制调 armVehicle(false) — 防止 PX4 因地形/传感器异常卡在 AUTO.LAND
+    //   - 任务流中段出现 Return 也走同一入口(advanceSkillStateMachine 不区分位置)
+    //   - 中途有用户重新下发 task_flow 时,taskFlowCallback 顶部会清 is_landing_in_progress_
+    void triggerPx4Landing() {
+        if (is_landing_in_progress_) {
+            return;  // 幂等:已在降落流程,避免被 10Hz 状态机重复触发
+        }
+        is_landing_in_progress_   = true;
+        landing_start_time_       = ros::Time::now();
+        landing_complete_logged_  = false;
+        current_phase_            = MissionPhase::PHASE_RETURNING;
+
+        ROS_WARN("[MissionManager] ===== Return-skill  PX4 AUTO.LAND triggered =====");
+
+        // 1. 停 waypoint_executor (AUTO.LAND 接管水平位置 + 下降率,executor 不应再发速度)
+        {
+            std_msgs::String cmd;
+            cmd.data = "stop";
+            waypoint_control_pub_.publish(cmd);
+            ROS_WARN("[MissionManager]   - waypoint_executor stop sent");
+        }
+
+        // 2. 停 setpoint publisher (PX4 AUTO.LAND 不接受 OFFBOARD setpoint,留着会冲突)
+        if (setpoint_running_) {
+            stopSetpointPublisher();
+            ROS_WARN("[MissionManager]   - setpoint publisher stopped");
+        }
+
+        // 3. 禁用制导 (如有遗留)
+        if (is_guidance_active_) {
+            disableGuidance();
+            ROS_WARN("[MissionManager]   - guidance disabled");
+        }
+
+        // 4. 切 PX4 到 AUTO.LAND (set_mode_client 仅在 !use_sim_ 初始化)
+        if (!use_sim_ && set_mode_client_.exists()) {
+            mavros_msgs::SetMode sm;
+            sm.request.custom_mode = "AUTO.LAND";
+            if (set_mode_client_.call(sm) && sm.response.mode_sent) {
+                ROS_WARN("[MissionManager]   - PX4 mode set to AUTO.LAND (mode_sent=true)");
+            } else {
+                ROS_ERROR("[MissionManager]   - PX4 AUTO.LAND set FAILED (mode_sent=%d, current_mode=%s)",
+                          sm.response.mode_sent ? 1 : 0,
+                          current_mavros_state_.mode.c_str());
+            }
+        } else {
+            ROS_WARN("[MissionManager]   - use_sim_=%d, set_mode_client not available — "
+                     "skipping actual AUTO.LAND call (sim mode)",
+                     use_sim_ ? 1 : 0);
+        }
+
+        ROS_WARN("[MissionManager] ===== AUTO.LAND: waiting for touchdown + auto-disarm =====");
+    }
+
+    // 由 missionTimerCallback 每 tick 调用 — 监控 PX4 落地完成
+    // 完成判定:current_mavros_state_.armed 从 true → false (PX4 AUTO.LAND 着陆后自动 disarm)
+    // 兜底:启动后 landing_safety_timeout_sec_(默认 120s) 仍未 disarm → 强制 disarm
+    void checkLandingComplete() {
+        if (!is_landing_in_progress_) {
+            return;
+        }
+
+        if (!current_mavros_state_.armed) {
+            // 落地 + disarm 完成
+            if (!landing_complete_logged_) {
+                double elapsed = (ros::Time::now() - landing_start_time_).toSec();
+                ROS_WARN("[MissionManager] ===== LANDING COMPLETE: PX4 disarmed "
+                         "(elapsed=%.1fs, mode=%s) =====",
+                         elapsed, current_mavros_state_.mode.c_str());
+                ROS_WARN("[MissionManager] ===== UAV on ground. Awaiting next task_flow or shutdown. =====");
+                landing_complete_logged_ = true;
+                // 不再切回 PHASE_HOLDING (UAV 已在地面,setpoint publisher 不需要再起)
+                // GS 通过 MissionState.phase=RETURNING + state.armed=false 即可判定任务结束
+            }
+            return;
+        }
+
+        // 还在 ARMED 状态 — 检查是否需要兜底
+        double elapsed = (ros::Time::now() - landing_start_time_).toSec();
+        if (elapsed > landing_safety_timeout_sec_) {
+            // AUTO.LAND 卡住(可能因地形/传感器问题未触发 disarm),强制 disarm 兜底
+            // 强制前:先尝试切 POSCTL (脱离 AUTO.LAND 状态机),再 disarm,某些固件要求模式非 LAND 才能 disarm
+            if (!use_sim_ && set_mode_client_.exists()) {
+                mavros_msgs::SetMode sm;
+                sm.request.custom_mode = "POSCTL";
+                if (set_mode_client_.call(sm)) {
+                    ROS_WARN("[MissionManager]   - switched to POSCTL for force-disarm");
+                }
+                ros::Duration(0.2).sleep();
+            }
+            ROS_ERROR("[MissionManager] Landing timeout (%.1fs > %.1fs), forcing disarm",
+                      elapsed, landing_safety_timeout_sec_);
+            if (!use_sim_ && arming_client_.exists()) {
+                armVehicle(false);  // 调 mavros/cmd/arming value=false
+            }
+        } else {
+            ROS_WARN_THROTTLE(5.0, "[MissionManager] AUTO.LAND in progress (elapsed=%.1fs, mode=%s, armed=%d)",
+                              elapsed,
+                              current_mavros_state_.mode.c_str(),
+                              current_mavros_state_.armed ? 1 : 0);
+        }
     }
 
     // PX4 SITL: 启动 setpoint 发布线程
@@ -2073,12 +2225,12 @@ public:
         if (skill_queue_.empty()) return;
         // 打印当前 skill 状态机状态
         const SkillRuntime& sr = skill_queue_[current_skill_index_];
-        ROS_INFO("[MissionManager] Skill[%zu] id=%s type=%u state=%s",
+        ROS_INFO_THROTTLE(1.0, "[MissionManager] Skill[%zu] id=%s type=%u state=%s",
                            current_skill_index_, sr.msg.skill_id.c_str(),
                            static_cast<unsigned>(sr.msg.skill_type),
                            skillStateStr(sr.state).c_str());
         // 打印当前的phase阶段
-        ROS_INFO("[MissionManager] Current MissionPhase=%s",
+        ROS_INFO_THROTTLE(1.0, "[MissionManager] Current MissionPhase=%s",
                            missionPhaseToString().c_str());
         if (current_skill_index_ >= skill_queue_.size()) return;
         advanceSkillStateMachine();
@@ -2114,12 +2266,31 @@ public:
                 if (!latest_wp_status_) break;
                 if (latest_wp_status_->arrive_idx >= latest_wp_status_->arrive_total &&
                     latest_wp_status_->skill_id == sr.msg.skill_id) {
-                    sr.state = SkillState::ENTRY_PENDING;
-                    sr.state_enter_time = now;
-                    sr.entry_gate_enter_time = now;
-                    sr.last_event = "TRANSIT to ENTRY_PENDING (arrive last point reached)";
-                    ROS_WARN("[MissionManager] Skill[%zu] id=%s to ENTRY_PENDING",
-                             current_skill_index_, sr.msg.skill_id.c_str());
+                    // === 修复:skill_area_path 为空时,executor 直接 ARRIVE→COMPLETE,
+                    //   不会发 SKILL_AREA。如果照原逻辑进 ENTRY_PENDING 等 phase==SKILL_AREA,
+                    //   永远等不到,30s 后 entry_gate_timeout 才 FAILED,期间 UAV 悬停不动。
+                    //   语义上"已在入口"(没有 skill_area 需要进),直接进 IN_TASK。
+                    if (sr.msg.skill_area_path.poses.empty()) {
+                        sr.state = SkillState::IN_TASK;
+                        sr.state_enter_time = now;
+                        sr.in_task_enter_time = now;
+                        if (sr.msg.skill_type == 101) {
+                            // 101 集结合:记录进入时刻,等待其他 UAV 或 timeout
+                            sr.gather_enter_time = now;
+                        }
+                        sr.last_event = "TRANSIT to IN_TASK (skill_area empty, skip ENTRY_PENDING)";
+                        ROS_WARN("[MissionManager] Skill[%zu] id=%s to IN_TASK "
+                                 "(type=%u, skill_area empty, skipping ENTRY_PENDING)",
+                                 current_skill_index_, sr.msg.skill_id.c_str(),
+                                 static_cast<unsigned>(sr.msg.skill_type));
+                    } else {
+                        sr.state = SkillState::ENTRY_PENDING;
+                        sr.state_enter_time = now;
+                        sr.entry_gate_enter_time = now;
+                        sr.last_event = "TRANSIT to ENTRY_PENDING (arrive last point reached)";
+                        ROS_WARN("[MissionManager] Skill[%zu] id=%s to ENTRY_PENDING",
+                                 current_skill_index_, sr.msg.skill_id.c_str());
+                    }
                 }
                 break;
             }
@@ -2244,10 +2415,20 @@ public:
                              skill_queue_[current_skill_index_].msg.skill_type,
                              workModeToString().c_str());
                 } else {
-                    // 全部完成 — 进入 PHASE_HOLDING, 原地+当前航向悬停等新 task_flow
-                    ROS_WARN("[MissionManager] >>>> All skills COMPLETE (%zu total) to PHASE_HOLDING",
-                             skill_queue_.size());
-                    enterHoldState();
+                    // 全部完成 — 检查最后一个 skill 是否是 Return (skill_type=103)
+                    //   是 → 触发 PX4 AUTO.LAND 降落 (PX4 着陆后自动 disarm)
+                    //   否 → 进入 PHASE_HOLDING, 原地+当前航向悬停等新 task_flow
+                    const auto& last_skill = skill_queue_.back().msg;
+                    if (last_skill.skill_type == 103 && !is_landing_in_progress_) {
+                        ROS_WARN("[MissionManager] >>>> Last skill is Return (103) "
+                                 " triggering PX4 AUTO.LAND (safety_timeout=%.1fs)",
+                                 landing_safety_timeout_sec_);
+                        triggerPx4Landing();
+                    } else {
+                        ROS_WARN_THROTTLE(1.0, "[MissionManager] >>>> All skills COMPLETE (%zu total) to PHASE_HOLDING",
+                                 skill_queue_.size());
+                        enterHoldState();
+                    }
                 }
                 break;
             }
@@ -2338,6 +2519,17 @@ public:
             // 目标已锁定，直接启动制导接近
             startGuidanceApproach();
         }
+    }
+
+    void handleDeniedEnvFlight() {
+        // 拒止环境飞行(预留模式,未实现)
+        // 未来扩展:
+        //   - GPS 拒止场景下用视觉/VIO 替代 GPS 定位
+        //   - 强对抗环境下主动规避雷达/激光锁定
+        //   - 与电子战模块配合
+        // 当前实现:仅维持 IDLE-like 行为(不执行 search/track/strike),等待后续 PR
+        current_task_status_ = TaskStatus::IDLE;
+        ROS_WARN_THROTTLE(10.0, "[MissionManager] DENIED_ENV_FLIGHT mode reserved (not implemented yet)");
     }
 
     void startSpiralApproach() {
@@ -2550,6 +2742,7 @@ public:
             case WorkMode::SEARCH_ONLY: return "SEARCH_ONLY";
             case WorkMode::SEARCH_TRACK: return "SEARCH_TRACK";
             case WorkMode::SEARCH_STRIKE: return "SEARCH_STRIKE";
+            case WorkMode::DENIED_ENV_FLIGHT: return "DENIED_ENV_FLIGHT";
             default: return "UNKNOWN";
         }
     }

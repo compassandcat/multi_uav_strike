@@ -32,8 +32,6 @@
          - ground_gather_search  (地面起飞 + 集结 + 搜索)
          - catapult_search_return(弹射起飞 + 搜索 + 返航)
          - ground_search         (地面起飞 + 搜索)
-         - b47c_normal / groupb1bc  (真实任务数据,内置 ref_lat/lon 覆盖)
-
   -->
   <arg name="uav_name" default="uav0" />
   <arg name="flow" default="ground_search_track" />
@@ -179,18 +177,20 @@
   <!-- ====================================================================== -->
   <!-- 9. 地面站模拟器（仿真测试用）                                            -->
   <!-- ====================================================================== -->
-  <node name="gs_simulator_node"
-        pkg="multi_uav_strike"
-        type="gs_simulator_node.py"
-        output="screen"
-        respawn="false"
-        args=""
-        launch-prefix="bash -c 'sleep 2; $@' --" >
-    <param name="flow" value="$(arg flow)" />
-    <param name="uav_ns" value="$(arg uav_name)" />
-    <rosparam command="load"
-                file="$(find multi_uav_strike)/config/common.yaml" />
-  </node>
+
+ 
+  <group ns="$(arg uav_name)">
+    <node pkg="starling_bridge" type="starling_bridge" name="starling_bridge" output="screen">
+      <!-- 地面站 IP 和端口 -->
+      <param name="gcs_ip" value="192.168.101.100" />
+      <param name="gcs_udp_port" value="14550" />
+      <param name="gcs_kcp_port" value="18990" />
+      <param name="device_name" value="$(arg uav_name)" />
+      <param name="device_sn" value="5678" />
+      <!--param name="uav_id" value="2" />
+      <param name="device_sn" value="MAVLink_2_1" /-->
+    </node>
+  </group>
 
   <!-- ====================================================================== -->
   <!-- 10. RViz 可视化                                                          -->

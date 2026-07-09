@@ -822,165 +822,6 @@ public:
         }
     }
 
-    // ============== 执行逻辑 ==============
-
-    void executeWaypointFlight() {
-        if (current_waypoint_index_ >= waypoint_queue_.size()) {
-            ROS_INFO("[WaypointExecutor] All waypoints reached!");
-            is_executing_ = false;
-            publishZeroVelocity();
-            // TODO: 后续应切换到定点模式等待新指令
-            publishStatus("all_waypoints_completed");
-            return;
-        }
-
-        Waypoint& current_wp = waypoint_queue_[current_waypoint_index_];
-
-        double dx = current_wp.ned_x - current_ned_x_;
-        double dy = current_wp.ned_y - current_ned_y_;
-        double dz = current_wp.ned_z - current_ned_z_;
-        double dist = sqrt(dx*dx + dy*dy + dz*dz);
-
-        // 计算期望航向角
-        double desired_yaw_ned;
-        if (use_desired_yaw_from_wp_) {
-            // 跟踪地面站发送的航点期望航向
-            desired_yaw_ned = current_wp.desired_yaw_ned;
-        } else {
-            if (current_waypoint_index_ == 0) {
-                // 第一个航点：始终指向该航点
-                desired_yaw_ned = atan2(dy, dx);
-            } else {
-                // 后续航点：使用上一个航点到当前航点的方向，不再切换
-                const auto& prev_wp = waypoint_queue_[current_waypoint_index_ - 1];
-                double dx_prev = current_wp.ned_x - prev_wp.ned_x;
-                double dy_prev = current_wp.ned_y - prev_wp.ned_y;
-                desired_yaw_ned = atan2(dy_prev, dx_prev);
-            }
-        }
-
-        ROS_DEBUG_THROTTLE(1.0, "[WaypointExecutor] WP[%zu/%lu] dist=%.2f m, desired_yaw=%.1fdeg",
-                          current_waypoint_index_, waypoint_queue_.size(), dist,
-                          desired_yaw_ned * 180.0 / M_PI);
-
-        bool is_last = (current_waypoint_index_ == waypoint_queue_.size() - 1);
-
-        if (dist < arrival_threshold_) {
-            waypoint_queue_[current_waypoint_index_].reached = true;
-
-            if (is_last) {
-                // 最后一个航点：不递增 index，持续发送速度指令维持位置
-                // 否则 SITL 会因为停止 setpoint 进入 RTL/降落。
-                if (!last_waypoint_reached_logged_) {
-                    ROS_WARN("[WaypointExecutor] ===== Last waypoint %zu reached, holding position =====",
-                             current_waypoint_index_);
-                    last_waypoint_reached_logged_ = true;
-                }
-                // 不 return，落到下面的速度计算（此时 reached=true → P-controller 位置保持）
-            } else {
-                ROS_WARN("[WaypointExecutor] ===== Waypoint %zu reached! =====", current_waypoint_index_);
-                current_waypoint_index_++;
-                publishZeroVelocity();
-                return;
-            }
-        }
-
-        // 计算速度指令：
-        //   - 接近最后一个航点（is_last && !reached）：按巡航速度 uav_speed_ 飞过去（恒速，不放大）
-        //   - 已到达最后一个航点（is_last &&  reached）：切到 P-controller，缓慢收敛到 0，避免震荡
-        //   - 中间航点：按巡航速度飞（恒速）
-        bool position_hold = is_last && current_wp.reached;
-        double vx, vy, vz;
-        computeVelocityCommand(current_wp.ned_x, current_wp.ned_y, current_wp.ned_z,
-                              vx, vy, vz, position_hold);
-
-        // 机间避障（人工势场）
-        applyInterUavAvoidance(vx, vy, vz);
-
-        // 发布速度和航向指令
-        publishVelocityCommandWithYaw(vx, vy, vz, desired_yaw_ned);
-
-        std::ostringstream oss;
-        oss << "wp:" << current_waypoint_index_ << "/" << waypoint_queue_.size()
-            << ",dist:" << dist;
-        publishStatus(oss.str());
-    }
-
-    void computeVelocityCommand(double target_x, double target_y, double target_z,
-                                double& vx, double& vy, double& vz,
-                                bool position_hold = false) {
-        double dx = target_x - current_ned_x_;
-        double dy = target_y - current_ned_y_;
-        double dz = target_z - current_ned_z_;
-        double horizontal_dist = sqrt(dx*dx + dy*dy);
-        double vertical_dist = fabs(dz);
-
-        if (horizontal_dist > 0.1) {
-            if (position_hold) {
-                // 最后一个航点用 P-controller：速度 ∝ 距离，距离 → 0 速度 → 0，避免震荡
-                vx = hold_kp_ * dx;
-                vy = hold_kp_ * dy;
-                vz = hold_kp_ * dz;
-            } else {
-                vx = (dx / horizontal_dist) * uav_speed_;
-                vy = (dy / horizontal_dist) * uav_speed_;
-                if (vertical_dist > 1)
-                    vz = (dz / vertical_dist) * uav_vertical_speed_;
-                else
-                    vz = hold_kp_ * dz;
-                if (vz > uav_vertical_speed_) vz = uav_vertical_speed_;
-                if (vz < -uav_vertical_speed_) vz = -uav_vertical_speed_;
-            }
-        } else {
-            vx = vy = vz = 0.0;
-        }
-    }
-
-    /**
-     * 机间避障（人工势场）
-     * - 斥力：邻居无人机靠近时推开
-     * - 引力：向目标点飞行
-     */
-    void applyInterUavAvoidance(double& vx, double& vy, double& vz) {
-        if (neighbors_.empty()) {
-            return;
-        }
-
-        double repulsion_gain = 20.0;  // 斥力增益
-        double min_safe_distance = 5.0; // 安全距离阈值(m)
-
-        double fx = 0.0, fy = 0.0, fz = 0.0;
-
-        for (const auto& neighbor : neighbors_) {
-            double dx = current_ned_x_ - neighbor.ned_x;
-            double dy = current_ned_y_ - neighbor.ned_y;
-            double dz = current_ned_z_ - neighbor.ned_z;
-            double dist = sqrt(dx*dx + dy*dy + dz*dz);
-
-            if (dist < min_safe_distance && dist > 0.1) {
-                // 斥力与距离平方成反比
-                double force_magnitude = repulsion_gain / (dist * dist);
-                fx += (dx / dist) * force_magnitude;
-                fy += (dy / dist) * force_magnitude;
-                fz += (dz / dist) * force_magnitude;
-            }
-        }
-        
-        // 叠加到速度指令
-        vx += fx;
-        vy += fy;
-        //vz += fz;
-
-        // 限速
-        double speed = sqrt(vx*vx + vy*vy + vz*vz);
-        if (speed > uav_speed_ * 1.5) {
-            double scale = (uav_speed_ * 1.5) / speed;
-            vx *= scale;
-            vy *= scale;
-            vz *= scale;
-        }
-    }
-
     /**
      * 发布速度指令（包含偏航角速率）
      * @param vx, vy, vz NED 速度
@@ -1032,7 +873,7 @@ public:
             // angular.z 已经在上面算成 ENU 角速度,这里不需要再转换
         }
         // 打印调试信息
-        ROS_INFO_THROTTLE(1.0, "[WaypointExecutor] Publishing velocity command: vx=%.2f, vy=%.2f, vz=%.2f, desired_yaw_ned=%.2fdeg， angular rate=%.2fdeg",
+        ROS_INFO_THROTTLE(1.0, "[WaypointExecutor] Publishing velocity command: vx=%.2f, vy=%.2f, vz=%.2f, desired_yaw_ned=%.2fdeg, angular rate=%.2fdeg/s",
                  vel_cmd.linear.x, vel_cmd.linear.y, vel_cmd.linear.z,
                  desired_yaw_ned * 180.0 / M_PI,
                  vel_cmd.angular.z * 180.0 / M_PI);
@@ -1065,15 +906,15 @@ public:
         double vel_nwu_y = -vy;
         double vel_nwu_z = -vz;
 
-        ROS_INFO_THROTTLE(0.5,
-            "[Flight] NWU (%.2f, %.2f, %.2f) | Target WP[%zu]: (%.2f, %.2f, %.2f) dist=%.2fm | Vel(%.2f, %.2f, %.2f) | Yaw: cur=%.0f des=%.0f",
-            uav_nwu_x, uav_nwu_y, uav_nwu_z,
-            current_waypoint_index_,
-            target_nwu_x, target_nwu_y, target_nwu_z,
-            dist_to_target,
-            vel_nwu_x, vel_nwu_y, vel_nwu_z,
-            current_yaw_ned_ * 180.0 / M_PI,
-            desired_yaw_ned * 180.0 / M_PI);
+        // ROS_INFO_THROTTLE(0.5,
+        //     "[Flight] NWU (%.2f, %.2f, %.2f) | Target WP[%zu]: (%.2f, %.2f, %.2f) dist=%.2fm | Vel(%.2f, %.2f, %.2f) | Yaw: cur=%.0f des=%.0f",
+        //     uav_nwu_x, uav_nwu_y, uav_nwu_z,
+        //     current_waypoint_index_,
+        //     target_nwu_x, target_nwu_y, target_nwu_z,
+        //     dist_to_target,
+        //     vel_nwu_x, vel_nwu_y, vel_nwu_z,
+        //     current_yaw_ned_ * 180.0 / M_PI,
+        //     desired_yaw_ned * 180.0 / M_PI);
     }
 
     void publishZeroVelocity() {

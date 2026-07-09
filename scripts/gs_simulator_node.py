@@ -8,7 +8,8 @@ gs_simulator_node.py
   $ rosrun multi_uav_strike gs_simulator_node.py _flow:=ground_search_strike _uav_ns:=uav0
 
 可选 flow:
-- ground_search_strike / ground_search_track / ground_gather_search / catapult_search_return
+- ground_search_strike / ground_search_track / ground_gather_search / catapult_search_return / ground_search
+- b47c_normal / groupb1bc  (真实任务数据,内置 ref_lat/lon 覆盖)
 
 若无 flow 参数(空字符串),节点不发布任何东西,纯哑节点,等待外部 GS 推 TaskFlow。
 """
@@ -278,6 +279,114 @@ DEMO_FLOWS = {
             },
         ],
     },
+
+    # ---------- Demo 6: 真实任务数据 — 起飞+集结+搜索+返航 ----------
+    # 数据来自真实 GS 下发的 TaskFlow,航点为绝对 GPS 坐标
+    # 参考点 (ref) = 起飞点 WP1: (36.0962811N, 114.3922342E, alt=0)
+    # 已按 NED 偏移换算,publish_demo_flow 会自动覆盖 self.ref_lat/lon
+    # 校验: 用上面 ref 反算回 GPS 应等于原始坐标 (允许 ~0.01m 误差)
+    "b47c_normal": {
+        "flow_id": "b47c_normal",
+        "work_mode": 3,  # SEARCH_ONLY — 纯搜索,无打击
+        "ref_lat": 36.0962811,
+        "ref_lon": 114.39223419999998,
+        "ref_alt": 0.0,
+        "skills": [
+            # 1) Takeoff — 原始 GPS: WP1=(36.0962811, 114.3922342, 30), WP2=(36.0965128, 114.3926923, 30)
+            {
+                "skill_id": "9bcd",
+                "skill_type": 100,
+                "takeoff_subtype": 0,
+                "takeoff_altitude": 30.0,
+                "priority": 0,
+                "cruise_speed": 0.0,
+                "task_speed": 0.0,
+                "arrive_path": [
+                    (0.00, 0.00, 30.0),    # WP1 — 起飞点上空 (ref + 30m)
+                    (25.71, 41.10, 30.0),  # WP2 — 起飞后过渡点 (约 48m 飞行)
+                ],
+                "skill_area_path": [],
+                "params_json": '{"max_duration":900.0,"takeoff_height":30.0,"takeoff_time_interval":20.0}',
+            },
+            # 2) Gather — 原始 GPS: WP1=(36.0965128, 114.3926923, 30), WP2=(36.0967201, 114.3928568, 30)
+            {
+                "skill_id": "a0d6",
+                "skill_type": 101,
+                "takeoff_subtype": 0,
+                "takeoff_altitude": 0.0,
+                "priority": 0,
+                "cruise_speed": 5.0,
+                "task_speed": 5.0,
+                "arrive_path": [
+                    (25.71, 41.10, 30.0),  # WP1 — 接 takeoff WP2
+                    (48.73, 55.86, 30.0),  # WP2 — 集结 HOVER 点
+                ],
+                "skill_area_path": [],
+                "params_json": '{"gather_height":30.0,"gather_speed":5.0,"max_duration":900.0}',
+            },
+            # 3) Search — 原始 GPS: WP1=(36.0967201, 114.3928568, 30), WP2=(36.0964496, 114.3932106, 30)
+            {
+                "skill_id": "942b",
+                "skill_type": 102,
+                "takeoff_subtype": 0,
+                "takeoff_altitude": 0.0,
+                "priority": 0,
+                "cruise_speed": 5.0,
+                "task_speed": 5.0,
+                "arrive_path": [
+                    (48.73, 55.86, 30.0),  # WP1 — 接 gather WP2
+                    (18.71, 87.61, 30.0),  # WP2 — 搜索终点
+                ],
+                "skill_area_path": [],
+                "params_json": '{"max_duration":900.0,"safe_distance":10.0,"search_height":30.0,"search_speed":5.0}',
+            },
+            # 4) Return — 原始 GPS: WP1=(36.0964496, 114.3932106, 30), WP2=(36.0963810, 114.3925973, 30)
+            {
+                "skill_id": "bd3b",
+                "skill_type": 103,
+                "takeoff_subtype": 0,
+                "takeoff_altitude": 0.0,
+                "priority": 0,
+                "cruise_speed": 5.0,
+                "task_speed": 5.0,
+                "arrive_path": [
+                    (18.71, 87.61, 30.0),  # WP1 — 接 search WP2
+                    (11.09, 32.58, 30.0),  # WP2 — 返航点(接近 home)
+                ],
+                "skill_area_path": [],
+                "params_json": '{"max_duration":900.0,"return_height":30.0,"return_speed":5.0}',
+            },
+        ],
+    },
+
+    # ---------- Demo 7: 真实任务数据 — 纯起飞(单 skill)----------
+    # 数据来自真实 GS 下发的 TaskFlow,航点为绝对 GPS 坐标
+    # 参考点 (ref) = 起飞点 WP1: (36.0962778N, 114.3922288E, alt=0)
+    "groupb1bc": {
+        "flow_id": "groupb1bc",
+        "work_mode": 3,  # SEARCH_ONLY — 占位,本 flow 只有 takeoff
+        "ref_lat": 36.096277799999996,
+        "ref_lon": 114.3922288,
+        "ref_alt": 0.0,
+        "skills": [
+            # 1) Takeoff — 原始 GPS: WP1=(36.0962778, 114.3922288, 30), WP2=(36.0960795, 114.3922483, 30)
+            {
+                "skill_id": "b1bc",
+                "skill_type": 100,
+                "takeoff_subtype": 0,
+                "takeoff_altitude": 30.0,
+                "priority": 0,
+                "cruise_speed": 0.0,
+                "task_speed": 0.0,
+                "arrive_path": [
+                    (0.00, 0.00, 30.0),     # WP1 — 起飞点上空 (ref + 30m)
+                    (-22.01, 1.75, 30.0),   # WP2 — 起飞后过渡点 (约 22m 飞行)
+                ],
+                "skill_area_path": [],
+                "params_json": '{"max_duration":900.0,"takeoff_height":30.0,"takeoff_time_interval":20.0}',
+            },
+        ],
+    },
 }
 
 
@@ -380,8 +489,8 @@ class GroundStationSimulator:
             s.priority = skill_cfg.get("priority", 100)
             s.cruise_speed = float(skill_cfg.get("cruise_speed", 8.0))
             s.task_speed = float(skill_cfg.get("task_speed", 8.0))
-            s.formation = 0
-            s.params_json = ""
+            s.formation = skill_cfg.get("formation", 0)
+            s.params_json = skill_cfg.get("params_json", "")
 
             # arrive_path
             for north_m, east_m, up_m in skill_cfg.get("arrive_path", []):
@@ -409,6 +518,22 @@ class GroundStationSimulator:
 
         cfg = DEMO_FLOWS[flow_name]
         work_mode = cfg.get("work_mode", 3)  # 默认 SEARCH_ONLY
+
+        # === flow 内置 ref 覆盖 ===
+        # 部分真实任务数据 (b47c_normal / groupb1bc) 的航点是绝对 GPS,
+        # 参考点 = 该 flow takeoff 第一个航点,需要先覆盖 self.ref_* 再发布
+        # 否则 NED→GPS 转换会基于 PX4 home,产生几百米的系统性偏差
+        cfg_ref_lat = cfg.get("ref_lat")
+        cfg_ref_lon = cfg.get("ref_lon")
+        if cfg_ref_lat is not None and cfg_ref_lon is not None:
+            self.ref_lat = cfg_ref_lat
+            self.ref_lon = cfg_ref_lon
+            if "ref_alt" in cfg:
+                self.ref_alt = cfg["ref_alt"]
+            # 重建 flow — 上面 build_task_flow 用的还是旧 ref_lat/lon
+            flow = self.build_task_flow(flow_name)
+            rospy.logwarn("[GS_Simulator] >>>> Flow ref override: lat=%.7f lon=%.7f alt=%.2f (rebuilt flow)",
+                          self.ref_lat, self.ref_lon, self.ref_alt)
 
         rospy.logwarn("[GS_Simulator] >>>> Publishing demo flow '%s' (id=%s, %lu skills, work_mode=%u)",
                       flow_name, flow.flow_id, len(flow.skills), work_mode)

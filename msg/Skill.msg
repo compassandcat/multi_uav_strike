@@ -1,12 +1,15 @@
+# ============================================================================
 # 单条 skill 定义 — 任务流中的原子单元
 # 与 WorkMode 独立(WorkMode 由 GS 单独下发)
 # skill_type 枚举(参考 TZS v4.0 §9.2.6):
 #   100 = Takeoff(弹射 or 地面)
 #   101 = Gather(集结)
 #   102 = Search(搜索)
-#   103 = Return(返航)
+#   103 = Return(返航,任务流末尾触发 PX4 AUTO.LAND)
 #   104 = Relay(中继,本版本不实现)
 #   105 = Attack(多目标打击)
+# ============================================================================
+
 string   skill_id
 uint8    skill_type
 
@@ -21,7 +24,43 @@ uint8    takeoff_subtype
 # skill_type != 100 时此字段忽略
 float32  takeoff_altitude
 
-# 数值越大优先级越高,用于机间避让
+# ============================================================================
+# 任务优先级 — 数值越大优先级越高
+#
+# 设计要点(2026-07):
+#   粗粒度(跨 UAV)优先级由 WorkMode 决定,不是本字段:
+#     - SEARCH_STRIKE      = 最高
+#     - SEARCH_TRACK       = 次高
+#     - SEARCH_ONLY        = 低
+#     - DENIED_ENV_FLIGHT  = 低
+#   详见 WorkMode.msg
+#
+# 本字段 (Skill.priority) 用途:
+#   1. 细粒度:同 UAV 内多条 skill 并存时仲裁(目前 task_flow 单 UAV 顺序执行,
+#             本字段在单机内暂不生效,主要为未来扩展预留)
+#   2. 备援:GS 端在 work_mode 之外,基于此字段决定任务的细节优先级
+#            (例如"先打距离近的目标"还是"先打高威胁目标")
+#   3. 跨 UAV 备援:当两条 task_flow 来自不同 GS 节点时,本字段可作为额外仲裁依据
+#
+# 建议取值范围(参考 TZS 协议 §9.2.6,本字段与 work_mode 独立):
+#   0  - 9    : 系统保留 (紧急迫降/失联保留通道)
+#   10 - 49   : 低优先级
+#   50 - 99   : 中优先级
+#   100- 199  : 高优先级
+#   200- 255  : 最高优先级(预留,医疗救护/Abort 场景)
+#
+# 默认值建议(GS 下发 task_flow 时,如果 work_mode 已能表达优先级,本字段可填 0):
+#   100 Takeoff : priority = 60  (过渡阶段,不可中断)
+#   101 Gather  : priority = 20
+#   102 Search  : priority = 0   (依赖 work_mode 决定)
+#   103 Return  : priority = 90  (过渡阶段,不可中断,含 AUTO.LAND 落地)
+#   105 Attack  : priority = 140
+#
+# 多机协同注意(基于 work_mode,与 Skill.priority 字段无关):
+#   - 同一区域多 UAV 路径冲突时,work_mode 优先级高的 UAV 保持原路径
+#   - 跨 phase 时(例如本机 PHASE_TAKING_OFF, 邻机 work_mode=SEARCH_STRIKE):
+#     邻机应保持原路径,本机起飞避让
+# ============================================================================
 uint8    priority
 
 # 进场巡航速度(米/秒)

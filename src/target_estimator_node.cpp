@@ -6,6 +6,7 @@
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
 #include <tf/transform_datatypes.h>
+#include <std_msgs/Bool.h>
 #include <cmath>
 #include <random>
 #include <chrono>
@@ -33,6 +34,7 @@ private:
     ros::Subscriber gimbal_los_sub_;
     ros::Subscriber uav_pose_sub_;
     ros::Subscriber real_target_sub_;  // 真实目标位置（调试用）
+    ros::Subscriber target_in_view_sub_;  // 目标是否在云台 FOV 内（gimbal 发布）
     ros::Publisher target_est_marker_pub_;
     ros::Publisher particles_marker_pub_;
     ros::Publisher target_est_pose_pub_;
@@ -75,6 +77,7 @@ private:
     bool is_real_target_received_ = false;
     bool is_los_received_ = false;
     bool is_uav_pose_received_ = false;
+    bool target_in_view_ = false;        // 目标在云台 FOV 内时为 true（由 detection/target_in_view 更新）
     bool is_particles_initialized_ = false;
     double tracking_accuracy_filter = 0.0;  // 初始化为1.0，避免启动时收敛慢
     double avg_particle_dist_;
@@ -130,6 +133,11 @@ public:
         gimbal_los_sub_ = nh_.subscribe("target_los_angle", 10, &TargetEstimator::gimbalLosCallback, this);
         uav_pose_sub_ = nh_.subscribe(uav_pose_topic_, 10, &TargetEstimator::uavPoseCallback, this);
         real_target_sub_ = nh_.subscribe("/target_position", 10, &TargetEstimator::realTargetCallback, this);
+        // 目标是否在 FOV 内（gimbal 持续发布）。在 FOV 外的目标不能用于 LOS 几何解算，
+        // 否则会基于过期 LOS 输出完全错误的位置估计。
+        target_in_view_sub_ = nh_.subscribe(
+            "detection/target_in_view", 10,
+            &TargetEstimator::targetInViewCallback, this);
 
         target_est_marker_pub_ = nh_.advertise<visualization_msgs::Marker>("target_estimated_marker", 10);
         particles_marker_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("particles_marker_array", 10);
@@ -198,6 +206,12 @@ public:
         is_real_target_received_ = true;
     }
 
+    // 目标是否在云台 FOV 内（gimbal 发布）。一旦拉出 FOV，下一次 LOS 角可能对应的是
+    // 云台回退到 default_pitch 而非真实目标，必须阻止基于该 LOS 的几何解算传播出去。
+    void targetInViewCallback(const std_msgs::Bool::ConstPtr& msg) {
+        target_in_view_ = msg->data;
+    }
+
     void pfLoopCallback(const ros::TimerEvent&) {
         if (!is_los_received_ || !is_uav_pose_received_) {
             ROS_WARN_THROTTLE(1.0, "Waiting for gimbal LOS or UAV pose data...");
@@ -206,7 +220,12 @@ public:
 
         // 旁路模式：跳过粒子滤波，直接用 LOS+UAV 几何解算目标位置并发布。
         // 公式与 initializeParticles() 一致，避免坐标/符号重写引入误差。
+        // 关键：目标不在 FOV 时，云台 LOS 已经回退到 default_pitch（不再指向真目标），
+        // 此时调用 computeLosTargetPosition 会输出完全错误的几何位置，必须跳过。
         if (bypass_pf_) {
+            if (!target_in_view_) {
+                return;
+            }
             double tx, ty, tz;
             if (computeLosTargetPosition(tx, ty, tz)) {
                 estimated_target_pose_.pose.position.x = tx;
@@ -233,7 +252,8 @@ public:
         }
 
         if (!is_particles_initialized_){
-            if (tracking_accuracy_filter > 0.9) {
+            // 初始化时同样依赖 LOS 几何定锚，必须等目标进入 FOV 再调用
+            if (tracking_accuracy_filter > 0.9 && target_in_view_) {
                 initializeParticles();
                 is_particles_initialized_ = true;
                 ROS_INFO("Particles initialized! Total particles: %d", num_particles_);
