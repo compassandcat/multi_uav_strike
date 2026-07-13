@@ -377,20 +377,23 @@ public:
     }
 
     /**
-     * PX4 home 一次性回调
-     * - 第一次收到就把 ref_lat_/ref_lon_/ref_alt_ 锁定到 PX4 当前 home
+     * PX4 home 回调 — 锁一次
+     * PX4 的 LOCAL_POSITION_NED 参考系由 EKF2 在启动时锁定,
+     * 后续 home 更新(MAV_CMD_DO_SET_HOME / disarm)不会重置 EKF2 origin,
+     * 也不让 local_position 跳变。如果跟着 home 更新去重算 NED,
+     * 反而让 setpoint 与 UAV 当前 local_position 不在同一 frame → 偏飞。
      */
     void homePositionCallback(const mavros_msgs::HomePosition::ConstPtr& msg) {
-        if (ref_initialized_) return;
+        if (ref_initialized_) return;  // 锁一次
         if (msg->geo.latitude == 0.0 && msg->geo.longitude == 0.0) {
             return;  // PX4 home 未稳定前发 0/0,忽略
         }
+        ROS_WARN("[WaypointExecutor] >>>> PX4 home locked: (%.7f, %.7f, %.2f)",
+                 msg->geo.latitude, msg->geo.longitude, msg->geo.altitude);
         ref_lat_ = msg->geo.latitude;
         ref_lon_ = msg->geo.longitude;
         ref_alt_ = msg->geo.altitude;
         ref_initialized_ = true;
-        ROS_WARN("[WaypointExecutor] >>>> PX4 home loaded: lat=%.7f lon=%.7f alt=%.2f",
-                 ref_lat_, ref_lon_, ref_alt_);
     }
 
     // ============== 回调函数 ==============
@@ -536,7 +539,6 @@ public:
             return;
         }
 
-        // executeWaypointFlight();
     }
 
     /**
@@ -625,62 +627,67 @@ public:
             // bearing 取直接朝航点(避免段方向偏差,支持在航点上 hover)
             bearing = atan2(dy_to_target, dx_to_target);
         } else {
-            // === L1 压航线控制(参考 PX4 旋翼外环控制:横距 → 横向速度)===
+            // === Lookahead-L1 控制(借鉴 PX4 mc_pos_control::PositionControl) ===
+            // 参考 PX4 旋翼外环: 飞机朝 lookahead 点飞,速度幅值由 v² ≤ 2·a·d 限速
+            //   L1 距离 = max(L1_min, v * L1_period),高速 lookahead 自然变长 → 平滑
+            //   横向速度由几何(sin/cos)自然限制 = cur_speed,无需手动 cap
+            //   当 UAV 过段端:target_along 夹到 seg_len → 直接朝目标点,brake 距离
+            //   自动切到 dist_h → 平滑过渡到 P-control,无死区
             double seg_dx = target_wp.ned_x - seg_x0;
             double seg_dy = target_wp.ned_y - seg_y0;
             double seg_len = sqrt(seg_dx*seg_dx + seg_dy*seg_dy);
 
             if (seg_len < 0.1) {
-                // 段退化为点(连续两航点重合 或 第一点已在到达半径内):
-                // 飞机离目标已经很近,无需再算速度,交给 arrival_threshold 推进
+                // 段退化为点(连续两航点重合 / 第一点已在到达半径内)
                 vx = 0.0;
                 vy = 0.0;
+                bearing = atan2(dy_to_target, dx_to_target);
             } else {
-                // 段方向单位向量 + 段法线(右手系,逆时针 90°)
                 double ux = seg_dx / seg_len;
                 double uy = seg_dy / seg_len;
-                double nx = -uy;
-                double ny =  ux;
-
-                // 飞机相对段起点的向量 → 切向 / 横向投影
+                // 飞机沿段投影
                 double rx = current_ned_x_ - seg_x0;
                 double ry = current_ned_y_ - seg_y0;
-                double along = rx * ux + ry * uy;   // 切向(沿段方向投影)
-                double cross = rx * nx + ry * ny;   // 横向(带符号偏离段线)
+                double along = rx * ux + ry * uy;
 
-                // === 切向速度:物理限速(平方减速)保证无超调 ===
-                // 物理刹停距离: v² ≤ 2·a·d  →  v ≤ sqrt(2·a·d)
-                // 沿段方向剩余距离 dist_along_to_target > 0 时限速,< 0 时停止切向(由 L1 横向 + arrival_threshold 推进)
-                const double a_decel = 2.0;  // 减速度 m/s²(可按机型调,2~5)
+                // ===== Lookahead 距离(PX4 mc_pos_control 同款) =====
+                const double L1_min = 5.0;     // m(低速段最小 lookahead,避免抖动)
+                const double L1_period = 1.0;  // s(PX4 默认 ~1)
+                double L1 = std::max(L1_min, cur_speed * L1_period);
+                // lookahead 投影点夹在 [0, seg_len](不过段端、不倒退)
+                double target_along = along + L1;
+                if (target_along < 0.0) target_along = 0.0;
+                if (target_along > seg_len) target_along = seg_len;
+                double la_x = seg_x0 + ux * target_along;
+                double la_y = seg_y0 + uy * target_along;
+
+                // ===== 物理刹停(v² ≤ 2·a·d) =====
+                // 沿段剩余距离;过段端(< 0)改用 dist_h → 自动衔接 P-control
+                const double a_decel = 2.0;
                 double dist_along_to_target = seg_len - along;
-                double v_along;
-                if (dist_along_to_target <= 0.0) {
-                    // 已过目标(沿段正方向超出),切向速度置 0
-                    v_along = 0.0;
+                double brake_dist = (dist_along_to_target > 0.0)
+                                        ? dist_along_to_target
+                                        : dist_h;
+                double v_mag = std::min(cur_speed,
+                                        sqrt(2.0 * a_decel * brake_dist));
+
+                // ===== 朝 lookahead 飞 =====
+                double dx_la = la_x - current_ned_x_;
+                double dy_la = la_y - current_ned_y_;
+                double dist_la = sqrt(dx_la*dx_la + dy_la*dy_la);
+                if (dist_la > 0.01) {
+                    vx = (dx_la / dist_la) * v_mag;
+                    vy = (dy_la / dist_la) * v_mag;
                 } else {
-                    // 在段上或段前:取 cur_speed 与物理刹停速度的较小值
-                    double v_max_brake = sqrt(2.0 * a_decel * dist_along_to_target);
-                    v_along = std::min(cur_speed, v_max_brake);
+                    vx = 0.0;
+                    vy = 0.0;
                 }
-
-                // === L1 横向补偿:把飞机压回航线 ===
-                // 参考 PX4 旋翼外环控制:横距误差 → 横向速度(简化版 P 控制)
-                const double l1_kp = 2.0;
-                double v_lateral = -l1_kp * cross;
-                // 限幅:横向速度不超过切向速度的 50%,避免大转向时失稳
-                double v_lateral_max = 0.5 * cur_speed;
-                if (v_lateral >  v_lateral_max) v_lateral =  v_lateral_max;
-                if (v_lateral < -v_lateral_max) v_lateral = -v_lateral_max;
-
-                // 合成 NED 速度(切向 + 横向)
-                vx = ux * v_along + nx * v_lateral;
-                vy = uy * v_along + ny * v_lateral;
+                // bearing 跟 lookahead: 段内朝段前方;偏离段时航向也跟着纠
+                bearing = atan2(dy_la, dx_la);
             }
-            // L1 模式下 bearing 取段方向(避免频繁切向)
-            bearing = atan2(seg_dy, seg_dx);
         }
-        // 打印当前位置、目标位置、距离、段方位角
-        ROS_INFO_THROTTLE(1.0, "[WaypointExecutor] SegmentPhase=%d, idx=%lu, cur=(%.2f,%.2f,%.2f), target=(%.2f,%.2f,%.2f), dist=%.2f, bearing=%.1fdeg",
+        // 打印当前位置、目标位置、距离、段方位角（5s 一次，状态变化另有日志）
+        ROS_INFO_THROTTLE(5.0, "[WaypointExecutor] SegmentPhase=%d, idx=%lu, cur=(%.2f,%.2f,%.2f), target=(%.2f,%.2f,%.2f), dist=%.2f, bearing=%.1fdeg",
                            static_cast<int>(segment_phase_), *cur_idx,
                            current_ned_x_, current_ned_y_, current_ned_z_,
                            target_wp.ned_x, target_wp.ned_y, target_wp.ned_z,
@@ -872,8 +879,8 @@ public:
             vel_cmd.linear.z = -ned_vz;
             // angular.z 已经在上面算成 ENU 角速度,这里不需要再转换
         }
-        // 打印调试信息
-        ROS_INFO_THROTTLE(1.0, "[WaypointExecutor] Publishing velocity command: vx=%.2f, vy=%.2f, vz=%.2f, desired_yaw_ned=%.2fdeg, angular rate=%.2fdeg/s",
+        // 调试信息：5s 一次即可，详细字段非常多，没必要每帧刷
+        ROS_INFO_THROTTLE(5.0, "[WaypointExecutor] Publishing velocity command: vx=%.2f, vy=%.2f, vz=%.2f, desired_yaw_ned=%.2fdeg, angular rate=%.2fdeg/s",
                  vel_cmd.linear.x, vel_cmd.linear.y, vel_cmd.linear.z,
                  desired_yaw_ned * 180.0 / M_PI,
                  vel_cmd.angular.z * 180.0 / M_PI);
@@ -1045,9 +1052,7 @@ public:
         // 这样 mission_manager 在检测到目标发"stop"时不会破坏后续 resume 的能力。
         // 如果真的需要清空航点，发个新的 waypoint_cmd 即可（会 reset 队列）。
         is_executing_ = false;
-        ROS_WARN("[WaypointExecutor] >>>>> stop() called, about to publish zero velocity");
         publishZeroVelocity();
-        ROS_WARN("[WaypointExecutor] >>>>> stop() completed");
         ROS_INFO("[WaypointExecutor] Stopped");
     }
 

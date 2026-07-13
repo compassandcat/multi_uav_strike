@@ -728,20 +728,23 @@ public:
     }
 
     /**
-     * PX4 home 一次性回调
-     * - 第一次收到就把 ref_lat_/ref_lon_/ref_alt_ 锁定到 PX4 当前 home
+     * PX4 home 回调 — 锁一次
+     * PX4 的 LOCAL_POSITION_NED 参考系由 EKF2 在启动时锁定,
+     * 后续 home 更新(MAV_CMD_DO_SET_HOME / disarm)不会重置 EKF2 origin,
+     * 也不让 local_position 跳变。如果跟着 home 更新去重算 NED,
+     * 反而让 setpoint 与 UAV 当前 local_position 不在同一 frame → 偏飞。
      */
     void homePositionCallback(const mavros_msgs::HomePosition::ConstPtr& msg) {
-        if (ref_initialized_) return;
+        if (ref_initialized_) return;  // 锁一次
         if (msg->geo.latitude == 0.0 && msg->geo.longitude == 0.0) {
             return;  // PX4 home 未稳定前发 0/0,忽略
         }
+        ROS_WARN("[MissionManager] >>>> PX4 home locked: (%.7f, %.7f, %.2f)",
+                 msg->geo.latitude, msg->geo.longitude, msg->geo.altitude);
         ref_lat_ = msg->geo.latitude;
         ref_lon_ = msg->geo.longitude;
         ref_alt_ = msg->geo.altitude;
         ref_initialized_ = true;
-        ROS_WARN("[MissionManager] >>>> PX4 home loaded: lat=%.7f lon=%.7f alt=%.2f",
-                 ref_lat_, ref_lon_, ref_alt_);
     }
 
     /**
@@ -760,7 +763,7 @@ public:
     void interUavTargetCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
         // 收到其他无人机发现的目标
         // 可以选择是否协同跟踪
-        ROS_INFO("[MissionManager] Received target info from other UAV: %s",
+        ROS_INFO_THROTTLE(10.0, "[MissionManager] Received target info from other UAV: %s",
                  msg->header.frame_id.c_str());
     }
 
@@ -1048,11 +1051,11 @@ public:
                 return;
         }
         if (new_mode != current_work_mode_) {
-            ROS_WARN("[MissionManager] Typed WorkMode override: %s",
-                     workModeToString().c_str());
+            WorkMode old_mode = current_work_mode_;
             current_work_mode_ = new_mode;
-            // 不复用 String 模式的所有副作用(waypoint stop/guidance enable),保留现状
-            // 这里只更新 current_work_mode_ 让 handleSearchOnly/Track/Strike 走对应分支
+            ROS_WARN("[MissionManager] Typed WorkMode: %s (overriding %s)",
+                     workModeToString(new_mode).c_str(),
+                     workModeToString(old_mode).c_str());
         }
     }
 
@@ -1390,7 +1393,7 @@ public:
                     } else {
                         set_message_rate_retry_count_++;
                         double elapsed = (ros::Time::now() - set_message_rate_start_time_).toSec();
-                        ROS_WARN_THROTTLE(1.0, "[MissionManager] >>>>> LOCAL_POSITION_NED rate set FAILED "
+                        ROS_WARN_THROTTLE(2.0, "[MissionManager] >>>>> LOCAL_POSITION_NED rate set FAILED "
                                               "(attempt %d/%d, elapsed %.1fs/%.1fs)",
                                               set_message_rate_retry_count_, max_set_message_rate_retries_,
                                               elapsed, set_message_rate_max_wait_sec_);
@@ -1432,18 +1435,13 @@ public:
                 // 一次性快速序列: SET_MODE → COMMAND_LONG → ARM，不等 mode 确认。
                 // 模仿 pymavlink 的 50ms 内连发 SET_MODE+ARM 的行为 — 这是它在同一架
                 // FCU 上能跑通的关键时机 (PX4 commander 100~500ms 内会 revert OFFBOARD)。
-                ROS_WARN("[MissionManager] >>>> OFFBOARD+ARM rapid sequence starting "
-                         "(sp=%.0fms count=%d, PX4 mode=%s armed=%d sys_status=%d)",
-                         sp_elapsed * 1000.0, setpoint_publish_count_,
-                         current_mavros_state_.mode.c_str(),
-                         current_mavros_state_.armed ? 1 : 0,
-                         current_mavros_state_.system_status);
                 if (triggerOffboardAndArm()) {
                     takeoff_state_ = TakeoffState::TAKEOFF_TAKEOFF_EXEC;
                     takeoff_start_time_ = ros::Time::now();
                     takeoff_setpoint_.pose.position.z = takeoff_altitude_;
-                    ROS_WARN("[MissionManager] >>>> OFFBOARD + ARM SUCCESS, takeoff climb started (target alt=%.1f m)",
-                             takeoff_altitude_);
+                    ROS_WARN("[MissionManager] >>>> OFFBOARD + ARM SUCCESS, takeoff climb started "
+                             "(sp=%.0fms, target alt=%.1f m)",
+                             sp_elapsed * 1000.0, takeoff_altitude_);
                 } else {
                     // 不进 FAILED 状态，下一 tick 会再走一遍 SETTING_OFFBOARD 重试整组动作
                     ROS_WARN("[MissionManager] >>>> OFFBOARD + ARM sequence FAILED (PX4 mode=%s armed=%d), "
@@ -1466,7 +1464,7 @@ public:
                         ROS_WARN("[MissionManager] Takeoff altitude reached, hovering (phase=HOVERING)...");
                     }
                 } else {
-                    ROS_WARN_THROTTLE(1.0, "[MissionManager] Takeoff climbing: %.1f / %.1f m",
+                    ROS_WARN_THROTTLE(2.0, "[MissionManager] Takeoff climbing: %.1f / %.1f m",
                                      current_alt, takeoff_altitude_);
                 }
 
@@ -1553,9 +1551,6 @@ public:
     //   4. 推进 takeoff_state_ 到 TAKEOFF_COMPLETE (让 missionTimerCallback 继续跑)
     //   5. current_phase_=PHASE_WAYPOINT_FOLLOW (下次 tick runPx4TakeoffSequence early-return)
     void performTakeoffHandoff() {
-        ROS_WARN("[MissionManager] ===== AUTO-HANDOFF: TAKEOFF to WAYPOINT_FOLLOW =====");
-        ROS_WARN("[MissionManager]   - is_waypoints_received_=true, waypoint_count=%zu",
-                 current_waypoint_count_);
         // 1. 恢复用户起飞前的工作模式,而不是硬切 SEARCH_ONLY
         //    场景:用户在地面站提前发过 SET_WORKMODE=SEARCH_TRACK,起飞 skill 不应覆盖用户意图
         //    兼容:如果起飞前是 IDLE(典型场景),回落到 ~post_takeoff_work_mode(默认 SEARCH_ONLY)
@@ -1563,12 +1558,16 @@ public:
         if (restore_mode == WorkMode::IDLE) {
             restore_mode = post_takeoff_work_mode_;
         }
-        if (restore_mode != current_work_mode_) {
-            ROS_WARN("[MissionManager]   - Auto-handoff: restoring work_mode %s to %s",
-                     workModeToString().c_str(), workModeToString(restore_mode).c_str());
+        bool mode_restored = (restore_mode != current_work_mode_);
+        if (mode_restored) {
             current_work_mode_ = restore_mode;
         }
         work_mode_before_takeoff_ = WorkMode::IDLE;  // 一次性缓存,清空防误用
+        ROS_WARN("[MissionManager] ===== AUTO-HANDOFF: TAKEOFF -> WAYPOINT_FOLLOW "
+                 "(waypoints=%zu, work_mode=%s%s) =====",
+                 current_waypoint_count_,
+                 workModeToString(current_work_mode_).c_str(),
+                 mode_restored ? " [restored]" : "");
         // phase_before_takeoff_ 不在此处清,因为它将在 GROUND_IDLE → TAKING_OFF → HOVERING → WAYPOINT_FOLLOW 链路结束后
         // 由新 task_flow 的 entry 路径再次覆盖。这里清掉反而可能在重新进入 PHASE_TAKING_OFF 的瞬间丢失兜底。
         disableGuidance();  // 起飞后默认关闭制导,等 SEARCH_TRACK/STRIKE 再 enable
@@ -1620,7 +1619,7 @@ public:
     // PX4 OFFBOARD 持续 setpoint 才能稳悬停,这是最简单可控的 hold 方案
     void enterHoldState() {
         if (is_pose_received_) {
-        ROS_WARN_THROTTLE(1.0, "[MissionManager] HOLDING current_pose (NED): x=%.2f y=%.2f z=%.2f",
+        ROS_WARN_THROTTLE(5.0, "[MissionManager] HOLDING current_pose (NED): x=%.2f y=%.2f z=%.2f",
             current_pose_.pose.position.x,
             current_pose_.pose.position.y,
             current_pose_.pose.position.z);
@@ -1694,19 +1693,16 @@ public:
             std_msgs::String cmd;
             cmd.data = "stop";
             waypoint_control_pub_.publish(cmd);
-            ROS_WARN("[MissionManager]   - waypoint_executor stop sent");
         }
 
         // 2. 停 setpoint publisher (PX4 AUTO.LAND 不接受 OFFBOARD setpoint,留着会冲突)
         if (setpoint_running_) {
             stopSetpointPublisher();
-            ROS_WARN("[MissionManager]   - setpoint publisher stopped");
         }
 
         // 3. 禁用制导 (如有遗留)
         if (is_guidance_active_) {
             disableGuidance();
-            ROS_WARN("[MissionManager]   - guidance disabled");
         }
 
         // 4. 切 PX4 到 AUTO.LAND (set_mode_client 仅在 !use_sim_ 初始化)
@@ -1714,19 +1710,16 @@ public:
             mavros_msgs::SetMode sm;
             sm.request.custom_mode = "AUTO.LAND";
             if (set_mode_client_.call(sm) && sm.response.mode_sent) {
-                ROS_WARN("[MissionManager]   - PX4 mode set to AUTO.LAND (mode_sent=true)");
+                ROS_WARN("[MissionManager] AUTO.LAND: PX4 mode accepted, waiting for touchdown");
             } else {
-                ROS_ERROR("[MissionManager]   - PX4 AUTO.LAND set FAILED (mode_sent=%d, current_mode=%s)",
+                ROS_ERROR("[MissionManager] AUTO.LAND set FAILED (mode_sent=%d, current_mode=%s)",
                           sm.response.mode_sent ? 1 : 0,
                           current_mavros_state_.mode.c_str());
             }
         } else {
-            ROS_WARN("[MissionManager]   - use_sim_=%d, set_mode_client not available — "
-                     "skipping actual AUTO.LAND call (sim mode)",
-                     use_sim_ ? 1 : 0);
+            ROS_WARN("[MissionManager] AUTO.LAND: use_sim_=%d, skipping actual mode call (sim mode); "
+                     "waiting for disarm", use_sim_ ? 1 : 0);
         }
-
-        ROS_WARN("[MissionManager] ===== AUTO.LAND: waiting for touchdown + auto-disarm =====");
     }
 
     // 由 missionTimerCallback 每 tick 调用 — 监控 PX4 落地完成
@@ -1863,8 +1856,8 @@ public:
                 //ros::spinOnce();
                 rate.sleep();
 
-                // 每 1s 打印一次发包状态 + PX4 当前 mode，方便对比两架 UAV 差异
-                if ((ros::Time::now() - last_log).toSec() > 1.0) {
+                // 每 5s 打印一次发包状态 + PX4 当前 mode（多 UAV 对比观察用）
+                if ((ros::Time::now() - last_log).toSec() > 5.0) {
                     ROS_WARN("[MissionManager] setpoint stream: %d pkts, PX4 mode=%s armed=%d connected=%d system_status=%d",
                              setpoint_publish_count_,
                              current_mavros_state_.mode.c_str(),
@@ -1889,20 +1882,17 @@ public:
         mavros_msgs::SetMode set_mode;
         set_mode.request.custom_mode = mode;
 
-        // 每次请求都打一行（不 throttle）：方便两架 UAV 对比看到底调了几次
-        ROS_WARN("[MissionManager] >>>>> setMode(%s) called, PX4 current_mode=%s connected=%d armed=%d system_status=%d setpoint_pkts=%d",
+        ROS_WARN("[MissionManager] >>>>> setMode(%s) called, PX4 current_mode=%s connected=%d armed=%d setpoint_pkts=%d",
                  mode.c_str(),
                  current_mavros_state_.mode.c_str(),
                  current_mavros_state_.connected ? 1 : 0,
                  current_mavros_state_.armed ? 1 : 0,
-                 current_mavros_state_.system_status,
                  setpoint_publish_count_);
 
         // ===== Path 1: 标准 SET_MODE 服务（走 SET_MODE MAVLink 消息）=====
         bool set_mode_sent = false;
         if (set_mode_client_.call(set_mode) && set_mode.response.mode_sent) {
             set_mode_sent = true;
-            ROS_WARN("[MissionManager] >>>>> SET_MODE service: command accepted by mavros (mode_sent=true)");
         } else {
             ROS_WARN("[MissionManager] >>>>> SET_MODE service failed, will try COMMAND_LONG fallback");
         }
@@ -1927,8 +1917,8 @@ public:
                          current_mavros_state_.mode.c_str());
                 sendSetModeCommandLong(mode);
             }
-            // 每 1s 报一次当前 PX4 mode（即使 throttle 了这里也要刷）
-            if (poll_count % 10 == 0) {
+            // 每 2s 报一次当前 PX4 mode（10Hz tick 中每 20 帧一次，避免被噪声淹没）
+            if (poll_count % 20 == 0) {
                 ROS_WARN("[MissionManager] ... waiting for mode=%s, PX4 currently in '%s' (%.1fs elapsed)",
                          mode.c_str(), current_mavros_state_.mode.c_str(),
                          (ros::Time::now() - start).toSec());
@@ -2090,39 +2080,24 @@ public:
         bool set_mode_sent = false;
         if (set_mode_client_.call(set_mode)) {
             set_mode_sent = set_mode.response.mode_sent;
-            ROS_WARN("[MissionManager] >>>> [%4.0fms] SET_MODE service: mode_sent=%d (PX4 mode=%s)",
-                     (ros::Time::now() - t0).toSec() * 1000.0,
-                     set_mode_sent ? 1 : 0,
-                     current_mavros_state_.mode.c_str());
         } else {
-            ROS_WARN("[MissionManager] >>>> [%4.0fms] SET_MODE service: RPC call FAILED",
-                     (ros::Time::now() - t0).toSec() * 1000.0);
+            ROS_WARN("[MissionManager] >>>> SET_MODE service: RPC call FAILED");
         }
 
         // -------- Step 2: 50ms 后 COMMAND_LONG DO_SET_MODE --------
         // 命中 PX4 commander handle_command 路径 — 某些固件版本对这条路径更稳定
         ros::Duration(0.05).sleep();
-        ROS_WARN("[MissionManager] >>>> [%4.0fms] sending COMMAND_LONG DO_SET_MODE OFFBOARD (PX4 mode=%s)",
-                 (ros::Time::now() - t0).toSec() * 1000.0,
-                 current_mavros_state_.mode.c_str());
         sendSetModeCommandLong("OFFBOARD");
 
         // -------- Step 3: 50ms 后 直接 ARM，不等 mode 确认 --------
         // 这是关键时机 — ARM 必须在 commander 还没 revert 之前到达
         ros::Duration(0.05).sleep();
-        ROS_WARN("[MissionManager] >>>> [%4.0fms] attempting ARM #1 (PX4 mode=%s)",
-                 (ros::Time::now() - t0).toSec() * 1000.0,
-                 current_mavros_state_.mode.c_str());
         bool armed = armVehicle(true);
 
         // -------- Step 4: ARM 失败重试最多 3 次（每次 50ms） --------
         // PX4 commander 可能在 OFFBOARD transition 中，ARM 会被暂缓一会儿
         for (int i = 0; i < 3 && !armed && ros::ok(); ++i) {
             ros::Duration(0.05).sleep();
-            ROS_WARN("[MissionManager] >>>> [%4.0fms] ARM retry %d/3 (PX4 mode=%s armed=%d)",
-                     (ros::Time::now() - t0).toSec() * 1000.0, i + 1,
-                     current_mavros_state_.mode.c_str(),
-                     current_mavros_state_.armed ? 1 : 0);
             armed = armVehicle(true);
         }
 
@@ -2223,15 +2198,13 @@ public:
      */
     void skillAdvanceTimerCallback(const ros::TimerEvent&) {
         if (skill_queue_.empty()) return;
-        // 打印当前 skill 状态机状态
+        // 每 5s 心跳打印当前 skill 状态机状态（慢速参考；状态变化时已有单独日志）
         const SkillRuntime& sr = skill_queue_[current_skill_index_];
-        ROS_INFO_THROTTLE(1.0, "[MissionManager] Skill[%zu] id=%s type=%u state=%s",
-                           current_skill_index_, sr.msg.skill_id.c_str(),
-                           static_cast<unsigned>(sr.msg.skill_type),
-                           skillStateStr(sr.state).c_str());
-        // 打印当前的phase阶段
-        ROS_INFO_THROTTLE(1.0, "[MissionManager] Current MissionPhase=%s",
-                           missionPhaseToString().c_str());
+        ROS_INFO_THROTTLE(5.0, "[MissionManager] Skill[%zu] id=%s type=%u state=%s, phase=%s",
+                          current_skill_index_, sr.msg.skill_id.c_str(),
+                          static_cast<unsigned>(sr.msg.skill_type),
+                          skillStateStr(sr.state).c_str(),
+                          missionPhaseToString().c_str());
         if (current_skill_index_ >= skill_queue_.size()) return;
         advanceSkillStateMachine();
     }
@@ -2425,7 +2398,7 @@ public:
                                  landing_safety_timeout_sec_);
                         triggerPx4Landing();
                     } else {
-                        ROS_WARN_THROTTLE(1.0, "[MissionManager] >>>> All skills COMPLETE (%zu total) to PHASE_HOLDING",
+                        ROS_WARN_THROTTLE(5.0, "[MissionManager] >>>> All skills COMPLETE (%zu total) to PHASE_HOLDING",
                                  skill_queue_.size());
                         enterHoldState();
                     }

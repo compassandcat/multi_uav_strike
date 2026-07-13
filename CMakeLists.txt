@@ -16,6 +16,7 @@ find_package(catkin REQUIRED COMPONENTS
   visualization_msgs
   eigen_conversions
   message_generation
+  serial
   mavros_msgs
 )
 
@@ -47,7 +48,7 @@ generate_messages(
 
 # 声明catkin包（供其他包依赖）
 catkin_package(
-  CATKIN_DEPENDS roscpp std_msgs geometry_msgs sensor_msgs nav_msgs tf visualization_msgs mavros_msgs message_runtime
+  CATKIN_DEPENDS roscpp std_msgs std_srvs geometry_msgs sensor_msgs nav_msgs tf visualization_msgs mavros_msgs serial message_runtime
 )
 
 # 包含ROS头文件目录
@@ -149,6 +150,15 @@ target_link_libraries(uav_avoidance_node
   ${catkin_LIBRARIES}
 )
 add_dependencies(uav_avoidance_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+
+# 10. 电源信息板通信节点
+add_executable(power_interact_node 
+  src/power_interact_node.cpp
+)
+target_link_libraries(power_interact_node 
+  ${catkin_LIBRARIES}
+)
+add_dependencies(power_interact_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 
 # ========== 安装可执行文件和脚本 ==========
 install(TARGETS

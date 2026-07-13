@@ -9,6 +9,7 @@
 #include <std_msgs/Bool.h>
 #include <std_msgs/String.h>
 #include <mavros_msgs/Thrust.h>
+#include <mavros_msgs/HomePosition.h>
 #include <visualization_msgs/Marker.h>
 #include <limits>
 #include <Eigen/Eigen>
@@ -31,6 +32,7 @@ private:
     ros::Subscriber mode_sub_;        // 模式控制："strike" 或 "track"
     ros::Subscriber uav_speed_sub_;   // 拦截速度(来自 mission_manager, 下发到 InterceptGuidance)
     ros::Subscriber other_uav_poses_sub_;  // 邻居无人机位置
+    ros::Subscriber home_position_sub_;    // PX4 home,锁一次用于 GPS→NED 转换
 
     // Publishers
     ros::Publisher vel_cmd_pub_;          // setpoint_velocity/cmd_vel_unstamped
@@ -81,10 +83,11 @@ private:
     std::string attitude_rates_topic_;
     std::string thrust_cmd_topic_;
 
-    // GPS 参考点（GPS -> NED 转换用）
+    // GPS 参考点（GPS -> NED 转换用，由 PX4 /mavros/home_position/home 首次锁定）
     double ref_lat_;
     double ref_lon_;
     double ref_alt_;
+    bool ref_initialized_ = false;  // 是否已收到 PX4 home(锁一次,后续 PX4 home 变化不更新)
 
     // 跟踪约束参数
     double min_altitude_;            // 最小高度限制
@@ -172,10 +175,8 @@ public:
         // 仿真/真机切换
         nh_private_.param<bool>("use_sim", use_sim_, true);
 
-        // GPS 参考点（仿真时所有 UAV 共享，PX4 SITL 时各 UAV 用各自的 home）
-        nh_private_.param<double>("ref_lat", ref_lat_, 36.096);
-        nh_private_.param<double>("ref_lon", ref_lon_, 114.392);
-        nh_private_.param<double>("ref_alt", ref_alt_, 100.0);
+        // GPS 参考点不再从 yaml 硬编码,而由 homePositionCallback() 从 PX4 /mavros/home_position/home 首次锁定
+        // (yaml 里仍可配 ref_lat/lon/alt 作为节点启动到 home 到达之间的临时 fallback,但实际 GPS→NED 在 ref_initialized_ 后才生效)
 
         // 根据 use_sim 设置 topic 名称
         if (use_sim_) {
@@ -283,6 +284,11 @@ public:
         other_uav_poses_sub_ = nh_.subscribe(
             "inter_uav/other_uav_poses", 10,
             &GuidanceControlNode::otherUavPosesCallback, this);
+
+        // PX4 home 订阅（仅用于 GPS→NED 转换的参考原点）
+        home_position_sub_ = nh_.subscribe(
+            "mavros/home_position/home", 10,
+            &GuidanceControlNode::homePositionCallback, this);
     }
 
     void initPublishers() {
@@ -436,6 +442,26 @@ public:
     }
 
     /**
+     * PX4 home 回调 — 锁一次
+     * PX4 的 LOCAL_POSITION_NED 参考系由 EKF2 在启动时锁定,
+     * 后续 home 更新(MAV_CMD_DO_SET_HOME / disarm)不会重置 EKF2 origin,
+     * 也不让 local_position 跳变。如果跟着 home 更新去重算 NED,
+     * 反而让 setpoint 与 UAV 当前 local_position 不在同一 frame → 偏飞。
+     */
+    void homePositionCallback(const mavros_msgs::HomePosition::ConstPtr& msg) {
+        if (ref_initialized_) return;  // 锁一次
+        if (msg->geo.latitude == 0.0 && msg->geo.longitude == 0.0) {
+            return;  // PX4 home 未稳定前发 0/0,忽略
+        }
+        ROS_WARN("[Guidance] >>>> PX4 home locked: (%.7f, %.7f, %.2f)",
+                 msg->geo.latitude, msg->geo.longitude, msg->geo.altitude);
+        ref_lat_ = msg->geo.latitude;
+        ref_lon_ = msg->geo.longitude;
+        ref_alt_ = msg->geo.altitude;
+        ref_initialized_ = true;
+    }
+
+    /**
      * GPS (WGS84) -> NED 坐标转换
      */
     void gpsToNed(double lat, double lon, double alt,
@@ -516,14 +542,10 @@ public:
                 eval_msg.data = (min_strike_distance_ < strike_distance_threshold_);
                 strike_eval_pub_.publish(eval_msg);
 
-                ROS_WARN("[STRIKE EVAL] ===== First Strike Evaluation =====");
-                ROS_WARN("[STRIKE EVAL] Min distance: %.2f m", min_strike_distance_);
-                ROS_WARN("[STRIKE EVAL] Strike altitude: %.2f m", strike_altitude_);
-                ROS_WARN("[STRIKE EVAL] Strike time: %.2f s", strike_time_);
-                ROS_WARN("[STRIKE EVAL] Success threshold: %.2f m", strike_distance_threshold_);
-                ROS_WARN("[STRIKE EVAL] Strike result: %s",
-                         (min_strike_distance_ < strike_distance_threshold_) ? "Success" : "Failure");
-                ROS_WARN("[STRIKE EVAL] ============================");
+                ROS_WARN("[STRIKE EVAL] %s: min_dist=%.2f m (threshold=%.2f), alt=%.2f m, t=%.2f s",
+                         (min_strike_distance_ < strike_distance_threshold_) ? "SUCCESS" : "FAILURE",
+                         min_strike_distance_, strike_distance_threshold_,
+                         strike_altitude_, strike_time_);
 
                 first_strike_evaluated_ = true;
             }
@@ -537,7 +559,7 @@ public:
         }
 
         if (!is_uav_pose_received_ || !is_target_pose_received_) {
-            ROS_WARN_THROTTLE(1.0, "[Guidance] Waiting for UAV pose or target data...");
+            ROS_WARN_THROTTLE(5.0, "[Guidance] Waiting for UAV pose or target data...");
             // ===== 关键：即使没收到目标，也要持续发零速度维持 PX4 OFFBOARD 心跳 =====
             // PX4 OFFBOARD 模式要求 setpoint 频率 > 2Hz，否则触发 failsafe 自动降落。
             // 起飞后切到 SEARCH_TRACK/STRIKE 时，目标通常还没出现，此时若 guidance
@@ -562,7 +584,7 @@ public:
         // Check if target twist is available (required for intercept)
         if (!is_target_twist_received_ &&
             current_strategy_type_ == multi_uav_strike::GuidanceStrategyType::INTERCEPT) {
-            ROS_WARN_THROTTLE(1.0, "[Guidance] Target velocity not available for intercept guidance");
+            ROS_WARN_THROTTLE(5.0, "[Guidance] Target velocity not available for intercept guidance");
             // 同样的 OFFBOARD 保活：悬停等待 twist
             geometry_msgs::Twist hover_cmd;
             hover_cmd.linear.x = 0.0;
@@ -665,7 +687,7 @@ public:
 
             case multi_uav_strike::GuidanceStrategyType::LOS: {
                 if (!is_los_received_) {
-                    ROS_WARN_THROTTLE(1.0, "[Guidance] LOS angle not available for LOS guidance");
+                    ROS_WARN_THROTTLE(5.0, "[Guidance] LOS angle not available for LOS guidance");
                     return;
                 }
                 auto* strategy = static_cast<multi_uav_strike::LosGuidance*>(guidance_strategy_.get());
@@ -696,9 +718,9 @@ public:
     //   alt_diff 为 UAV 相对目标的高度差（正值 = UAV 高于目标）。
     void computeTrackVelocity(geometry_msgs::Twist& vel_cmd) {
         // ====== 调试节流计数器：每 DBG_PERIOD 次循环打一次（约 10Hz @ 50Hz 主循环） ======
-        static int dbg_tick = 0;
-        const int DBG_PERIOD = 5;
-        const bool dbg_this = (++dbg_tick % DBG_PERIOD) == 0;
+        // static int dbg_tick = 0;
+        // const int DBG_PERIOD = 5;
+        // const bool dbg_this = (++dbg_tick % DBG_PERIOD) == 0;
 
         const double uav_x = current_uav_pose_.pose.position.x;
         const double uav_y = current_uav_pose_.pose.position.y;
@@ -862,115 +884,115 @@ public:
         // 8) 综合调试打印：每 DBG_PERIOD 次循环打一次（约 10Hz）
         //    一次性把每一步的中间量都列出来，方便定位"为何没追上 / 姿态乱跳"
         // =====================================================================
-        if (dbg_this) {
-            ROS_WARN(
-                "\n========== [TRACK DEBUG tick=%d] =========="
-                "\n[INPUT]"
-                "\n  uav_pos[NWU]   = (%.2f, %.2f, %.2f)   alt_asl=%.2f"
-                "\n  tgt_pos[NWU]   = (%.2f, %.2f, %.2f)"
-                "\n  uav_quat(wxyz) = (%.3f, %.3f, %.3f, %.3f)"
-                "\n  los_received  = %d"
-                "\n  los_in[NED]   (yaw,pitch,conf) = (%.3f rad, %.3f rad, %.3f)"
-                "\n  los_in[NWU deg] (yaw,pitch)   = (%.1f, %.1f)   <-- gimbal 直接发出来的"
-                "\n[GEOMETRY]"
-                "\n  rel_pos (dx,dy,dz) = (%.2f, %.2f, %.2f)   (target - uav in NWU)"
-                "\n  horiz_dist      = %.2f m"
-                "\n  alt_diff (uav-tgt) = %.2f m"
-                "\n  geom_pitch[nwu deg] = %.1f   (= atan2(alt_diff, horiz_dist))"
-                "\n  los_pitch[nwu deg]  = %.1f   (来自 los_angle.y)"
-                "\n  diff(los - geom) = %+.1f deg   <-- 偏离 0 = LOS 与几何一致，越大说明 LOS 已经不指向真目标"
-                "\n[YAW]"
-                "\n  current_yaw   = %.1f deg   (NWU: 0=N, +π/2=W)"
-                "\n  target_bearing= %.1f deg   (NWU)"
-                "\n  yaw_error     = %+.1f deg (|err|=%.1f, threshold=%.1f, attenuation_active=%s)"
-                "\n  los_yaw_in    = %.1f deg   (gimbal 发的，对照 current_yaw 看 gimbal 实际转向)"
-                "\n[DESIRED STAND-OFF]"
-                "\n  desired_los_pitch_deg = %.1f   (rad=%.3f, tan=%.3f)"
-                "\n  desired_horiz_dist    = %.2f  (raw=horiz_pitch+clamp [%.1f, %.1f], fallback_for_low_alt=%.2f)"
-                "\n[RADIAL P CONTROL]"
-                "\n  horiz_dist_error       = horiz - desired = %.2f"
-                "\n  radial_speed raw       = -k * err = -%.2f * %.2f = %.3f"
-                "\n  radial_speed after cap = %.3f   (clamped_by_max_speed=%s, max=%.2f)"
-                "\n  radial_unit (radial_x, radial_y) = (%.3f, %.3f)"
-                "\n[WORLD VEL BEFORE BODY CONVERSION]"
-                "\n  cmd_world_pre = (%.3f, %.3f)   |.|= %.3f"
-                "\n[BODY CONVERSION  (cos=%.3f, sin=%.3f of current_yaw)]"
-                "\n  pre-clamp : cmd_fwd_pre = %.3f   cmd_left_pre = %.3f   |body_pre|=%.3f"
-                "\n  step1 no-backward clamp active=%s   (would have sent fwd=%.3f backward, now 0)"
-                "\n  step2 lat-lim active=%s   (cap=±%.3f)"
-                "\n  step3 yaw-threshold attenuation active=%s   (fwd x0.2, left x0.3)"
-                "\n  step4 body-norm cap active=%s"
-                "\n  post-clamp: cmd_fwd_final = %.3f   cmd_left_final = %.3f   |body_final|=%.3f"
-                "\n[WORLD VEL AFTER BODY->WORLD  (before avoidance)]"
-                "\n  cmd_world_pre_avoid = (%.3f, %.3f)   |.|= %.3f"
-                "\n[ALTITUDE]"
-                "\n  uav_z=%.2f  track_altitude=%.2f  err=%.2f  -> cmd_z=%.3f (NED: <0=up)  saturated=%s"
-                "\n[INTER-UAV AVOIDANCE]"
-                "\n  neighbors=%lu"
-                "\n  pre  avoid: (%.3f, %.3f, %.3f)"
-                "\n  post avoid: (%.3f, %.3f, %.3f)"
-                "\n  delta      : (%.3f, %.3f, %.3f)"
-                "\n[YAW RATE]"
-                "\n  yaw_err_ctrl    = %.3f rad  (= %+.1f deg)"
-                "\n  yaw_rate raw    = kp*err = %.2f * %.3f = %.3f"
-                "\n  yaw_rate after clamp to ±%.2f  =>  %.3f   (clamped=%s)"
-                "\n[PARAMS]"
-                "\n  track_k_approach=%.2f  track_max_speed=%.2f  max_lat_speed=track_max*0.5=%.3f"
-                "\n  los_kp_yaw=%.2f  los_max_rate=%.2f  yaw_los_threshold=%.1f"
-                "\n[FINAL OUTPUT  (NED, 发送给飞控)]"
-                "\n  vel_cmd.linear  = (%.3f, %.3f, %.3f)"
-                "\n  vel_cmd.angular.z (yaw_rate, NED) = %.3f"
-                "\n==========",
-                dbg_tick,
-                uav_x, uav_y, uav_z, uav_z,
-                tgt_x, tgt_y, tgt_z,
-                current_uav_pose_.pose.orientation.w, current_uav_pose_.pose.orientation.x,
-                current_uav_pose_.pose.orientation.y, current_uav_pose_.pose.orientation.z,
-                is_los_received_ ? 1 : 0,
-                current_los_angle_.x, current_los_angle_.y, current_los_angle_.z,
-                los_yaw_in_nwu_deg, los_pitch_in_nwu_deg,
-                dx, dy, dz,
-                horiz_dist,
-                alt_diff,
-                -geom_pitch_ned_rad * 180.0 / M_PI,
-                los_pitch_in_nwu_deg,
-                los_geom_pitch_diff_deg,
-                current_yaw * 180.0 / M_PI,
-                target_bearing * 180.0 / M_PI,
-                yaw_error * 180.0 / M_PI, yaw_error_abs_deg, yaw_los_threshold_deg_,
-                yaw_threshold_active ? "YES" : "no",
-                los_yaw_in_nwu_deg,
-                desired_los_pitch_deg_, desired_los_pitch_rad, std::tan(desired_los_pitch_rad),
-                desired_horiz_dist, min_horiz_dist_, max_horiz_dist_, track_horiz_dist_,
-                horiz_dist_error,
-                track_k_approach_, horiz_dist_error, radial_speed_raw,
-                radial_speed,
-                radial_speed_clamped ? "YES" : "no", track_max_speed_,
-                radial_x, radial_y,
-                cmd_x, cmd_y, cmd_world_pre_norm,
-                cos_yaw, sin_yaw,
-                cmd_fwd_pre, cmd_left_pre,
-                std::sqrt(cmd_fwd_pre*cmd_fwd_pre + cmd_left_pre*cmd_left_pre),
-                clamped_no_backward ? "YES" : "no", cmd_fwd_pre,
-                clamped_lat ? "YES" : "no", max_lat_speed,
-                yaw_threshold_active ? "YES" : "no",
-                body_speed_clamped ? "YES" : "no",
-                cmd_fwd, cmd_left, std::sqrt(cmd_fwd*cmd_fwd + cmd_left*cmd_left),
-                cmd_x_pre_avoid, cmd_y_pre_avoid, cmd_world_post_norm,
-                uav_z, track_altitude_, alt_error, cmd_z, alt_clamped ? "YES" : "no",
-                neighbors_.size(),
-                cmd_x_pre_avoid, cmd_y_pre_avoid, cmd_z_pre_avoid,
-                cmd_x, cmd_y, cmd_z,
-                cmd_x - cmd_x_pre_avoid, cmd_y - cmd_y_pre_avoid, cmd_z - cmd_z_pre_avoid,
-                yaw_err_ctrl, yaw_err_ctrl * 180.0 / M_PI,
-                los_kp_yaw_, yaw_err_ctrl, yaw_rate_raw,
-                los_max_rate_, yaw_rate, yaw_rate_clamped ? "YES" : "no",
-                track_k_approach_, track_max_speed_, max_lat_speed,
-                los_kp_yaw_, los_max_rate_, yaw_los_threshold_deg_,
-                vel_cmd.linear.x, vel_cmd.linear.y, vel_cmd.linear.z,
-                vel_cmd.angular.z
-            );
-        }
+        // if (dbg_this) {
+        //     ROS_WARN(
+        //         "\n========== [TRACK DEBUG tick=%d] =========="
+        //         "\n[INPUT]"
+        //         "\n  uav_pos[NWU]   = (%.2f, %.2f, %.2f)   alt_asl=%.2f"
+        //         "\n  tgt_pos[NWU]   = (%.2f, %.2f, %.2f)"
+        //         "\n  uav_quat(wxyz) = (%.3f, %.3f, %.3f, %.3f)"
+        //         "\n  los_received  = %d"
+        //         "\n  los_in[NED]   (yaw,pitch,conf) = (%.3f rad, %.3f rad, %.3f)"
+        //         "\n  los_in[NWU deg] (yaw,pitch)   = (%.1f, %.1f)   <-- gimbal 直接发出来的"
+        //         "\n[GEOMETRY]"
+        //         "\n  rel_pos (dx,dy,dz) = (%.2f, %.2f, %.2f)   (target - uav in NWU)"
+        //         "\n  horiz_dist      = %.2f m"
+        //         "\n  alt_diff (uav-tgt) = %.2f m"
+        //         "\n  geom_pitch[nwu deg] = %.1f   (= atan2(alt_diff, horiz_dist))"
+        //         "\n  los_pitch[nwu deg]  = %.1f   (来自 los_angle.y)"
+        //         "\n  diff(los - geom) = %+.1f deg   <-- 偏离 0 = LOS 与几何一致，越大说明 LOS 已经不指向真目标"
+        //         "\n[YAW]"
+        //         "\n  current_yaw   = %.1f deg   (NWU: 0=N, +π/2=W)"
+        //         "\n  target_bearing= %.1f deg   (NWU)"
+        //         "\n  yaw_error     = %+.1f deg (|err|=%.1f, threshold=%.1f, attenuation_active=%s)"
+        //         "\n  los_yaw_in    = %.1f deg   (gimbal 发的，对照 current_yaw 看 gimbal 实际转向)"
+        //         "\n[DESIRED STAND-OFF]"
+        //         "\n  desired_los_pitch_deg = %.1f   (rad=%.3f, tan=%.3f)"
+        //         "\n  desired_horiz_dist    = %.2f  (raw=horiz_pitch+clamp [%.1f, %.1f], fallback_for_low_alt=%.2f)"
+        //         "\n[RADIAL P CONTROL]"
+        //         "\n  horiz_dist_error       = horiz - desired = %.2f"
+        //         "\n  radial_speed raw       = -k * err = -%.2f * %.2f = %.3f"
+        //         "\n  radial_speed after cap = %.3f   (clamped_by_max_speed=%s, max=%.2f)"
+        //         "\n  radial_unit (radial_x, radial_y) = (%.3f, %.3f)"
+        //         "\n[WORLD VEL BEFORE BODY CONVERSION]"
+        //         "\n  cmd_world_pre = (%.3f, %.3f)   |.|= %.3f"
+        //         "\n[BODY CONVERSION  (cos=%.3f, sin=%.3f of current_yaw)]"
+        //         "\n  pre-clamp : cmd_fwd_pre = %.3f   cmd_left_pre = %.3f   |body_pre|=%.3f"
+        //         "\n  step1 no-backward clamp active=%s   (would have sent fwd=%.3f backward, now 0)"
+        //         "\n  step2 lat-lim active=%s   (cap=±%.3f)"
+        //         "\n  step3 yaw-threshold attenuation active=%s   (fwd x0.2, left x0.3)"
+        //         "\n  step4 body-norm cap active=%s"
+        //         "\n  post-clamp: cmd_fwd_final = %.3f   cmd_left_final = %.3f   |body_final|=%.3f"
+        //         "\n[WORLD VEL AFTER BODY->WORLD  (before avoidance)]"
+        //         "\n  cmd_world_pre_avoid = (%.3f, %.3f)   |.|= %.3f"
+        //         "\n[ALTITUDE]"
+        //         "\n  uav_z=%.2f  track_altitude=%.2f  err=%.2f  -> cmd_z=%.3f (NED: <0=up)  saturated=%s"
+        //         "\n[INTER-UAV AVOIDANCE]"
+        //         "\n  neighbors=%lu"
+        //         "\n  pre  avoid: (%.3f, %.3f, %.3f)"
+        //         "\n  post avoid: (%.3f, %.3f, %.3f)"
+        //         "\n  delta      : (%.3f, %.3f, %.3f)"
+        //         "\n[YAW RATE]"
+        //         "\n  yaw_err_ctrl    = %.3f rad  (= %+.1f deg)"
+        //         "\n  yaw_rate raw    = kp*err = %.2f * %.3f = %.3f"
+        //         "\n  yaw_rate after clamp to ±%.2f  =>  %.3f   (clamped=%s)"
+        //         "\n[PARAMS]"
+        //         "\n  track_k_approach=%.2f  track_max_speed=%.2f  max_lat_speed=track_max*0.5=%.3f"
+        //         "\n  los_kp_yaw=%.2f  los_max_rate=%.2f  yaw_los_threshold=%.1f"
+        //         "\n[FINAL OUTPUT  (NED, 发送给飞控)]"
+        //         "\n  vel_cmd.linear  = (%.3f, %.3f, %.3f)"
+        //         "\n  vel_cmd.angular.z (yaw_rate, NED) = %.3f"
+        //         "\n==========",
+        //         dbg_tick,
+        //         uav_x, uav_y, uav_z, uav_z,
+        //         tgt_x, tgt_y, tgt_z,
+        //         current_uav_pose_.pose.orientation.w, current_uav_pose_.pose.orientation.x,
+        //         current_uav_pose_.pose.orientation.y, current_uav_pose_.pose.orientation.z,
+        //         is_los_received_ ? 1 : 0,
+        //         current_los_angle_.x, current_los_angle_.y, current_los_angle_.z,
+        //         los_yaw_in_nwu_deg, los_pitch_in_nwu_deg,
+        //         dx, dy, dz,
+        //         horiz_dist,
+        //         alt_diff,
+        //         -geom_pitch_ned_rad * 180.0 / M_PI,
+        //         los_pitch_in_nwu_deg,
+        //         los_geom_pitch_diff_deg,
+        //         current_yaw * 180.0 / M_PI,
+        //         target_bearing * 180.0 / M_PI,
+        //         yaw_error * 180.0 / M_PI, yaw_error_abs_deg, yaw_los_threshold_deg_,
+        //         yaw_threshold_active ? "YES" : "no",
+        //         los_yaw_in_nwu_deg,
+        //         desired_los_pitch_deg_, desired_los_pitch_rad, std::tan(desired_los_pitch_rad),
+        //         desired_horiz_dist, min_horiz_dist_, max_horiz_dist_, track_horiz_dist_,
+        //         horiz_dist_error,
+        //         track_k_approach_, horiz_dist_error, radial_speed_raw,
+        //         radial_speed,
+        //         radial_speed_clamped ? "YES" : "no", track_max_speed_,
+        //         radial_x, radial_y,
+        //         cmd_x, cmd_y, cmd_world_pre_norm,
+        //         cos_yaw, sin_yaw,
+        //         cmd_fwd_pre, cmd_left_pre,
+        //         std::sqrt(cmd_fwd_pre*cmd_fwd_pre + cmd_left_pre*cmd_left_pre),
+        //         clamped_no_backward ? "YES" : "no", cmd_fwd_pre,
+        //         clamped_lat ? "YES" : "no", max_lat_speed,
+        //         yaw_threshold_active ? "YES" : "no",
+        //         body_speed_clamped ? "YES" : "no",
+        //         cmd_fwd, cmd_left, std::sqrt(cmd_fwd*cmd_fwd + cmd_left*cmd_left),
+        //         cmd_x_pre_avoid, cmd_y_pre_avoid, cmd_world_post_norm,
+        //         uav_z, track_altitude_, alt_error, cmd_z, alt_clamped ? "YES" : "no",
+        //         neighbors_.size(),
+        //         cmd_x_pre_avoid, cmd_y_pre_avoid, cmd_z_pre_avoid,
+        //         cmd_x, cmd_y, cmd_z,
+        //         cmd_x - cmd_x_pre_avoid, cmd_y - cmd_y_pre_avoid, cmd_z - cmd_z_pre_avoid,
+        //         yaw_err_ctrl, yaw_err_ctrl * 180.0 / M_PI,
+        //         los_kp_yaw_, yaw_err_ctrl, yaw_rate_raw,
+        //         los_max_rate_, yaw_rate, yaw_rate_clamped ? "YES" : "no",
+        //         track_k_approach_, track_max_speed_, max_lat_speed,
+        //         los_kp_yaw_, los_max_rate_, yaw_los_threshold_deg_,
+        //         vel_cmd.linear.x, vel_cmd.linear.y, vel_cmd.linear.z,
+        //         vel_cmd.angular.z
+        //     );
+        // }
     }
 
     /**

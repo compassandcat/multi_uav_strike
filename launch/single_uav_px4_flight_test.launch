@@ -155,6 +155,7 @@
           type="mission_manager_node"
           output="screen"
           respawn="false">
+      <param name="device_id" value="0" />
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
@@ -182,18 +183,18 @@
   <!-- 9. 地面站模拟器（仿真测试用）                                            -->
   <!-- ====================================================================== -->
    
-  <!--group ns="$(arg uav_name)"-->
+  <group ns="$(arg uav_name)">
     <node pkg="starling_bridge" type="starling_bridge" name="starling_bridge" output="screen">
       <!-- 地面站 IP 和端口 -->
       <param name="gcs_ip" value="192.168.1.1" />
       <param name="gcs_udp_port" value="14550" />
       <param name="gcs_kcp_port" value="18990" />
       <param name="device_name" value="$(arg uav_name)" />
-      <param name="device_sn" value="$(arg uav_name)" />
-      <!--param name="uav_id" value="3" /-->
-      <!--param name="device_sn" value="MAVLink_3_1" /-->
+      <param name="device_sn" value="5678" />
+      <!--param name="uav_id" value="2" />
+      <param name="device_sn" value="MAVLink_2_1" /-->
     </node>
-  <!--/group-->
+  </group>
 
   <!-- ====================================================================== -->
   <!-- 10. RViz 可视化                                                          -->

@@ -243,7 +243,7 @@ public:
 
         // 数据没到齐:发"空帧"+保持当前云台角度
         if (!cached_proj_valid_) {
-            ROS_WARN_THROTTLE(1.0, "[GimbalSim] waiting for target/pose ...");
+            ROS_WARN_THROTTLE(5.0, "[GimbalSim] waiting for target/pose ...");
             publishYoloDetection();
             return;
         }
@@ -252,7 +252,7 @@ public:
         desired_pitch = cached_visible_ ? computePitchAndYawToTarget() : default_pitch_rad_;
         // Print out throttled message when target is in view
         if (cached_visible_) {
-            ROS_INFO_THROTTLE(1.0, "[GimbalSim] target in view: u_px=%.1f, v_px=%.1f, "
+            ROS_INFO_THROTTLE(5.0, "[GimbalSim] target in view: u_px=%.1f, v_px=%.1f, "
                                 "distance=%.2fm, desired_pitch=%.2fdeg",
                               cached_u_px_, cached_v_px_, cached_distance_,
                               desired_pitch * 180.0 / M_PI);

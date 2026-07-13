@@ -287,22 +287,24 @@ public:
     }
 
     /**
-     * PX4 home 一次性回调
-     * - 第一次收到就把 ref_lat_/ref_lon_/ref_alt_ 锁定到 PX4 当前 home
-     * - 之后再收也不覆盖,避免飞行中 home 突变导致 NED 跳变
+     * PX4 home 回调 — 锁一次
+     * PX4 的 LOCAL_POSITION_NED 参考系由 EKF2 在启动时锁定,
+     * 后续 home 更新(MAV_CMD_DO_SET_HOME / disarm)不会重置 EKF2 origin,
+     * 也不让 local_position 跳变。如果跟着 home 更新去重算 NED,
+     * 反而让 setpoint 与 UAV 当前 local_position 不在同一 frame → 偏飞。
      */
     void homePositionCallback(const mavros_msgs::HomePosition::ConstPtr& msg) {
-        if (ref_initialized_) return;
+        if (ref_initialized_) return;  // 锁一次
         if (msg->geo.latitude == 0.0 && msg->geo.longitude == 0.0) {
             // PX4 在 home 未稳定前可能发 0/0,忽略
             return;
         }
+        ROS_WARN("[Comm] >>>> PX4 home locked: (%.7f, %.7f, %.2f)",
+                 msg->geo.latitude, msg->geo.longitude, msg->geo.altitude);
         ref_lat_ = msg->geo.latitude;
         ref_lon_ = msg->geo.longitude;
         ref_alt_ = msg->geo.altitude;
         ref_initialized_ = true;
-        ROS_WARN("[Comm] >>>> PX4 home loaded: lat=%.7f lon=%.7f alt=%.2f",
-                 ref_lat_, ref_lon_, ref_alt_);
     }
 
     void otherUavPosesCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
