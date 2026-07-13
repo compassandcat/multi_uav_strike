@@ -923,7 +923,7 @@ public:
 
         // 第一个 skill 是 Takeoff(type=100)时:推进 phase=PHASE_TAKING_OFF
         // 注意:不再操作 work_mode(只表达"在任务区内做什么",起飞是 phase 不是 work_mode)
-        if (!skill_queue_.empty() && skill_queue_[0].msg.skill_type == 100) {
+        if (!skill_queue_.empty() && (skill_queue_[0].msg.skill_type == 100 || skill_queue_[0].msg.skill_type == 106)) {
             if (current_phase_ != MissionPhase::PHASE_TAKING_OFF) {
                 // 缓存起飞前的 phase 和 work_mode,performTakeoffHandoff 用
                 phase_before_takeoff_ = current_phase_;
@@ -1001,7 +1001,7 @@ public:
         //   而 takeoff 还没爬升到目标高度,两套控制打架(handoff 强制 COMPLETE 也晚了一步)。
         //   即使 arrive_path 为空也不推 — 保持"takeoff 不下发"的语义一致,让
         //   后续 search/gather 真正要飞的航点从下一条 skill 开始下发。
-        if (sr.msg.skill_type == 100) {
+        if (sr.msg.skill_type == 100 || sr.msg.skill_type == 106) {
             return;
         }
         // 推到 executor
@@ -1591,7 +1591,8 @@ public:
         //    起飞 skill 没有 arrive_path/skill_area_path,EXIT_PENDING 阶段无意义,直接 COMPLETE 更清晰
         //    下次 skillAdvanceTimerCallback tick 就会走 COMPLETE 分支推下一个 skill
         if (current_skill_index_ < skill_queue_.size() &&
-            skill_queue_[current_skill_index_].msg.skill_type == 100) {
+            (skill_queue_[current_skill_index_].msg.skill_type == 100 ||
+             skill_queue_[current_skill_index_].msg.skill_type == 106)) {
             auto& sr = skill_queue_[current_skill_index_];
             const std::string prev_state_str = skillStateStr(sr.state);
             sr.state = SkillState::COMPLETE;
@@ -2223,7 +2224,7 @@ public:
             case SkillState::TRANSIT: {
                 // 特殊门控:skill_type=100 (Takeoff) — 起飞没有 arrive_path/skill_area_path,
                 //   用 isTakeoffComplete() 当门控;一旦起飞完成直接跳 EXIT_PENDING(中间状态无意义)
-                if (sr.msg.skill_type == 100) {
+                if (sr.msg.skill_type == 100 || sr.msg.skill_type == 106) {
                     if (!isTakeoffComplete()) break;
                     sr.state = SkillState::EXIT_PENDING;
                     sr.state_enter_time = now;
