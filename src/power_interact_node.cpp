@@ -30,6 +30,7 @@ public:
         // 2. 发布器：所有收发报文通过std_msgs/String输出
         pub_raw_msg = nh.advertise<std_msgs::String>("power_board_raw_msg", 10);
         pub_gas_gen_normal = nh.advertise<std_msgs::Bool>("gas_generator_normal", 10);
+        pub_datalink_normal = nh.advertise<std_msgs::Bool>("datalink_normal", 10);
 
         // 3. 创建4个服务，分别对应4大功能
         srv_trigger_gen = nh.advertiseService("trigger_gas_generator",
@@ -51,7 +52,7 @@ public:
         std::vector<uint8_t> recv_buf;
         while (ros::ok())
         {
-            // ===== 功能1: 检查触发反馈超时(无 ASCII "finish open" 视为失败) =====
+            // ===== 超时判定:三种反馈任一未在截止前到达 -> 视为失败 =====
             if (trigger_pending_ && ros::Time::now() >= trigger_feedback_deadline_) {
                 ROS_WARN("Gas generator trigger: no 'finish open' within %.1fs, assumed failed",
                          trigger_feedback_timeout_s_);
@@ -59,6 +60,22 @@ public:
                 gen_bool.data = false;
                 pub_gas_gen_normal.publish(gen_bool);
                 trigger_pending_ = false;
+            }
+            if (datalink_down_pending_ && ros::Time::now() >= datalink_down_feedback_deadline_) {
+                ROS_WARN("Datalink power down: no 'finish down' within %.1fs, assumed failed",
+                         trigger_feedback_timeout_s_);
+                std_msgs::Bool dl_bool;
+                dl_bool.data = false;
+                pub_datalink_normal.publish(dl_bool);
+                datalink_down_pending_ = false;
+            }
+            if (datalink_up_pending_ && ros::Time::now() >= datalink_up_feedback_deadline_) {
+                ROS_WARN("Datalink power up: no 'finish up' within %.1fs, assumed failed",
+                         trigger_feedback_timeout_s_);
+                std_msgs::Bool dl_bool;
+                dl_bool.data = false;
+                pub_datalink_normal.publish(dl_bool);
+                datalink_up_pending_ = false;
             }
 
             size_t len = ser.available();
@@ -68,21 +85,42 @@ public:
                 ser.read(temp.data(), len);
                 recv_buf.insert(recv_buf.end(), temp.begin(), temp.end());
 
-                // ===== 功能1 ASCII 反馈检测(必须在 0x71 帧解析之前,否则会被字节丢弃) =====
-                // 气体发生器触发成功后,电源板回 "finish open" ASCII 流(无帧头 0x71)
-                if (trigger_pending_ && !recv_buf.empty()) {
+                // ===== ASCII 反馈检测(必须在 0x71 帧解析之前,否则会被字节丢弃) =====
+                // 三个等待中的反馈任一匹配即视为成功
+                if (!recv_buf.empty() &&
+                    (trigger_pending_ || datalink_down_pending_ || datalink_up_pending_)) {
                     std::string ascii_data(recv_buf.begin(), recv_buf.end());
-                    if (ascii_data.find("finish open") != std::string::npos) {
+                    bool consumed = false;
+                    if (trigger_pending_ &&
+                        ascii_data.find("finish open") != std::string::npos) {
                         ROS_INFO("Gas generator trigger confirmed: 'finish open' ASCII feedback");
                         std_msgs::Bool gen_bool;
                         gen_bool.data = true;
                         pub_gas_gen_normal.publish(gen_bool);
                         trigger_pending_ = false;
+                        consumed = true;
+                    } else if (datalink_down_pending_ &&
+                               ascii_data.find("finish down") != std::string::npos) {
+                        ROS_INFO("Datalink power down confirmed: 'finish down' ASCII feedback");
+                        std_msgs::Bool dl_bool;
+                        dl_bool.data = true;
+                        pub_datalink_normal.publish(dl_bool);
+                        datalink_down_pending_ = false;
+                        consumed = true;
+                    } else if (datalink_up_pending_ &&
+                               ascii_data.find("finish up") != std::string::npos) {
+                        ROS_INFO("Datalink power up confirmed: 'finish up' ASCII feedback");
+                        std_msgs::Bool dl_bool;
+                        dl_bool.data = true;
+                        pub_datalink_normal.publish(dl_bool);
+                        datalink_up_pending_ = false;
+                        consumed = true;
+                    }
+                    if (consumed) {
                         recv_buf.clear();
                     } else if (recv_buf.size() > 128) {
-                        // ASCII 字节累积但既不含 "finish open" 也不是 0x71 帧头,
-                        // 防止在长任务期间无限增长
-                        ROS_WARN("Non-frame bytes buffered > 128B without 'finish open', clearing");
+                        // 累积太多未识别字节,清空防内存增长
+                        ROS_WARN("Non-frame bytes buffered > 128B without 'finish *', clearing");
                         recv_buf.clear();
                     }
                 }
@@ -141,6 +179,7 @@ private:
     ros::NodeHandle nh;
     ros::Publisher pub_raw_msg;
     ros::Publisher pub_gas_gen_normal;
+    ros::Publisher pub_datalink_normal;
     serial::Serial ser;
 
     // 4个服务服务端
@@ -149,11 +188,17 @@ private:
     ros::ServiceServer srv_data_link_up;
     ros::ServiceServer srv_check_gen;
 
-    // ===== 功能1 触发反馈状态 =====
-    // 触发后等待电源板回 ASCII "finish open";超时未回视为失败
+    // ===== 功能1 / 功能2 反馈等待状态 =====
+    // 三个指令成功后电源板回 ASCII:trigger -> "finish open",
+    // datalink down -> "finish down", datalink up -> "finish up";
+    // 超时未回视为失败
     bool trigger_pending_ = false;
     ros::Time trigger_feedback_deadline_;
-    static constexpr double trigger_feedback_timeout_s_ = 5.0;  // 等待 "finish open" 上限
+    bool datalink_down_pending_ = false;
+    ros::Time datalink_down_feedback_deadline_;
+    bool datalink_up_pending_ = false;
+    ros::Time datalink_up_feedback_deadline_;
+    static constexpr double trigger_feedback_timeout_s_ = 5.0;  // 等待 ASCII 反馈统一上限
 
     // ==================== 服务回调函数 ====================
     // 功能1：气体发生器触发指令 0x71 02 00 00 00 sum 5C
@@ -174,26 +219,32 @@ private:
     }
 
     // 功能2：数据链下电 0x71 00 02 00 00 sum 5C
+    // 成功反馈: ASCII "finish down";失败无反馈
     bool srvDataLinkDownCb(std_srvs::Trigger::Request &req, std_srvs::Trigger::Response &res)
     {
         std::vector<uint8_t> frame = {0x71, 0x00, 0x02, 0x00, 0x00};
         fillCheckSum(frame);
         frame.push_back(0x5C);
         sendFrame(frame);
+        datalink_down_pending_ = true;
+        datalink_down_feedback_deadline_ = ros::Time::now() + ros::Duration(trigger_feedback_timeout_s_);
         res.success = true;
-        res.message = "Send datalink power down cmd ok";
+        res.message = "Send datalink power down cmd ok, awaiting 'finish down' feedback";
         return true;
     }
 
     // 功能2：数据链上电 0x71 00 01 00 00 sum 5C
+    // 成功反馈: ASCII "finish up";失败无反馈
     bool srvDataLinkUpCb(std_srvs::Trigger::Request &req, std_srvs::Trigger::Response &res)
     {
         std::vector<uint8_t> frame = {0x71, 0x00, 0x01, 0x00, 0x00};
         fillCheckSum(frame);
         frame.push_back(0x5C);
         sendFrame(frame);
+        datalink_up_pending_ = true;
+        datalink_up_feedback_deadline_ = ros::Time::now() + ros::Duration(trigger_feedback_timeout_s_);
         res.success = true;
-        res.message = "Send datalink power up cmd ok";
+        res.message = "Send datalink power up cmd ok, awaiting 'finish up' feedback";
         return true;
     }
 
