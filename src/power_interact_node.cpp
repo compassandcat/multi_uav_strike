@@ -15,12 +15,12 @@ public:
         // 1. 串口初始化，根据实际硬件修改端口、波特率
         try
         {
-            ser.setPort("/dev/ttyS2");
+            ser.setPort("/dev/ttyS8");
             ser.setBaudrate(115200);
             serial::Timeout to = serial::Timeout::simpleTimeout(100);
             ser.setTimeout(to);
             ser.open();
-            ROS_INFO("Serial port open success: /dev/ttyS2");
+            ROS_INFO("Serial port open success: /dev/ttyS8");
         }
         catch (serial::IOException &e)
         {

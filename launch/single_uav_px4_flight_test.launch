@@ -197,9 +197,17 @@
   </group>
 
   <!-- ====================================================================== -->
-  <!-- 10. RViz 可视化                                                          -->
+  <!-- 10. 电源信息板通信节点                                                          -->
   <!-- ====================================================================== -->
-  <node name="rviz" pkg="rviz" type="rviz"
-        args="-d $(find multi_uav_strike)/rviz/view_strike_SITL.rviz" />
+  <group ns="$(arg uav_name)">
+    <node pkg="multi_uav_strike" type="power_interact_node" name="power_interact_node" output="screen">
+    </node>
+  </group>
+
+  <!-- ====================================================================== -->
+  <!-- 11. RViz 可视化                                                          -->
+  <!-- ====================================================================== -->
+  <!-- <node name="rviz" pkg="rviz" type="rviz"
+        args="-d $(find multi_uav_strike)/rviz/view_strike_SITL.rviz" /> -->
 
 </launch>
