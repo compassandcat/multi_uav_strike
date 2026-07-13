@@ -28,7 +28,13 @@ from math import cos, pi
 # Phase 2+: 内嵌 DEMO TaskFlows(每套对应一个测试场景)
 # ============================================================================
 # 坐标系:相对参考点的米(NED 北, NED 东, 上为正高度)
-# skill_type: 100=Takeoff, 101=Gather, 102=Search, 103=Return, 105=Attack
+# skill_type (当前): 100=Takeoff-弹射, 101=Gather, 102=Search, 103=Return, 105=Attack, 106=Takeoff-地面
+#
+# 起飞按类型已拆分:
+#   100 = Takeoff-弹射 (catapult takeoff, 走 mission/catapult_trigger 流程)
+#   106 = Takeoff-地面 (ground takeoff, 走原 OFFBOARD+ARM 流程)
+# 所有 demo 已按此分好,弹射起飞 demo 仍带 takeoff_subtype=1 标记(后续弃用),
+# 地面起飞 demo 带 takeoff_subtype=0 (后续弃用)。
 
 DEMO_FLOWS = {
     # ---------- Demo 1: 地面起飞 + 搜索 + 打击 ----------
@@ -44,7 +50,7 @@ DEMO_FLOWS = {
             # 1) Takeoff (地面起飞, takeoff_subtype=0)
             {
                 "skill_id": "takeoff_001",
-                "skill_type": 100,
+                "skill_type": 106,
                 "takeoff_subtype": 0,
                 "takeoff_altitude": 30.0,  # 相对 PX4 home,目标 alt = home_alt + 30
                 "priority": 100,
@@ -105,7 +111,7 @@ DEMO_FLOWS = {
         "skills": [
             {
                 "skill_id": "takeoff_001",
-                "skill_type": 100,
+                "skill_type": 106,
                 "takeoff_subtype": 0,
                 "takeoff_altitude": 30.0,  # 相对 PX4 home,目标 alt = home_alt + 30
                 "priority": 100,
@@ -150,7 +156,7 @@ DEMO_FLOWS = {
         "skills": [
             {
                 "skill_id": "takeoff_001",
-                "skill_type": 100,
+                "skill_type": 106,
                 "takeoff_subtype": 0,
                 "takeoff_altitude": 30.0,  # 相对 PX4 home,目标 alt = home_alt + 30
                 "priority": 100,
@@ -164,13 +170,11 @@ DEMO_FLOWS = {
                 "skill_type": 101,
                 "priority": 100,
                 "cruise_speed": 8.0,
-                "task_speed": 0.0,  # 集结不需任务速度
+                "task_speed": 4.0,  # 集结不需任务速度
                 "arrive_path": [
                     (20.0, 0.0, 30.0),
                 ],
-                "skill_area_path": [
-                    (20.0, 0.0, 30.0),  # 集结 HOVER 点
-                ],
+                "skill_area_path": [],  # 集结只需到 ARRIVE 点,无独立 skill_area (mission_manager 检测到空路径会跳过 ENTRY_PENDING)
             },
             {
                 "skill_id": "search_001",
@@ -252,7 +256,7 @@ DEMO_FLOWS = {
             # 1) Takeoff (地面起飞, takeoff_subtype=0)
             {
                 "skill_id": "takeoff_001",
-                "skill_type": 100,
+                "skill_type": 106,
                 "takeoff_subtype": 0,
                 "takeoff_altitude": 30.0,  # 相对 PX4 home,目标 alt = home_alt + 30
                 "priority": 100,
@@ -295,7 +299,7 @@ DEMO_FLOWS = {
             # 1) Takeoff — 原始 GPS: WP1=(36.0962811, 114.3922342, 30), WP2=(36.0965128, 114.3926923, 30)
             {
                 "skill_id": "9bcd",
-                "skill_type": 100,
+                "skill_type": 106,
                 "takeoff_subtype": 0,
                 "takeoff_altitude": 30.0,
                 "priority": 0,
@@ -372,7 +376,7 @@ DEMO_FLOWS = {
             # 1) Takeoff — 原始 GPS: WP1=(36.0962778, 114.3922288, 30), WP2=(36.0960795, 114.3922483, 30)
             {
                 "skill_id": "b1bc",
-                "skill_type": 100,
+                "skill_type": 106,
                 "takeoff_subtype": 0,
                 "takeoff_altitude": 30.0,
                 "priority": 0,

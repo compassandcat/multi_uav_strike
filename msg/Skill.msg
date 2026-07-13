@@ -2,12 +2,19 @@
 # 单条 skill 定义 — 任务流中的原子单元
 # 与 WorkMode 独立(WorkMode 由 GS 单独下发)
 # skill_type 枚举(参考 TZS v4.0 §9.2.6):
-#   100 = Takeoff(弹射 or 地面)
+#   100 = Takeoff-弹射 (catapult takeoff,走弹射起飞流程,等 PX4 抛飞模式 + 外部 trigger)
 #   101 = Gather(集结)
 #   102 = Search(搜索)
 #   103 = Return(返航,任务流末尾触发 PX4 AUTO.LAND)
 #   104 = Relay(中继,本版本不实现)
 #   105 = Attack(多目标打击)
+#   106 = Takeoff-地面 (ground takeoff,走原 OFFBOARD+ARM 流程)
+#
+# TODO(skill_type_mapping): 协议升级中,旧版本 100=Takeoff(弹射/地面)由 takeoff_subtype
+#   区分(0=地面,1=弹射);新协议改为 100=弹射 / 106=地面分开,不再使用 takeoff_subtype。
+#   当前 mission_manager_node.cpp 已兼容新旧两套 (同时认 100 和 106 为 takeoff),
+#   gs_simulator_node.py 应改为: 弹射任务下发 100, 地面任务下发 106。
+#   此字段后续版本会弃用,具体时序等 GS 端协议冻结后清理。
 # ============================================================================
 
 string   skill_id

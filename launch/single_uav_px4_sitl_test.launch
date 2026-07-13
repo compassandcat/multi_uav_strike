@@ -36,7 +36,7 @@
 
   -->
   <arg name="uav_name" default="uav0" />
-  <arg name="flow" default="ground_search_track" />
+  <arg name="flow" default="ground_gather_search" />
 
   <!-- Set GeographicLib data path -->
   <env name="GEOGRAPHICLIB_DATA" value="$(env HOME)/.GeographicLib" />

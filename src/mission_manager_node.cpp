@@ -111,6 +111,11 @@ enum class TaskStatus {
 enum class TakeoffState {
     TAKEOFF_IDLE,           // 空闲状态，等待开始起飞
     TAKEOFF_WAITING_FCU,   // 等待 FCU 连接
+    // ===== 弹射起飞特有状态(skill_type=100) =====
+    TAKEOFF_CATAPULT_ARMED,     // 弹射模式就绪,等外部 trigger
+    TAKEOFF_CATAPULT_TRIGGERED, // 收到 trigger,等 PX4 进 POSCTL
+    TAKEOFF_CATAPULT_POSCTL,    // PX4 POSCTL 稳定,准备 OFFBOARD 接管
+    // ===== 标准起飞流程(地面 + 弹射后段共用) =====
     TAKEOFF_SETTING_OFFBOARD, // 正在切换 OFFBOARD 模式
     TAKEOFF_TAKEOFF_EXEC,  // 执行起飞爬升
     TAKEOFF_HOVERING,      // 悬停等待
@@ -174,6 +179,38 @@ struct TrackedTarget {
     multi_uav_strike::DetectTarget::ConstPtr latest;
     TrackLockState        lock_state;
     ros::Time             locked_at;
+    // 锁定瞬间 YOLO 的原始 label (string,如 "person"/"car"),
+    // 用于 attack_cmd action=1/2 加黑名单时携带 label 信息
+    // (DetectTarget.label 是 uint32 占位 =1,丢失了原始 label)
+    std::string           yolo_label;
+};
+
+// === 目标级"已忽略"黑名单(label + TTL) ===
+// 用于解决 SEARCH_TRACK 模式下的目标聚类缺失问题:
+//   1. UAV 检测并锁定目标 A (label="person")
+//   2. GS 发 attack_cmd action=1/2 (忽略/暂存)
+//   3. 当前实现: tracked_target_ 清空 → 下一帧 YOLO 再命中同一目标 → 又重新锁
+//   4. 加本黑名单后: attack_cmd 触发时记录 label+到期时间;
+//      后续 checkYoloDrivenStrike 进门控时检查新命中 label 是否在黑名单 + 未过期
+//      → 视为同一类目标(由 GS ignore 过),跳过锁定。
+//
+// 设计权衡(2026-07 改为 label-only):
+//   - 原始方案带空间半径(20m)需要靠 UAV 当前位置做 proxy,
+//     但 DetectTarget.obj_lat/lon 实际是 UAV pose 占位(不是真实目标位置),
+//     UAV 一边扫描一边移动,3s 就走出 20m,空间匹配失效。
+//   - 改 label-only:20s 内同 label 一律忽略,扫描/悬停都稳定;空间维度
+//     留给未来云台+UAV pose 反推真实目标位置(C 方案)落地后再补。
+//   - 不持久化(节点重启即清空),只防同一任务流内重复
+//   - 与未来 reported_targets_ 上报去重列表解耦,语义独立
+//   - 用户的语义("同位置忽略人后再看到车可追")由 label 区分已满足
+struct IgnoredTarget {
+    std::string  label;          // YoloDetection.label 原值,如 "person"/"car"
+    ros::Time    ignore_until;   // 过期时间 (now + ~ignored_retention_sec_)
+    ros::Time    ignore_set_time;// 用于日志/debug
+    // 保留位置字段以便未来 C 方案落地时直接复用(暂不参与匹配)
+    double       ned_x           = 0.0;
+    double       ned_y           = 0.0;
+    double       ned_alt         = 0.0;
 };
 
 class MissionManager {
@@ -307,6 +344,16 @@ private:
     double takeoff_check_interval_;
     double takeoff_stable_time_;   // 高度达标后稳定等待（秒）
     double takeoff_hover_time_;    // 悬停等待（秒）
+    // ===== 弹射起飞流程状态(skill_type=100) =====
+    // TODO(skill_type_mapping): 协议升级后 skill_type=100 仅表示弹射,
+    //   skill_type=106 表示地面起飞;此处所有判定同步更新
+    bool is_catapult_takeoff_ = false;          // 当前 task_flow 是否为弹射起飞
+    bool is_px4_catapult_mode_ = false;         // PX4 是否已被 comm_node 切到抛飞模式
+    bool catapult_trigger_received_ = false;    // 是否收到 /mission/catapult_trigger
+    ros::Time catapult_posctl_enter_time_;      // PX4 进入 POSCTL 的时刻(用于稳定等待)
+    double catapult_posctl_stable_sec_ = 1.0;   // POSCTL 持续多久才算稳定
+    ros::Subscriber catapult_trigger_sub_;
+    ros::Subscriber px4_catapult_mode_sub_;
     // LOCAL_POSITION_NED 发送频率（Hz）。某些板子 PX4 重启后默认频率太低，
     // 必须上电后用 MAV_CMD_SET_MESSAGE_INTERVAL (511) 设置一次，否则位置数据延迟大、
     // OFFBOARD 控制发散。FCU 断连后 flag 会清掉，PX4 重启重连时自动重发。
@@ -378,6 +425,13 @@ private:
     ros::Time latest_yolo_time_;
     // 跟踪目标(typed)
     TrackedTarget tracked_target_;
+
+    // === 已忽略目标黑名单 ===
+    std::vector<IgnoredTarget> ignored_targets_;
+    double ignored_retention_sec_;     // 黑名单保留时长 (秒)
+    double ignored_match_radius_m_;    // 已弃用:label-only 方案不再做位置匹配;
+                                       //   保留 param 仅为兼容 yaml 配置,代码内不读取
+    ros::Time last_ignored_cleanup_;   // 上次清理过期项的时间(避免每帧遍历)
     // WaypointStatus(Phase 4)
     multi_uav_strike::WaypointStatus::ConstPtr latest_wp_status_;
     ros::Time latest_wp_status_time_;
@@ -431,7 +485,10 @@ public:
         set_message_rate_retry_count_(0),
         max_set_message_rate_retries_(3),
         set_message_rate_start_time_(ros::Time()),  // isZero() 表示还没开始尝试
-        set_message_rate_max_wait_sec_(5.0) {
+        set_message_rate_max_wait_sec_(5.0),
+        ignored_retention_sec_(20.0),       // 黑名单默认保留 20s
+        ignored_match_radius_m_(20.0),      // 空间匹配默认 20m
+        last_ignored_cleanup_(ros::Time()) {
 
         initParams();
         initSubscribers();
@@ -496,6 +553,10 @@ public:
         nh_private_.param<double>("entry_gate_timeout", entry_gate_timeout_, 30.0); // ENTRY_PENDING 上限 30s
         nh_private_.param<double>("in_task_timeout",    in_task_timeout_, 0.0);    // IN_TASK 默认不限(0)
         nh_private_.param<double>("gather_timeout",     gather_timeout_, 60.0);    // 101 集结合计超时 60s
+
+        // === 已忽略目标黑名单参数 (Phase 5.5: 目标聚类轻量替代) ===
+        nh_private_.param<double>("ignored_retention_sec",  ignored_retention_sec_,  20.0);  // 默认 20s
+        nh_private_.param<double>("ignored_match_radius_m", ignored_match_radius_m_, 20.0);  // 默认 20m
 
         // 期望集结 UAV SN 列表(逗号分隔字符串,如 "uav0,uav2")
         std::string sns_str;
@@ -599,6 +660,14 @@ public:
         // === PX4 home 自动加载(ref_lat/lon/alt 的唯一权威来源)===
         home_position_sub_ = nh_.subscribe("mavros/home_position/home", 10,
                                             &MissionManager::homePositionCallback, this);
+
+        // ===== 弹射起飞流程(协议 TODO: skill_type=100 = 弹射, 106 = 地面) =====
+        // 弹射指令触发(由外部弹射控制节点发,本节点不实现发端)
+        catapult_trigger_sub_ = nh_.subscribe("mission/catapult_trigger", 10,
+                                              &MissionManager::catapultTriggerCallback, this);
+        // PX4 抛飞模式就绪(由 comm_node 切完 PX4 模式后发 true)
+        px4_catapult_mode_sub_ = nh_.subscribe("px4/catapult_mode_ready", 10,
+                                               &MissionManager::px4CatapultModeCallback, this);
     }
 
     void initPublishers() {
@@ -850,6 +919,64 @@ public:
         }
     }
 
+    /**
+     * 弹射起飞 trigger 回调
+     * 由外部弹射控制节点触发,本节点不实现发端
+     * 仅当 is_catapult_takeoff_=true(当前 task_flow 首发是 skill_type=100)时认账,
+     *   否则丢弃(防御性:防止地面起飞误触发)
+     */
+    void catapultTriggerCallback(const std_msgs::Bool::ConstPtr& msg) {
+        if (!msg->data) return;
+        if (!is_catapult_takeoff_) {
+            ROS_WARN_THROTTLE(2.0, "[MissionManager] catapult_trigger received but current task_flow "
+                                   "is NOT catapult takeoff (skill_type=%s) — ignored",
+                              (skill_queue_.empty() ? "none" :
+                               std::to_string(skill_queue_[0].msg.skill_type).c_str()));
+            return;
+        }
+        catapult_trigger_received_ = true;
+        ROS_WARN("[MissionManager] >>>> Catapult TRIGGER received (armed in PX4 catapult mode=%s)",
+                 is_px4_catapult_mode_ ? "YES" : "NO (waiting for comm_node)");
+    }
+
+    /**
+     * PX4 抛飞模式就绪回调(由 comm_node 切完 PX4 模式后发 true)
+     * - true:  comm_node 已把 PX4 切到抛飞模式(MAV_CMD_DO_GO_ARMED/类似指令)
+     * - false: 收到 reset,准备 reset 流程
+     * 配合 is_catapult_takeoff_ 使用:只有当前 task_flow 是弹射起飞时才接收
+     */
+    void px4CatapultModeCallback(const std_msgs::Bool::ConstPtr& msg) {
+        is_px4_catapult_mode_ = msg->data;
+        ROS_WARN("[MissionManager] PX4 catapult_mode_ready = %s",
+                 is_px4_catapult_mode_ ? "TRUE (PX4 in catapult mode)" : "FALSE");
+    }
+
+    /**
+     * Whether UAV is currently in flight (used to reject takeoff task_flow while airborne)
+     * Ground states (return false): GROUND_IDLE / FAILED / HOLDING
+     * In-flight states (return true): TAKING_OFF / HOVERING / WAYPOINT_FOLLOW /
+     *   GUIDANCE_TRACK / GUIDANCE_STRIKE / RETURNING / COMPLETE
+     * Note: COMPLETE counts as in-flight since UAV is usually still airborne / returning.
+     */
+    bool isInFlight() const {
+        switch (current_phase_) {
+            case MissionPhase::PHASE_GROUND_IDLE:
+            case MissionPhase::PHASE_FAILED:
+            case MissionPhase::PHASE_HOLDING:
+                return false;
+            case MissionPhase::PHASE_TAKING_OFF:
+            case MissionPhase::PHASE_HOVERING:
+            case MissionPhase::PHASE_WAYPOINT_FOLLOW:
+            case MissionPhase::PHASE_GUIDANCE_TRACK:
+            case MissionPhase::PHASE_GUIDANCE_STRIKE:
+            case MissionPhase::PHASE_RETURNING:
+            case MissionPhase::PHASE_COMPLETE:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     // ============== Phase 2: 类型化回调 ==============
 
     /**
@@ -861,6 +988,22 @@ public:
     void taskFlowCallback(const multi_uav_strike::TaskFlow::ConstPtr& msg) {
         // device_id 过滤(0=广播,其它=本机 device_id)
         if (msg->device_id != 0 && msg->device_id != self_device_id_) {
+            return;
+        }
+
+        // === 飞行安全门:若 UAV 已在飞行中,且新 task_flow 首发是 takeoff skill,
+        //     拒绝接收并报警 — 避免 GS 误操作覆盖当前飞行任务 ===
+        // 场景:返航中(GROUND 触发)收新 takeoff;航点跟踪中收 takeoff;
+        //       guidance 中收 takeoff;都应当拒绝。
+        // 例外:phase=GROUND_IDLE/HOLDING 时(地面或悬停待命)允许接收。
+        if (!msg->skills.empty() &&
+            (msg->skills[0].skill_type == 100 || msg->skills[0].skill_type == 106) &&
+            isInFlight()) {
+            ROS_ERROR("[MissionManager] >>>> REJECT takeoff task_flow: UAV already in flight "
+                      "(phase=%s, takeoff skill_type=%u). GS sent takeoff while airborne — "
+                      "ignored for safety. Send IDLE first to abort current mission.",
+                      missionPhaseToString().c_str(),
+                      static_cast<unsigned>(msg->skills[0].skill_type));
             return;
         }
 
@@ -921,9 +1064,26 @@ public:
             current_waypoint_count_ = 1;  // 占位,让 performTakeoffHandoff 不报 0
         }
 
-        // 第一个 skill 是 Takeoff(type=100)时:推进 phase=PHASE_TAKING_OFF
+        // 第一个 skill 是 Takeoff(type=100 或 106)时:推进 phase=PHASE_TAKING_OFF
         // 注意:不再操作 work_mode(只表达"在任务区内做什么",起飞是 phase 不是 work_mode)
+        // 协议 TODO(skill_type_mapping): 100=弹射起飞,106=地面起飞
         if (!skill_queue_.empty() && (skill_queue_[0].msg.skill_type == 100 || skill_queue_[0].msg.skill_type == 106)) {
+            // === 弹射起飞判定 (skill_type=100) ===
+            // 设置 is_catapult_takeoff_,并在每个新 task_flow 开始时清掉旧的 trigger 状态
+            // 这样:新一发 task_flow 是弹射则重新等 trigger;不是则彻底忽略外部 trigger。
+            bool new_is_catapult = (skill_queue_[0].msg.skill_type == 100);
+            if (new_is_catapult != is_catapult_takeoff_) {
+                ROS_WARN("[MissionManager] Takeoff type changed: %s -> %s "
+                         "(resetting catapult trigger state)",
+                         is_catapult_takeoff_ ? "CATAPULT(100)" : "GROUND(106)",
+                         new_is_catapult ? "CATAPULT(100)" : "GROUND(106)");
+            }
+            is_catapult_takeoff_       = new_is_catapult;
+            catapult_trigger_received_ = false;   // 每个新 task_flow 重新等 trigger
+            // is_px4_catapult_mode_ 保持:comm_node 切的模式有持续性,不应每次 flow 重置
+            //   (万一 comm_node 没发 false 关闭信号,这里避免误清)
+            catapult_posctl_enter_time_ = ros::Time();  // isZero() 表示还没进入 POSCTL
+
             if (current_phase_ != MissionPhase::PHASE_TAKING_OFF) {
                 // 缓存起飞前的 phase 和 work_mode,performTakeoffHandoff 用
                 phase_before_takeoff_ = current_phase_;
@@ -1102,17 +1262,62 @@ public:
                 break;
             }
             case 1: {
-                // 忽略 — 不上报目标
-                ROS_WARN("[MissionManager] AttackCmd action=1 (忽略) — resume search");
+                // 忽略 — 不上报目标,但加黑名单(20s/20m/同 label 内不再自动锁)
+                //   否则下一帧 YOLO 再命中同目标,checkYoloDrivenStrike 门控 4
+                //   (lock_state==NOT_LOCKED) 满足 → 重新锁 → ignore 指令形同虚设
+                //
+                // 同时必须停掉已 active 的 guidance:
+                //   - startGuidanceApproach() 设了 is_guidance_active_=true
+                //   - guidance_control_node 持续向目标位置飞,UAV 不会停
+                //   - 后续 YOLO 命中 → 门控 3 (is_guidance_active_) 早返回,门控 7 (黑名单) 永远跑不到
+                //   - 必须 disableGuidance() + 发 "resume" 给 waypoint_executor 才能真正"忽略"
+                ROS_WARN("[MissionManager] AttackCmd action=1 (忽略) — adding to blacklist, resume search");
+                if (tracked_target_.latest) {
+                    addIgnoredTarget(*tracked_target_.latest, tracked_target_.yolo_label);
+                }
+                if (is_guidance_active_) {
+                    disableGuidance();
+                    ROS_WARN("[MissionManager]   - guidance DISABLED (was active before ignore)");
+                }
+                // 清掉 TargetState,避免 handleSearchTrack/Strike 误以为"仍锁定"再次触发 guidance
+                current_target_.is_locked   = false;
+                current_target_.is_detected = false;
+                current_target_.is_shared   = false;
+                // 重启 waypoint_executor(它现在还是 stop 状态,要 resume 才能继续扫描)
+                {
+                    std_msgs::String wp_cmd;
+                    wp_cmd.data = "resume";
+                    waypoint_control_pub_.publish(wp_cmd);
+                }
+                // phase 回 WAYPOINT_FOLLOW(原本被 startGuidanceApproach 改成 GUIDANCE_TRACK,
+                //   MissionState 上报里 GS 看到的应是航点跟踪阶段,而非 guidance)
+                current_phase_ = MissionPhase::PHASE_WAYPOINT_FOLLOW;
                 tracked_target_.is_valid = false;
                 tracked_target_.lock_state = TrackLockState::NOT_LOCKED;
                 return;
             }
             case 2: {
-                // 暂存
+                // 暂存 — 上报 DetectTarget(type=2) 同时加黑名单(本次跳过,接下来不应再自动锁)
+                //   收尾动作与 action=1 完全一致(action=2 仅多 publish 一个 DetectTarget)
                 dt.target_type = 2;
-                ROS_WARN("[MissionManager] AttackCmd action=2 (暂存)");
+                ROS_WARN("[MissionManager] AttackCmd action=2 (暂存) — adding to blacklist");
                 detect_target_pub_.publish(dt);
+                if (tracked_target_.latest) {
+                    addIgnoredTarget(*tracked_target_.latest, tracked_target_.yolo_label);
+                }
+                if (is_guidance_active_) {
+                    disableGuidance();
+                    ROS_WARN("[MissionManager]   - guidance DISABLED (was active before stash)");
+                }
+                current_target_.is_locked   = false;
+                current_target_.is_detected = false;
+                current_target_.is_shared   = false;
+                {
+                    std_msgs::String wp_cmd;
+                    wp_cmd.data = "resume";
+                    waypoint_control_pub_.publish(wp_cmd);
+                }
+                current_phase_ = MissionPhase::PHASE_WAYPOINT_FOLLOW;
                 tracked_target_.is_valid = false;
                 tracked_target_.lock_state = TrackLockState::NOT_LOCKED;
                 return;
@@ -1176,6 +1381,15 @@ public:
         multi_uav_strike::DetectTarget dt = buildDetectTarget(*msg, /*target_type=*/3);
         detect_target_pub_.publish(dt);
 
+        // TODO(target_dedup): 当前每帧 YOLO 命中都会 publish DetectTarget,
+        //   GS 端会收到大量重复目标上报。后续应实现 reported_targets_ 黑名单
+        //   (与 ignored_targets_ 同构:ned_x/y + label + 上报时间),配合"目标
+        //   估计稳定"判定(如 N 次连续命中后才上报一次),形成完整 dedup。
+        //   与 ignored_targets_ 的区别:
+        //     - ignored: GS 主动 ignore,本机不再自动锁
+        //     - reported:本机识别上报 GS,GS 端不重复
+        //   两个列表可并行维护,语义独立。当前阶段先实现 ignored,dedup 留作下个 PR。
+
         // 2) SEARCH_TRACK: 顺便发 TrackingState 通知 GS "正在跟踪"(信息性,
         //    不含锁定语义。锁定决策由 checkYoloDrivenStrike 在 IN_TASK 时做)
         if (current_work_mode_ == WorkMode::SEARCH_TRACK) {
@@ -1227,6 +1441,7 @@ public:
      *   4. tracked_target_.lock_state == NOT_LOCKED  ← 没锁过目标
      *   5. latest_yolo_ 有效:has_latest_yolo_ + is_in_fov + age < 1.0s
      *   6. work_mode 必须是 SEARCH_STRIKE 或 SEARCH_TRACK(其他模式无意义)
+     *   7. 新目标不在 ignored_targets_ 黑名单内(同 label + 距离 ≤ 20m + 未过期)
      *
      * 行为:
      *   - SEARCH_STRIKE: 构造 DetectTarget(SEARCH_ONLY 模式可以也构造),
@@ -1254,6 +1469,15 @@ public:
         if (!latest_yolo_->is_in_fov) return;
         double yolo_age = (ros::Time::now() - latest_yolo_time_).toSec();
         if (yolo_age > 1.0) return;  // 超过 1s 视为过期,等下一次 YOLO 命中
+        // 门控 7:目标在 ignored_targets_ 黑名单内(GS 用 attack_cmd action=1/2 加的) → 跳过
+        //   label-only 匹配:20s 内同 label 一律忽略
+        //   空间维度留给未来云台+UAV pose 反推真实目标位置(C 方案)落地后再补
+        if (isTargetIgnored(latest_yolo_->label)) {
+            ROS_WARN_THROTTLE(2.0, "[MissionManager] >>>> YOLO+IN_TASK: target IGNORED "
+                                   "(label=%s, in blacklist)",
+                              latest_yolo_->label.c_str());
+            return;
+        }
 
 
         // === 触发 ===
@@ -1263,12 +1487,13 @@ public:
             auto dt_ptr = boost::make_shared<multi_uav_strike::DetectTarget>(dt);
             tracked_target_.is_valid   = true;
             tracked_target_.latest     = dt_ptr;
+            tracked_target_.yolo_label = latest_yolo_->label;  // 保留原始 label,用于 attack_cmd 加黑名单
             tracked_target_.lock_state = TrackLockState::LOCKED_AUTO;
             tracked_target_.locked_at  = ros::Time::now();
 
             ROS_WARN("[MissionManager] >>>> YOLO+Attack+IN_TASK [STRIKE]: trigger strike "
-                     "(yolo_age=%.2fs conf=%.2f)",
-                     yolo_age, latest_yolo_->confidence);
+                     "(yolo_age=%.2fs conf=%.2f label=%s)",
+                     yolo_age, latest_yolo_->confidence, latest_yolo_->label.c_str());
             guidance_speed_ = sr.msg.task_speed;
             triggerStrike();
         } else {
@@ -1277,14 +1502,73 @@ public:
             auto dt_ptr = boost::make_shared<multi_uav_strike::DetectTarget>(dt);
             tracked_target_.is_valid   = true;
             tracked_target_.latest     = dt_ptr;
+            tracked_target_.yolo_label = latest_yolo_->label;  // 保留原始 label
             tracked_target_.lock_state = TrackLockState::LOCKED_WAIT_CONFIRM;
             tracked_target_.locked_at  = ros::Time::now();
             guidance_speed_ = sr.msg.task_speed;
             startGuidanceApproach();
             ROS_WARN("[MissionManager] >>>> YOLO+Attack+IN_TASK [TRACK]: target locked, "
-                     "waiting for attack_cmd (yolo_age=%.2fs conf=%.2f)",
-                     yolo_age, latest_yolo_->confidence);
+                     "waiting for attack_cmd (yolo_age=%.2fs conf=%.2f label=%s)",
+                     yolo_age, latest_yolo_->confidence, latest_yolo_->label.c_str());
         }
+    }
+
+    /**
+     * 判断给定 label 是否在 ignored_targets_ 黑名单内
+     * 匹配规则(label-only, 2026-07 简化):
+     *   1. label 必须完全相等(string equality)
+     *   2. ignore_until > now
+     * 注:不再做位置匹配。DetectTarget.obj_lat/lon 实际是 UAV pose 占位,
+     *   扫描时 UAV 一边移动,位置匹配不稳;真实目标位置等云台+pose 反推(C 方案)
+     *   落地后再补空间维度。
+     * 副作用:每次调用顺手清理过期条目(throttle 1Hz,避免每帧都遍历)
+     */
+    bool isTargetIgnored(const std::string& label) {
+        ros::Time now = ros::Time::now();
+        // 节流清理过期项:1Hz 一次足够(ignore_until 精度秒级)
+        if ((now - last_ignored_cleanup_).toSec() > 1.0) {
+            auto it = ignored_targets_.begin();
+            while (it != ignored_targets_.end()) {
+                if (now >= it->ignore_until) {
+                    ROS_INFO("[MissionManager] Ignored blacklist expired: label=%s "
+                             "(alive %.1fs)",
+                             it->label.c_str(),
+                             (now - it->ignore_set_time).toSec());
+                    it = ignored_targets_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            last_ignored_cleanup_ = now;
+        }
+        for (const auto& it : ignored_targets_) {
+            if (it.label != label) continue;
+            if (now >= it.ignore_until) continue;
+            return true;  // label 相等 + 未过期 → 忽略
+        }
+        return false;
+    }
+
+    /**
+     * 推一条目标到 ignored_targets_ 黑名单
+     * 由 attackCmdCallback 在 action=1/2 时调用
+     * @param dt 锁定的 DetectTarget (位置字段保留备用,目前不参与匹配)
+     * @param yolo_label 锁定瞬间 YOLO 原始 string label
+     */
+    void addIgnoredTarget(const multi_uav_strike::DetectTarget& dt,
+                          const std::string& yolo_label) {
+        IgnoredTarget entry;
+        entry.ned_x           = dt.obj_lat;   // 保留备用(C 方案启用时直接复用)
+        entry.ned_y           = dt.obj_lon;
+        entry.ned_alt         = dt.obj_alt;
+        entry.label           = yolo_label;
+        entry.ignore_set_time = ros::Time::now();
+        entry.ignore_until    = entry.ignore_set_time + ros::Duration(ignored_retention_sec_);
+        ignored_targets_.push_back(entry);
+        ROS_WARN("[MissionManager] Added to IGNORED blacklist (label=%s "
+                 "ttl=%.1fs, current_size=%zu)",
+                 entry.label.c_str(),
+                 ignored_retention_sec_, ignored_targets_.size());
     }
 
     /**
@@ -1363,10 +1647,123 @@ public:
             case TakeoffState::TAKEOFF_IDLE:
                 // 已在 TAKEOFF 模式：等待 FCU 连接后开始
                 if (!use_sim_ && is_px4_connected_) {
-                    takeoff_state_ = TakeoffState::TAKEOFF_WAITING_FCU;
-                    ROS_WARN("[MissionManager] PX4 Connected, waiting for initialization...");
+                    // 弹射起飞(skill_type=100)与地面起飞(skill_type=106)分流:
+                    //   弹射:不能直接切 OFFBOARD,先让 PX4 进抛飞模式等外部 trigger
+                    //   地面:走原流程,FCU 连上就 SET_MODE → COMMAND_LONG → ARM
+                    if (is_catapult_takeoff_) {
+                        takeoff_state_ = TakeoffState::TAKEOFF_CATAPULT_ARMED;
+                        ROS_WARN("[MissionManager] PX4 Connected, CATAPULT takeoff flow — "
+                                 "waiting for catapult_mode_ready=%s + catapult_trigger",
+                                 is_px4_catapult_mode_ ? "true" : "false (need comm_node)");
+                    } else {
+                        takeoff_state_ = TakeoffState::TAKEOFF_WAITING_FCU;
+                        ROS_WARN("[MissionManager] PX4 Connected, waiting for initialization...");
+                    }
                 }
                 break;
+
+            case TakeoffState::TAKEOFF_CATAPULT_ARMED:
+                // 弹射起飞第一步:等 PX4 抛飞模式就绪 (comm_node 通过 px4/catapult_mode_ready 通知)
+                //                  + 外部 trigger (mission/catapult_trigger)
+                // 必须两者都到,因为:
+                //   - 只到 PX4 模式没 trigger:不会发射, UAV 静等 → 浪费
+                //   - 只到 trigger 没 PX4 模式:外部发弹射但 PX4 没准备好,危险
+                if (!is_px4_catapult_mode_) {
+                    ROS_WARN_THROTTLE(2.0, "[MissionManager] CATAPULT_ARMED: waiting for PX4 catapult "
+                                          "mode (comm_node sets it via px4/catapult_mode_ready)");
+                    break;
+                }
+                if (!catapult_trigger_received_) {
+                    ROS_WARN_THROTTLE(2.0, "[MissionManager] CATAPULT_ARMED: PX4 catapult mode ready, "
+                                          "waiting for catapult_trigger from external node");
+                    break;
+                }
+                // 两个都齐了 — 记录起始时间,准备监视 POSCTL 进入
+                catapult_posctl_enter_time_ = ros::Time();
+                takeoff_state_ = TakeoffState::TAKEOFF_CATAPULT_TRIGGERED;
+                ROS_WARN("[MissionManager] >>>> CATAPULT armed+triggered, watching PX4 enter POSCTL "
+                         "(commander will switch to POSCTL after launch detects sustained climb)...");
+                break;
+
+            case TakeoffState::TAKEOFF_CATAPULT_TRIGGERED: {
+                // 弹射起飞第二步:等 PX4 自动切到 POSCTL(发射后 PX4 自主控制并进入位置模式)
+                // 通过 mavros/state 反馈,current_mavros_state_.mode == "POSCTL" 视为进入
+                // 兜底超时:60s 内没进 POSCTL 视为发射异常,转 FAILED
+                if (current_mavros_state_.mode == "POSCTL") {
+                    catapult_posctl_enter_time_ = ros::Time::now();
+                    takeoff_state_ = TakeoffState::TAKEOFF_CATAPULT_POSCTL;
+                    ROS_WARN("[MissionManager] >>>> CATAPULT: PX4 entered POSCTL (mode=%s, armed=%d)",
+                             current_mavros_state_.mode.c_str(),
+                             current_mavros_state_.armed ? 1 : 0);
+                } else {
+                    double since_trigger = catapult_posctl_enter_time_.isZero()
+                        ? (ros::Time::now() - (ros::Time::now() - ros::Duration(catapult_posctl_stable_sec_))).toSec()
+                        : 0.0;
+                    // 注意:catapult_posctl_enter_time_ 此时 isZero (TRIGGERED 进入前清零),
+                    // 用 takeoff_start_time_ (Phase=TAKING_OFF 时刻) 估算经过时间更稳
+                    static ros::Time catapult_trigger_armed_time;  // 静态变量,记录 armed→triggered 的过渡
+                    if (catapult_posctl_enter_time_.isZero() && catapult_trigger_armed_time.isZero()) {
+                        catapult_trigger_armed_time = ros::Time::now();
+                    }
+                    double elapsed_in_triggered = (ros::Time::now() - catapult_trigger_armed_time).toSec();
+                    if (elapsed_in_triggered > 60.0) {
+                        ROS_ERROR("[MissionManager] CATAPULT: PX4 did not enter POSCTL within 60s, "
+                                  "FAILED (current mode=%s)",
+                                  current_mavros_state_.mode.c_str());
+                        catapult_trigger_armed_time = ros::Time();  // 重置
+                        takeoff_state_ = TakeoffState::TAKEOFF_FAILED;
+                        current_phase_ = MissionPhase::PHASE_FAILED;
+                    } else {
+                        ROS_WARN_THROTTLE(2.0, "[MissionManager] CATAPULT: waiting for PX4 POSCTL "
+                                              "(current mode=%s, %.1fs/60s)",
+                                          current_mavros_state_.mode.c_str(), elapsed_in_triggered);
+                    }
+                    (void)since_trigger;  // 抑制未使用变量警告
+                }
+                break;
+            }
+
+            case TakeoffState::TAKEOFF_CATAPULT_POSCTL: {
+                // 弹射起飞第三步:PX4 POSCTL 稳定 catapult_posctl_stable_sec_(1s) 后
+                //                启动 setpoint publisher + 切 OFFBOARD 接管
+                // 此处复用 TAKEOFF_WAITING_FCU 的 LOCAL_POSITION_NED rate 设置逻辑
+                if (is_local_position_rate_set_ == false) {
+                    if (set_message_rate_start_time_.isZero()) {
+                        set_message_rate_start_time_ = ros::Time::now();
+                    }
+                    if (setMessageRate(32, local_position_rate_hz_)) {
+                        is_local_position_rate_set_ = true;
+                        set_message_rate_start_time_ = ros::Time();
+                        set_message_rate_retry_count_ = 0;
+                    } else {
+                        set_message_rate_retry_count_++;
+                        double elapsed = (ros::Time::now() - set_message_rate_start_time_).toSec();
+                        bool retries_done = (set_message_rate_retry_count_ >= max_set_message_rate_retries_);
+                        bool timeout = (elapsed > set_message_rate_max_wait_sec_);
+                        if (retries_done || timeout) {
+                            ROS_ERROR("[MissionManager] CATAPULT: LOCAL_POSITION_NED rate set GIVE UP — "
+                                      "proceeding anyway");
+                            is_local_position_rate_set_ = true;
+                            set_message_rate_start_time_ = ros::Time();
+                            set_message_rate_retry_count_ = 0;
+                        } else {
+                            break;  // 下个 tick 再试
+                        }
+                    }
+                }
+                // POSCTL 稳定等待(系统不抖后再接管)
+                double posctl_elapsed = (ros::Time::now() - catapult_posctl_enter_time_).toSec();
+                if (posctl_elapsed < catapult_posctl_stable_sec_) {
+                    ROS_WARN_THROTTLE(0.3, "[MissionManager] CATAPULT: POSCTL stable wait %.2fs/%.2fs",
+                                      posctl_elapsed, catapult_posctl_stable_sec_);
+                    break;
+                }
+                // 稳定时间到 — 进 SETTING_OFFBOARD 接管
+                ROS_WARN("[MissionManager] >>>> CATAPULT: POSCTL stable, switching to OFFBOARD takeover");
+                takeoff_state_ = TakeoffState::TAKEOFF_SETTING_OFFBOARD;
+                startSetpointPublisher();
+                break;
+            }
 
             case TakeoffState::TAKEOFF_WAITING_FCU:
                 if (!is_px4_connected_) {
@@ -2270,9 +2667,14 @@ public:
             }
 
             case SkillState::ENTRY_PENDING: {
-                // 门控:executor 报告 phase=SKILL_AREA 且距 path[0] ≤ arrival_threshold
+                // 门控:executor 报告 phase=SKILL_AREA(或 phase=COMPLETE — 同点 catch 不到 SKILL_AREA 的补救)
+                //   - 正常情况:ARRIVE → SKILL_AREA → COMPLETE,mission_manager 看到 SKILL_AREA 时开门
+                //   - 同点场景:ARRIVE/SKILL_AREA 同一坐标,executor 20ms 内 SKILL_AREA 跳过,
+                //     mission_manager 的 10Hz tick 可能错过 SKILL_AREA → 改判 phase=COMPLETE 也开门
+                //   - skill_area_path 空:line 2247 早就 TRANSIT → IN_TASK 跳过 ENTRY_PENDING,走不到这里
                 bool in_skill_area = (latest_wp_status_ &&
-                                      latest_wp_status_->phase == multi_uav_strike::WaypointStatus::PHASE_SKILL_AREA &&
+                                      (latest_wp_status_->phase == multi_uav_strike::WaypointStatus::PHASE_SKILL_AREA ||
+                                       latest_wp_status_->phase == multi_uav_strike::WaypointStatus::PHASE_COMPLETE) &&
                                       latest_wp_status_->skill_id == sr.msg.skill_id);
                 if (in_skill_area) {
                     sr.state = SkillState::IN_TASK;

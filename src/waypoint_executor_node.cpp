@@ -145,6 +145,11 @@ private:
     int flight_mode_velocity_;
     int flight_mode_position_;
 
+    // ===== 加/减速度限幅(平滑起步、缓和刹车)=====
+    double accel_limit_;   // m/s²,起步加速度上限 — 防止 v_mag 从 0 阶跃到 cur_speed
+    double decel_limit_;   // m/s²,刹车减速度上限 — 物理刹停 v²≤2ad 用这个值
+    double last_v_mag_;    // 上周期 v_mag (accel_limit 用,跨航点平滑过渡)
+
     // 基准点参数(由 PX4 /mavros/home_position/home 自动填充,不再硬编码)
     double ref_lat_;
     double ref_lon_;
@@ -200,6 +205,9 @@ public:
         last_waypoint_reached_logged_(false),
         hold_kp_(0.8),
         yaw_max_rate_(1.0),
+        accel_limit_(2.0),
+        decel_limit_(2.0),
+        last_v_mag_(0.0),
         current_work_mode_("SEARCH_ONLY"),
         segment_phase_(SegmentPhase::IDLE),
         arrive_idx_(0),
@@ -236,6 +244,9 @@ public:
         nh_private_.param<double>("hold_kp", hold_kp_, 0.8);
         // 航向角速度限幅(rad/s)——避免 P-controller 输出过大旋转指令
         nh_private_.param<double>("yaw_max_rate", yaw_max_rate_, 1.0);
+        // 加/减速度限幅(m/s²)——起步不阶跃、刹车不急刹
+        nh_private_.param<double>("accel_limit", accel_limit_, 2.0);
+        nh_private_.param<double>("decel_limit", decel_limit_, 2.0);
 
         // 自动从命名空间获取 uav_id（如 ns="uav0" → id=0）
         std::string ns = ros::this_node::getNamespace();
@@ -663,13 +674,21 @@ public:
 
                 // ===== 物理刹停(v² ≤ 2·a·d) =====
                 // 沿段剩余距离;过段端(< 0)改用 dist_h → 自动衔接 P-control
-                const double a_decel = 2.0;
                 double dist_along_to_target = seg_len - along;
                 double brake_dist = (dist_along_to_target > 0.0)
                                         ? dist_along_to_target
                                         : dist_h;
                 double v_mag = std::min(cur_speed,
-                                        sqrt(2.0 * a_decel * brake_dist));
+                                        sqrt(2.0 * decel_limit_ * brake_dist));
+
+                // ===== 加速度限幅:起步不阶跃,跨航点平滑过渡 =====
+                // L1 算出的 v_mag 在静止起步时 = cur_speed(阶跃);
+                // 用 last_v_mag_ + a*dt 上限钳制 → 起飞/换航点平滑
+                double dt = 1.0 / executor_rate_;
+                double v_max_accel = last_v_mag_ + accel_limit_ * dt;
+                if (v_mag > v_max_accel) v_mag = v_max_accel;
+                if (v_mag < 0.0) v_mag = 0.0;
+                last_v_mag_ = v_mag;
 
                 // ===== 朝 lookahead 飞 =====
                 double dx_la = la_x - current_ned_x_;
