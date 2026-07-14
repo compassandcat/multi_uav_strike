@@ -21,7 +21,7 @@
  * 订阅：
  * - /mission/mode                    - 工作模式（来自 comm_node）
  * - /mission/waypoint_cmd           - 航点命令（来自 comm_node）
- * - /detection/yolo_result          - YOLO检测结果
+ * - /target_estimator/cluster_states - 10Hz 所有 alive cluster 快照(由 target_estimator_node 发布)
  * - /target_los_angle               - 目标LOS角度（来自 gimbal_simulator）
  * - /target_estimated_pose           - 目标估计位置（来自 target_estimator）
  * - /target_estimated_twist         - 目标估计速度
@@ -61,10 +61,12 @@
 
 #include <string>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <thread>
 #include <chrono>
 #include <sstream>
+#include <unordered_map>
 #include <boost/make_shared.hpp>
 
 // === Phase 1+ 类型化消息 ===
@@ -75,7 +77,8 @@
 #include "multi_uav_strike/MissionState.h"
 #include "multi_uav_strike/DetectTarget.h"
 #include "multi_uav_strike/DetectTargets.h"
-#include "multi_uav_strike/YoloDetection.h"
+#include "multi_uav_strike/ClusterState.h"      // 所有 alive cluster 的 10Hz 快照(由 target_estimator_node 发布)
+                                                // 替代原 cluster_event(后者只 publish 一次,会被 IN_TASK 时序窗口漏掉)
 #include "multi_uav_strike/TrackingState.h"
 #include "multi_uav_strike/WaypointStatus.h"
 #include "multi_uav_strike/UavGatherStatus.h"
@@ -221,7 +224,7 @@ private:
     ros::NodeHandle nh_private_;
 
     // ============== 订阅 ==============
-    ros::Subscriber yolo_typed_sub_;  // typed YoloDetection(detection_simulator_node 发布,Phase 5 启用)
+    ros::Subscriber cluster_states_sub_;  // target_estimator_node 10Hz 发布的所有 alive cluster 快照
     ros::Subscriber gimbal_los_sub_;
     ros::Subscriber target_est_pose_sub_;
     ros::Subscriber target_est_twist_sub_;
@@ -236,7 +239,7 @@ private:
     ros::Subscriber task_flow_sub_;        // 任务流入口(multi_uav_strike/TaskFlow)
     ros::Subscriber work_mode_sub_;        // 工作模式 typed(multi_uav_strike/WorkMode)
     ros::Subscriber attack_cmd_sub_;       // MAV_CMD_ATTACK typed(multi_uav_strike/AttackCmd)
-    // yolo_typed_sub_ 在上方已声明
+    // cluster_states_sub_ 在上方已声明
     ros::Subscriber waypoint_status_sub_;  // 航段状态(Phase 4 启用)
 
     // ============== Service Client ==============
@@ -301,6 +304,11 @@ private:
     sensor_msgs::NavSatFix current_gps_;
     bool is_gps_received_ = false;
 
+    // DetectTarget.label 协议类别 ID:GCS 按此渲染(1=人,2=车,协议 §11.2.1)。
+    // 检测端产生的是字符串 label(如 "general_target"/"person"/"car"),经 labelToClassId 映射;
+    // 映射不到时退化为 unknown_label_id_(可配,默认 1)。
+    int unknown_label_id_ = 1;
+
     // 邻居无人机
     struct NeighborUav {
         std::string name;
@@ -355,6 +363,8 @@ private:
     double takeoff_check_interval_;
     double takeoff_stable_time_;   // 高度达标后稳定等待（秒）
     double takeoff_hover_time_;    // 悬停等待（秒）
+    double takeoff_climb_rate_;    // 起飞爬升斜坡速率 (m/s,默认 3.0,避免阶跃 setpoint 引起速度饱和)
+    double takeoff_start_alt_;     // TAKEOFF_EXEC 起始时刻的高度(米,ENU 上为正),用作斜坡起点
     // ===== 弹射起飞流程状态(skill_type=100) =====
     // TODO(skill_type_mapping): 协议升级后 skill_type=100 仅表示弹射,
     //   skill_type=106 表示地面起飞;此处所有判定同步更新
@@ -430,12 +440,22 @@ private:
     uint8_t typed_work_mode_;
     ros::Time typed_work_mode_set_time_;
     bool has_typed_work_mode_;
-    // 来自 typed YoloDetection 的最新一帧
-    multi_uav_strike::YoloDetection::ConstPtr latest_yolo_;
-    bool has_latest_yolo_;
-    ros::Time latest_yolo_time_;
     // 跟踪目标(typed)
     TrackedTarget tracked_target_;
+
+    // === Cluster 事件订阅状态(从 cluster_states 10Hz 快照中提炼) ===
+    // dedup: 同一 cluster_id 在同 task_flow 内只触发一次"上报/锁定"
+    // (cluster_states 是周期发布,若不用 dedup 就会 10Hz 重复上报同一目标)
+    std::unordered_map<uint64_t, int> reported_clusters_;
+    ros::Time last_reported_cleanup_;   // 1Hz 节流清理开关(暂无过期清理,保留作 hook)
+
+    // 当前已锁定的 cluster 快照位置(NWU 米,降级用于 triggerStrike 桥接到 current_target_)
+    // 不存整个 ClusterTarget 是为了避免 ConstPtr 生命周期问题 + 解耦 target_estimator 内部
+    double      locked_cluster_ned_x_  = 0.0;
+    double      locked_cluster_ned_y_  = 0.0;
+    double      locked_cluster_ned_alt_ = 0.0;
+    uint64_t    locked_cluster_id_     = 0;     // 0 = 未锁定
+    ros::Time   locked_cluster_time_;
 
     // === 已忽略目标黑名单 ===
     std::vector<IgnoredTarget> ignored_targets_;
@@ -477,6 +497,8 @@ public:
         takeoff_check_interval_(0.5),
         takeoff_stable_time_(1.0),     // 高度达标后稳定 1 秒（原 2 秒）
         takeoff_hover_time_(0.5),      // 悬停 0.5 秒（原 2 秒）
+        takeoff_climb_rate_(3.0),      // 起飞爬升斜坡速率 (m/s),详见 TAKEOFF_TAKEOFF_EXEC 注释
+        takeoff_start_alt_(0.0),       // TAKEOFF_EXEC 入口处填实际高度,这里 0 仅占位
         takeoff_retry_count_(0),
         max_takeoff_retries_(3),
         takeoff_retry_delay_(5.0),
@@ -499,7 +521,8 @@ public:
         set_message_rate_max_wait_sec_(5.0),
         ignored_retention_sec_(20.0),       // 黑名单默认保留 20s
         ignored_match_radius_m_(20.0),      // 空间匹配默认 20m
-        last_ignored_cleanup_(ros::Time()) {
+        last_ignored_cleanup_(ros::Time()),
+        last_reported_cleanup_(ros::Time()) {
 
         initParams();
         initSubscribers();
@@ -528,6 +551,7 @@ public:
         nh_private_.param<double>("takeoff_retry_delay", takeoff_retry_delay_, 5.0);
         nh_private_.param<double>("takeoff_stable_time", takeoff_stable_time_, 1.0);  // 高度达标后稳定时间
         nh_private_.param<double>("takeoff_hover_time", takeoff_hover_time_, 0.5);    // 悬停等待时间
+        nh_private_.param<double>("takeoff_climb_rate", takeoff_climb_rate_, 3.0);    // 起飞 setpoint 斜坡速率 (m/s),取代原阶跃跳变
         nh_private_.param<double>("local_position_rate_hz", local_position_rate_hz_, 20.0);  // LOCAL_POSITION_NED 发送频率
         nh_private_.param<int>("max_set_message_rate_retries", max_set_message_rate_retries_, 3);
         nh_private_.param<double>("set_message_rate_max_wait_sec", set_message_rate_max_wait_sec_, 5.0);
@@ -568,6 +592,7 @@ public:
         // === 已忽略目标黑名单参数 (Phase 5.5: 目标聚类轻量替代) ===
         nh_private_.param<double>("ignored_retention_sec",  ignored_retention_sec_,  20.0);  // 默认 20s
         nh_private_.param<double>("ignored_match_radius_m", ignored_match_radius_m_, 20.0);  // 默认 20m
+        nh_private_.param<int>("unknown_label_id", unknown_label_id_, 1);  // label 映射不到时的兜底类别 ID
 
         // 期望集结 UAV SN 列表(逗号分隔字符串,如 "uav0,uav2")
         std::string sns_str;
@@ -671,9 +696,14 @@ public:
         attack_cmd_sub_ = nh_.subscribe("mission/attack_cmd", 10,
                                         &MissionManager::attackCmdCallback, this);
 
-        // typed YoloDetection(detection_simulator_node 发布到同名 topic,但 msg 类型不同)
-        yolo_typed_sub_ = nh_.subscribe("detection/yolo_result", 10,
-                                        &MissionManager::typedYoloCallback, this);
+        // cluster_states(target_estimator_node 10Hz 发布的所有 alive cluster 快照)
+        // 用 snapshot 而非一次性 cluster_event 是为了解决时序窗口 bug:
+        //   原 cluster_event 在"新 cluster 首次进入 FOV"时 publish 一次,如果那一刻 UAV 还没进
+        //   IN_TASK (可能在 TRANSIT/ENTRY_PENDING),gating 直接 return,UAV 进入 IN_TASK 后
+        //   target_estimator 不会再发 cluster_event,目标永远锁不上。
+        //   改用 10Hz snapshot 后,任何在 IN_TASK 期间还在 alive 的 cluster 都会被重新扫到并触发。
+        cluster_states_sub_ = nh_.subscribe("cluster_states", 10,
+                                            &MissionManager::clusterStatesCallback, this);
 
         // waypoint_executor 段状态(Phase 4 启用)
         waypoint_status_sub_ = nh_.subscribe("waypoint_executor/status", 10,
@@ -866,6 +896,23 @@ public:
         double d_lon = lon - ref_lon_;
         ned_y = d_lon * M_PI / 180.0 * EARTH_R * cos(ref_lat_ * M_PI / 180.0);  // 东向
         ned_z = -(alt - ref_alt_);  // 下向
+    }
+
+    /**
+     * NED (本地 NED/Earth 偏移,米) -> GPS (WGS84 lat/lon, AMSL alt 米)
+     * gpsToNed 的反函数;cluster 报告 ned_x/y/z,需要转成 DetectTarget.obj_lat/lon/alt 上行
+     * 注:ref_initialized_ 必须为 true(PX4 home 已锁定)才能保证精度
+     */
+    void nedToGps(double ned_x, double ned_y, double ned_z,
+                  double& lat, double& lon, double& alt) const {
+        const double EARTH_R = 6378137.0;
+        const double RAD_PER_DEG = M_PI / 180.0;
+        const double DEG_PER_RAD = 180.0 / M_PI;
+        lat = ref_lat_ + ned_x / EARTH_R * DEG_PER_RAD;
+        double cos_lat = std::cos(ref_lat_ * RAD_PER_DEG);
+        if (cos_lat < 1e-6) cos_lat = 1e-6;  // 防止 cos(90°)=0 除零
+        lon = ref_lon_ + ned_y / (EARTH_R * cos_lat) * DEG_PER_RAD;
+        alt = ref_alt_ - ned_z;  // NED z 下向 → AMSL 上向
     }
 
     void interUavTargetCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
@@ -1083,6 +1130,18 @@ public:
         latest_task_flow_ = msg;
         current_flow_id_  = msg->flow_id;
         has_task_flow_    = true;
+
+        // === 新 TaskFlow 到达:清空 cluster dedup 状态 + 锁定目标,允许新一轮上报/锁定 ===
+        //   - reported_clusters_ 清空:之前 task_flow 上报过的 cluster_id 在新 flow 中可重新上报
+        //     (实际 cluster 已 TTL 或飞离,新 flow 重新看到也大概率是不同目标,但语义上保持独立)
+        //   - locked_cluster_id_ = 0:cluster_states 缓存失效
+        //   - tracked_target_ 的清空见下方 preserve_track 分支(Attack(105)首发时不清)
+        reported_clusters_.clear();
+        locked_cluster_id_     = 0;
+        locked_cluster_ned_x_  = 0.0;
+        locked_cluster_ned_y_  = 0.0;
+        locked_cluster_ned_alt_ = 0.0;
+        locked_cluster_time_   = ros::Time();
 
         // 重置航点接收标志(避免前序 flow 的 is_waypoints_received_ 残留误导 performTakeoffHandoff)
         is_waypoints_received_ = false;
@@ -1411,15 +1470,21 @@ public:
     /**
      * 触发 strike(用现有 strikes_distance_threshold 流程)
      * 把现有 TargetState 桥接到 guidance_control_node
+     *
+     * 改进:current_target_.pose.position 用 cluster.ned_x/y/z(NWU 米)直接填,
+     *   不再用 obj_lat/lon/alt(后者是 WGS84,填进 NED 字段会偏飞)。
+     *   targetEstPoseCallback(target_estimated_pose 来自 target_estimator 10Hz 实时位置)
+     *   在 is_locked=true 后会持续更新 current_target_.pose,几帧后即可收敛到精确位置。
      */
     void triggerStrike() {
-        // 把跟踪目标写入 current_target_,走现有 startGuidanceApproach()
         if (tracked_target_.latest) {
             current_target_.is_detected = true;
             current_target_.is_locked   = true;
-            current_target_.pose.pose.position.x = tracked_target_.latest->obj_lat;
-            current_target_.pose.pose.position.y = tracked_target_.latest->obj_lon;
-            current_target_.pose.pose.position.z = tracked_target_.latest->obj_alt;
+            // 优先用 locked_cluster_* (NWU,米) — clusterStatesCallback 在锁定瞬间存的快照,
+            //   降级到 0 让 target_estimated_pose 在下一拍覆盖
+            current_target_.pose.pose.position.x = locked_cluster_ned_x_;
+            current_target_.pose.pose.position.y = locked_cluster_ned_y_;
+            current_target_.pose.pose.position.z = locked_cluster_ned_alt_;
         }
         // 强制进入 SEARCH_STRIKE 分支以触发现有 strike 流程
         current_work_mode_ = WorkMode::SEARCH_STRIKE;
@@ -1427,83 +1492,229 @@ public:
     }
 
     /**
-     * typed YoloDetection 回调
+     * cluster_states 回调 — target_estimator_node 10Hz 发布所有 alive cluster 的快照
+     * 替代原 clusterEventCallback(后者在新 cluster 首次出现时 publish 一次,
+     * 若该时机早于 IN_TASK,目标永远锁不上;改为周期 snapshot 后,
+     * UAV 进入 IN_TASK 时任何还活着的 cluster 都会被扫到并触发锁定)。
+     *
      * 行为取决于 current_work_mode_:
-     *   IDLE/TAKEOFF: 忽略
-     *   SEARCH_ONLY:   识别即上报 DetectTarget(type=3 普通搜索目标)
-     *   SEARCH_TRACK:  首次 is_in_fov=true → 锁目标 + 发布 TrackingState(state=1, 等地面站确认)
-     *   SEARCH_STRIKE: 识别即上报 DetectTarget(type=1 攻击目标) + 触发 strike
+     *   IDLE:                                                    忽略
+     *   SEARCH_ONLY  + 当前 skill IN_TASK + 同 cluster 未上报过: 上报 DetectTarget(type=3 普通搜索目标)一次
+     *   SEARCH_TRACK + 当前 skill IN_TASK + 同 cluster 未上报过: 锁目标 + 发布 TrackingState(state=1,等地面站 attack_cmd)
+     *   SEARCH_STRIKE + 当前 skill IN_TASK + 同 cluster 未上报过: 上报 DetectTarget(type=1 攻击目标) + 触发 strike
+     *
+     * 关键 gating(同原 clusterEventCallback):
+     *   1. work_mode != IDLE
+     *   2. current_skill_index_ 必须指向一个有效 skill
+     *   3. skill.state 必须 == IN_TASK(UAV 已进入 skill_area_path,正在执行)
+     *   4. skill.skill_type ∈ {102 SEARCH, 105 ATTACK}
+     *   5. cluster.label 不在 ignored_targets_ 黑名单内(label-only 匹配)
+     *   6. cluster.cluster_id 未在 reported_clusters_ 内(dedup)
      */
-    void typedYoloCallback(const multi_uav_strike::YoloDetection::ConstPtr& msg) {
-        // 缓存最新一帧(给 skill 状态机的 checkYoloDrivenStrike() 用)
-        latest_yolo_ = msg;
-        has_latest_yolo_ = true;
-        latest_yolo_time_ = ros::Time::now();
-
-        if (!msg->is_in_fov) return;
+    void clusterStatesCallback(const multi_uav_strike::ClusterState::ConstPtr& msg) {
         if (current_work_mode_ == WorkMode::IDLE) {
             return;
         }
 
-        // === 修复:此函数只做目标回传,不做锁定/trigger 控制决策 ===
-        // 之前:SEARCH_STRIKE 模式下 YOLO 命中即调 triggerStrike() + 改 lock_state,完全不看
-        //        当前 skill 是不是 Attack、是否到了 IN_TASK。结果:arrive_path 阶段或 Search
-        //        skill 里 YOLO 命中也会触发 strike,guidance 抢占,waypoint 跟踪被中断。
-        // 现在:控制决策挪到 advanceSkillStateMachine IN_TASK 分支的 checkYoloDrivenStrike()。
-        //      门控:skill_type==105 + state==IN_TASK + 未锁 + 未制导 + YOLO 有效。
-        //      满足才触发 lock/strike。
-
-        // 1) DetectTarget 上报(GS 关心的遥测,所有模式都发)
-        multi_uav_strike::DetectTarget dt = buildDetectTarget(*msg, /*target_type=*/3);
-        detect_target_pub_.publish(dt);
-        {
-            multi_uav_strike::DetectTargets batch;
-            batch.targets.push_back(dt);
-            detect_targets_pub_.publish(batch);
+        // === Gating 1: 必须有有效 skill ===
+        if (current_skill_index_ >= skill_queue_.size()) {
+            return;
+        }
+        const auto& sr = skill_queue_[current_skill_index_];
+        if (sr.state != SkillState::IN_TASK) {
+            return;
+        }
+        if (sr.msg.skill_type != 102 && sr.msg.skill_type != 105) {
+            return;
         }
 
-        // TODO(target_dedup): 当前每帧 YOLO 命中都会 publish DetectTarget,
-        //   GS 端会收到大量重复目标上报。后续应实现 reported_targets_ 黑名单
-        //   (与 ignored_targets_ 同构:ned_x/y + label + 上报时间),配合"目标
-        //   估计稳定"判定(如 N 次连续命中后才上报一次),形成完整 dedup。
-        //   与 ignored_targets_ 的区别:
-        //     - ignored: GS 主动 ignore,本机不再自动锁
-        //     - reported:本机识别上报 GS,GS 端不重复
-        //   两个列表可并行维护,语义独立。当前阶段先实现 ignored,dedup 留作下个 PR。
+        // === Gating 2: 1Hz 节流 dedup 清理(避免每帧遍历) ===
+        cleanupReportedClusters();
 
-        // 2) SEARCH_TRACK: 顺便发 TrackingState 通知 GS "正在跟踪"(信息性,
-        //    不含锁定语义。锁定决策由 checkYoloDrivenStrike 在 IN_TASK 时做)
-        if (current_work_mode_ == WorkMode::SEARCH_TRACK) {
-            multi_uav_strike::TrackingState ts;
-            ts.state   = 1;  // 1 = 跟踪中
-            ts.flag    = 0;
-            ts.target_dist = 50.0;  // 简化占位
-            ts.target_lat  = dt.obj_lat;
-            ts.target_lon  = dt.obj_lon;
-            ts.target_alt  = dt.obj_alt;
-            tracking_state_pub_.publish(ts);
-        }
+        // === 遍历所有 alive cluster,对每个独立应用 gating + 派发 ===
+        for (const auto& cluster : msg->targets) {
+            // 黑名单(GS attack_cmd action=1/2 推入的 label-only 名单)
+            if (isTargetIgnored(cluster.label)) {
+                ROS_WARN_THROTTLE(2.0, "[MissionManager] Cluster[%lu] label=%s IGNORED (in blacklist)",
+                                  cluster.cluster_id, cluster.label.c_str());
+                continue;
+            }
 
-        // 之后不再做任何状态机/控制动作
+            // === SEARCH_TRACK 模式特例:lock 跟 label 走,不跟 cluster_id ===
+            // 场景:FOV 边缘目标反复进出 / UAV 高速机动 → target_estimator 因 LOS 投影位置
+            //   偏移反复开新 cluster_id;但目标没换。如果按 cluster_id 死锁,tracked_target_
+            //   会指向已"stale"的旧 cluster,UAV 飞向错位置,attack_cmd 拿到的是旧坐标。
+            // 解法:同 label 已锁 → 把 lock 转移到当前 cluster,持续刷新位置。
+            //   这等价于"没有聚类时每帧 YOLO 命中都重新锁"的旧行为,只是入口变成 cluster。
+            if (current_work_mode_ == WorkMode::SEARCH_TRACK &&
+                tracked_target_.is_valid &&
+                tracked_target_.yolo_label == cluster.label) {
+                // 转移到新 cluster(可能 cluster_id 与上帧不同,只要 label 一致就 transfer)
+                multi_uav_strike::DetectTarget dt = buildDetectTarget(cluster, /*target_type=*/3);
+                tracked_target_.latest     = boost::make_shared<multi_uav_strike::DetectTarget>(dt);
+                tracked_target_.lock_state = TrackLockState::LOCKED_WAIT_CONFIRM;  // 仍等 attack_cmd
+                tracked_target_.locked_at  = ros::Time::now();
+                // 更新 locked_cluster_* 用于 triggerStrike
+                locked_cluster_ned_x_   = cluster.ned_x;
+                locked_cluster_ned_y_   = cluster.ned_y;
+                locked_cluster_ned_alt_ = cluster.ned_alt;
+                locked_cluster_id_      = cluster.cluster_id;
+                locked_cluster_time_    = ros::Time::now();
+                // 当前 cluster_id 也加入 reported(避免同一 cluster 反复 transfer 触发 startGuidanceApproach)
+                reported_clusters_[cluster.cluster_id] = -1;
+                continue;  // 本次循环内此 cluster 处理完,不去 dispatch
+            }
+
+            // dedup — 同一 cluster_id 同 task_flow 只处理一次
+            if (reported_clusters_.count(cluster.cluster_id)) {
+                continue;
+            }
+
+            // 缓存为 locked_cluster_*,供 attackCmdCallback / triggerStrike 使用
+            locked_cluster_ned_x_   = cluster.ned_x;
+            locked_cluster_ned_y_   = cluster.ned_y;
+            locked_cluster_ned_alt_ = cluster.ned_alt;
+            locked_cluster_id_      = cluster.cluster_id;
+            locked_cluster_time_    = ros::Time::now();
+
+            // === 按 work_mode 派发 ===
+            switch (current_work_mode_) {
+            case WorkMode::SEARCH_ONLY: {
+                // 普通搜索 — 仅上报 1 次 type=3
+                multi_uav_strike::DetectTarget dt = buildDetectTarget(cluster, /*target_type=*/3);
+                detect_target_pub_.publish(dt);
+                {
+                    multi_uav_strike::DetectTargets batch;
+                    batch.targets.push_back(dt);
+                    detect_targets_pub_.publish(batch);
+                }
+                reported_clusters_[cluster.cluster_id] = 3;
+                ROS_WARN("[MissionManager] Cluster[%lu] label=%s SEARCH_ONLY → published type=3",
+                         cluster.cluster_id, cluster.label.c_str());
+                break;
+            }
+            case WorkMode::SEARCH_TRACK: {
+                // 搜索跟踪 — 锁目标 + 发 tracking_state,**不上报** DetectTarget
+                // 把 cluster 数据构造为 DetectTarget 缓存到 tracked_target_.latest,
+                // 供后续 attackCmdCallback (action=0/1/2) 构造上行 dt 使用
+                multi_uav_strike::DetectTarget dt = buildDetectTarget(cluster, /*target_type=*/3);
+                auto dt_ptr = boost::make_shared<multi_uav_strike::DetectTarget>(dt);
+                tracked_target_.is_valid   = true;
+                tracked_target_.latest     = dt_ptr;
+                tracked_target_.yolo_label = cluster.label;  // 字段名沿用,语义改为 cluster label
+                tracked_target_.lock_state = TrackLockState::LOCKED_WAIT_CONFIRM;
+                tracked_target_.locked_at  = ros::Time::now();
+
+                multi_uav_strike::TrackingState ts;
+                ts.state       = 1;        // 1 = 跟踪中
+                ts.flag        = 0;
+                ts.target_dist = 50.0;     // 占位(协议 §9.4)
+                ts.target_lat  = dt.obj_lat;
+                ts.target_lon  = dt.obj_lon;
+                ts.target_alt  = dt.obj_alt;
+                tracking_state_pub_.publish(ts);
+
+                reported_clusters_[cluster.cluster_id] = -1;  // -1 = 仅锁未上报
+                guidance_speed_ = sr.msg.task_speed;
+                startGuidanceApproach();
+                ROS_WARN("[MissionManager] Cluster[%lu] label=%s SEARCH_TRACK → locked, "
+                         "tracking_state published, waiting for attack_cmd",
+                         cluster.cluster_id, cluster.label.c_str());
+                break;
+            }
+            case WorkMode::SEARCH_STRIKE: {
+                // 搜索即打击 — 上报 1 次 type=1 + 自动 strike
+                multi_uav_strike::DetectTarget dt = buildDetectTarget(cluster, /*target_type=*/1);
+                auto dt_ptr = boost::make_shared<multi_uav_strike::DetectTarget>(dt);
+                tracked_target_.is_valid   = true;
+                tracked_target_.latest     = dt_ptr;
+                tracked_target_.yolo_label = cluster.label;
+                tracked_target_.lock_state = TrackLockState::LOCKED_AUTO;
+                tracked_target_.locked_at  = ros::Time::now();
+
+                detect_target_pub_.publish(dt);
+                {
+                    multi_uav_strike::DetectTargets batch;
+                    batch.targets.push_back(dt);
+                    detect_targets_pub_.publish(batch);
+                }
+                reported_clusters_[cluster.cluster_id] = 1;
+                guidance_speed_ = sr.msg.task_speed;
+                triggerStrike();
+                ROS_WARN("[MissionManager] Cluster[%lu] label=%s SEARCH_STRIKE → "
+                         "strike + published type=1",
+                         cluster.cluster_id, cluster.label.c_str());
+                break;
+            }
+            default:
+                // 其他模式(DENIED_ENV_FLIGHT 等)不处理
+                break;
+            }  // end switch (current_work_mode_)
+        }  // end for each cluster
     }
 
     /**
-     * 从 YoloDetection 构造 DetectTarget(DRY:在 typedYoloCallback / checkYoloDrivenStrike
-     * / attackCmdCallback 中复用)
-     *
-     * Phase 5 后续:用 gimbal_los + GPS 推算 obj_lat/lon/alt(目前简化用 UAV 位置占位)
+     * 1Hz 节流清理 reported_clusters_ 过期项
+     * TTL = ignored_retention_sec_(默认 20s)— 与 ignored_targets_ 对齐
+     * 实际语义:同一 cluster_id 在 20s 内只上报一次;20s 后允许重新上报
+     * (正常情况下 cluster_ttl 在 target_estimator 是 60s,这里 20s 已经足够防止快速重复)
      */
+    void cleanupReportedClusters() {
+        ros::Time now = ros::Time::now();
+        if ((now - last_reported_cleanup_).toSec() < 1.0) return;
+        last_reported_cleanup_ = now;
+        // 注:reported_clusters_ 暂不主动清(键只是 cluster_id,占用很小);
+        //     当新 TaskFlow 到达时 taskFlowCallback 会整体清空。
+        // 此处函数保留为空 hook,以便未来需要 TTL 时启用。
+    }
+
+    /**
+     * 从 ClusterTarget 构造 DetectTarget
+     * 调用方:
+     *   - clusterStatesCallback:按 work_mode 派发时(SEARCH_ONLY 上报 / SEARCH_TRACK 缓存 / SEARCH_STRIKE 上报+strike)
+     *   - 不再被 attackCmdCallback 调用(后者直接复用 tracked_target_.latest)
+     *
+     * 目标 GPS 来源优先级:
+     *   1. current_target_.gps (来自 target_estimated_gps,target_estimator 实时发布 best cluster 的 GPS)
+     *   2. cluster.ned_x/y/z 通过 nedToGps 转 WGS84 (需要 ref_initialized_=true)
+     *   3. 设备 GPS 退化(obj_lat = dev_lat, obj_alt = 0)— 临时占位
+     *
+     * img_data:ClusterTarget 不携带图像,故 img_data 留空
+     *   (原 typedYoloCallback 会从 YoloDetection.img_data 透传 JPEG,
+     *    cluster 链路下图像通过 detection/yolo_result 单独订阅,目前未接入)
+     */
+    /**
+     * 检测端字符串 label → 协议类别 ID(DetectTarget.label,见协议 §11.2.1)。
+     * GCS 按此 ID 渲染目标(1=人,2=车)。大小写不敏感,含常见同义词。
+     * 映射不到的 label(如仿真占位 "general_target")退化为 unknown_label_id_。
+     * 类别扩充时在此表追加即可。
+     */
+    uint32_t labelToClassId(const std::string& label) const {
+        std::string s;
+        s.reserve(label.size());
+        for (char c : label) s.push_back(static_cast<char>(std::tolower((unsigned char)c)));
+
+        // 1 = 人
+        if (s == "person" || s == "people" || s == "human" || s == "pedestrian" || s == "人")
+            return 1u;
+        // 2 = 车
+        if (s == "car" || s == "vehicle" || s == "truck" || s == "bus" || s == "van" ||
+            s == "车" || s == "汽车")
+            return 2u;
+
+        return static_cast<uint32_t>(unknown_label_id_);
+    }
+
     multi_uav_strike::DetectTarget buildDetectTarget(
-        const multi_uav_strike::YoloDetection& yolo,
+        const multi_uav_strike::ClusterTarget& cluster,
         uint8_t target_type = 3) {
         multi_uav_strike::DetectTarget dt;
-        dt.timestamp_us = yolo.stamp_us;
-        dt.label        = 1;  // 占位
-        dt.confidence   = yolo.confidence;
+        dt.timestamp_us = cluster.last_seen_us;
+        dt.label        = labelToClassId(cluster.label);  // 协议类别 ID(1=人/2=车),GCS 据此渲染
+        dt.confidence   = cluster.confidence;
         dt.target_type  = target_type;
 
-        // 设备 GPS — 优先用 mavros/global_position/global (WGS84 lat/lon, AMSL alt)
-        // GPS 未 lock 时退化为 0.0,并打印一次性 WARN,避免把 NED 本地坐标当经纬度上行
+        // 设备 GPS — 优先 mavros/global_position/global (WGS84 lat/lon, AMSL alt)
         if (is_gps_received_) {
             dt.dev_lat = current_gps_.latitude;
             dt.dev_lon = current_gps_.longitude;
@@ -1528,103 +1739,32 @@ public:
             dt.dev_yaw = std::atan2(siny_cosp, cosy_cosp);
         }
 
-        // 目标 GPS — 优先用 target_estimator 发布的目标估计 GPS(target_estimated_gps)
-        // 还未收到有效目标 GPS 时退化到设备 GPS(临时占位,等 target_estimator 稳定即可消除)
+        // 目标 GPS — 优先 live target_estimated_gps;其次 cluster ned 转 GPS;最后退化
         if (current_target_.has_gps) {
             dt.obj_lat = current_target_.gps.latitude;
             dt.obj_lon = current_target_.gps.longitude;
             dt.obj_alt = current_target_.gps.altitude;
+        } else if (ref_initialized_) {
+            nedToGps(cluster.ned_x, cluster.ned_y, cluster.ned_alt,
+                     dt.obj_lat, dt.obj_lon, dt.obj_alt);
         } else {
             dt.obj_lat = dt.dev_lat;
             dt.obj_lon = dt.dev_lon;
             dt.obj_alt = 0.0;
         }
-        dt.img_format   = 1;
-        dt.img_data     = yolo.img_data;  // 透传 gimbal_simulator 嵌入的固定 JPEG
+
+        // 图像:ClusterTarget 已透传最新一帧 YoloDetection.img_data,
+        //   这里直接拷贝;img_format 与源对齐(1 = JPEG)
+        dt.img_format = cluster.img_format;
+        dt.img_data   = cluster.img_data;
         return dt;
     }
 
     /**
-     * YOLO 驱动的 strike/lock 决策 — 仅在 advanceSkillStateMachine IN_TASK 分支调用
-     *
-     * 门控条件(全部满足才执行):
-     *   1. skill_type == 105 (Attack skill)   ← Search skill (102) 不会触发
-     *   2. skill state == IN_TASK              ← 没到执行区域第一个点不会触发
-     *   3. !is_guidance_active_               ← 没在制导中(避免重复触发)
-     *   4. tracked_target_.lock_state == NOT_LOCKED  ← 没锁过目标
-     *   5. latest_yolo_ 有效:has_latest_yolo_ + is_in_fov + age < 1.0s
-     *   6. work_mode 必须是 SEARCH_STRIKE 或 SEARCH_TRACK(其他模式无意义)
-     *   7. 新目标不在 ignored_targets_ 黑名单内(同 label + 距离 ≤ 20m + 未过期)
-     *
-     * 行为:
-     *   - SEARCH_STRIKE: 构造 DetectTarget(SEARCH_ONLY 模式可以也构造),
-     *                    设置 tracked_target_(LOCKED_AUTO) → triggerStrike()
-     *   - SEARCH_TRACK:  构造 DetectTarget,设置 tracked_target_(LOCKED_WAIT_CONFIRM)
-     *                    等 attack_cmd;由 attackCmdCallback 收到 action=0 后再 trigger
-     *
-     * 设计意图:把"识别→决策→动作"完整链路从 YOLO 回调挪到 skill 状态机,
-     *          YOLO 回调只负责数据缓存和 GS 上报,职责单一。
+     * (已删除) 原 checkYoloDrivenStrike — 由 clusterStatesCallback 在 10Hz 快照扫描中
+     *   直接完成 SEARCH_STRIKE/SEARCH_TRACK 的 strike/lock 决策。
+     *   见 clusterStatesCallback 的门控说明。
      */
-    void checkYoloDrivenStrike(const SkillRuntime& sr) {
-        // 门控 6:work_mode 必须是 STRIKE/TRACK
-        if (current_work_mode_ != WorkMode::SEARCH_STRIKE &&
-            current_work_mode_ != WorkMode::SEARCH_TRACK) return;
-        // 门控 1:搜索阶段可以进track，strike skill则可直接切入
-        if (sr.msg.skill_type != 105 && sr.msg.skill_type != 102) return;
-        // 门控 2:必须已到 IN_TASK(执行区域第一个点之后)
-        if (sr.state != SkillState::IN_TASK) return;
-        // 门控 3:已在制导中,跳过(避免重复 trigger)
-        if (is_guidance_active_) return;
-        // 门控 4:已锁目标,跳过(攻击/等待 attack_cmd 走另一条路径)
-        if (tracked_target_.lock_state != TrackLockState::NOT_LOCKED) return;
-        // 门控 5:YOLO 数据有效
-        if (!has_latest_yolo_ || !latest_yolo_) return;
-        if (!latest_yolo_->is_in_fov) return;
-        double yolo_age = (ros::Time::now() - latest_yolo_time_).toSec();
-        if (yolo_age > 1.0) return;  // 超过 1s 视为过期,等下一次 YOLO 命中
-        // 门控 7:目标在 ignored_targets_ 黑名单内(GS 用 attack_cmd action=1/2 加的) → 跳过
-        //   label-only 匹配:20s 内同 label 一律忽略
-        //   空间维度留给未来云台+UAV pose 反推真实目标位置(C 方案)落地后再补
-        if (isTargetIgnored(latest_yolo_->label)) {
-            ROS_WARN_THROTTLE(2.0, "[MissionManager] >>>> YOLO+IN_TASK: target IGNORED "
-                                   "(label=%s, in blacklist)",
-                              latest_yolo_->label.c_str());
-            return;
-        }
-
-
-        // === 触发 ===
-        if (current_work_mode_ == WorkMode::SEARCH_STRIKE) {
-            // 自动 strike:构造 DetectTarget(攻击目标),锁目标,trigger
-            multi_uav_strike::DetectTarget dt = buildDetectTarget(*latest_yolo_, /*target_type=*/1);
-            auto dt_ptr = boost::make_shared<multi_uav_strike::DetectTarget>(dt);
-            tracked_target_.is_valid   = true;
-            tracked_target_.latest     = dt_ptr;
-            tracked_target_.yolo_label = latest_yolo_->label;  // 保留原始 label,用于 attack_cmd 加黑名单
-            tracked_target_.lock_state = TrackLockState::LOCKED_AUTO;
-            tracked_target_.locked_at  = ros::Time::now();
-
-            ROS_WARN("[MissionManager] >>>> YOLO+Attack+IN_TASK [STRIKE]: trigger strike "
-                     "(yolo_age=%.2fs conf=%.2f label=%s)",
-                     yolo_age, latest_yolo_->confidence, latest_yolo_->label.c_str());
-            guidance_speed_ = sr.msg.task_speed;
-            triggerStrike();
-        } else {
-            // SEARCH_TRACK:锁目标等 attack_cmd
-            multi_uav_strike::DetectTarget dt = buildDetectTarget(*latest_yolo_, /*target_type=*/3);
-            auto dt_ptr = boost::make_shared<multi_uav_strike::DetectTarget>(dt);
-            tracked_target_.is_valid   = true;
-            tracked_target_.latest     = dt_ptr;
-            tracked_target_.yolo_label = latest_yolo_->label;  // 保留原始 label
-            tracked_target_.lock_state = TrackLockState::LOCKED_WAIT_CONFIRM;
-            tracked_target_.locked_at  = ros::Time::now();
-            guidance_speed_ = sr.msg.task_speed;
-            startGuidanceApproach();
-            ROS_WARN("[MissionManager] >>>> YOLO+Attack+IN_TASK [TRACK]: target locked, "
-                     "waiting for attack_cmd (yolo_age=%.2fs conf=%.2f label=%s)",
-                     yolo_age, latest_yolo_->confidence, latest_yolo_->label.c_str());
-        }
-    }
 
     /**
      * 判断给定 label 是否在 ignored_targets_ 黑名单内
@@ -1948,10 +2088,18 @@ public:
                 if (triggerOffboardAndArm()) {
                     takeoff_state_ = TakeoffState::TAKEOFF_TAKEOFF_EXEC;
                     takeoff_start_time_ = ros::Time::now();
-                    takeoff_setpoint_.pose.position.z = takeoff_altitude_;
+                    // ===== 不再阶跃跳到目标高度 =====
+                    // 原因: 0.5m → 30m 的阶跃会让 PX4 速度饱和(MPC_VEL_UP_MAX),真机上引起
+                    //       40m 级别 overshoot,然后快速下落,衔接 waypoint 时有明显下沉。
+                    // 改为: 记录当前实际高度作为斜坡起点,每个 tick 按 takeoff_climb_rate_
+                    //       (默认 3 m/s)线性推高,直到达到 takeoff_altitude_。PX4 在斜坡模式
+                    //       下稳态跟踪,几乎不超调。
+                    takeoff_start_alt_ = -current_pose_.pose.position.z;
+                    takeoff_setpoint_.pose.position.z = takeoff_start_alt_;
                     ROS_WARN("[MissionManager] >>>> OFFBOARD + ARM SUCCESS, takeoff climb started "
-                             "(sp=%.0fms, target alt=%.1f m)",
-                             sp_elapsed * 1000.0, takeoff_altitude_);
+                             "(sp=%.0fms, target alt=%.1f m, climb_rate=%.1f m/s, start_alt=%.2f m)",
+                             sp_elapsed * 1000.0, takeoff_altitude_,
+                             takeoff_climb_rate_, takeoff_start_alt_);
                 } else {
                     // 不进 FAILED 状态，下一 tick 会再走一遍 SETTING_OFFBOARD 重试整组动作
                     ROS_WARN("[MissionManager] >>>> OFFBOARD + ARM sequence FAILED (PX4 mode=%s armed=%d), "
@@ -1963,19 +2111,31 @@ public:
             }
 
             case TakeoffState::TAKEOFF_TAKEOFF_EXEC: {
+                // ===== setpoint z 斜坡推进 =====
+                // 每个 tick 按 takeoff_climb_rate_ 把目标高度往 takeoff_altitude_ 推,
+                // 不再阶跃跳变。斜坡速度 3 m/s 默认,落在 PX4 MPC_VEL_UP_MAX(5 m/s)安全区内,
+                // 真机不饱和、不超调。
+                double elapsed_climb = (ros::Time::now() - takeoff_start_time_).toSec();
+                double ramped_z = takeoff_start_alt_ + takeoff_climb_rate_ * elapsed_climb;
+                if (ramped_z > takeoff_altitude_) {
+                    ramped_z = takeoff_altitude_;
+                }
+                takeoff_setpoint_.pose.position.z = ramped_z;
+
                 // 检查高度 (NED: z 向下为正)
                 double current_alt = -current_pose_.pose.position.z;
-                if (current_alt >= takeoff_altitude_ - 1.0f) {  // 高度容差 1m
+                if (current_alt >= takeoff_altitude_ - 1.0f) {  // 高度容差 1m(保留:避免小机型无法精确达到目标卡死)
                     double elapsed = (ros::Time::now() - takeoff_start_time_).toSec();
                     if (elapsed > takeoff_stable_time_) {  // 高度稳定时间（ROS 参数）
                         takeoff_state_ = TakeoffState::TAKEOFF_HOVERING;
                         takeoff_start_time_ = ros::Time::now();
                         current_phase_ = MissionPhase::PHASE_HOVERING;  // phase 推进:TAKING_OFF → HOVERING
-                        ROS_WARN("[MissionManager] Takeoff altitude reached, hovering (phase=HOVERING)...");
+                        ROS_WARN("[MissionManager] Takeoff altitude reached, hovering (phase=HOVERING, ramped_z=%.2f)...",
+                                 ramped_z);
                     }
                 } else {
-                    ROS_WARN_THROTTLE(2.0, "[MissionManager] Takeoff climbing: %.1f / %.1f m",
-                                     current_alt, takeoff_altitude_);
+                    ROS_WARN_THROTTLE(2.0, "[MissionManager] Takeoff climbing: cur=%.1f / tgt=%.1f m (ramp=%.2f)",
+                                     current_alt, takeoff_altitude_, ramped_z);
                 }
 
                 // 超时检测
@@ -2835,16 +2995,13 @@ public:
             }
 
             case SkillState::IN_TASK: {
-                // === YOLO 驱动的 strike/lock 决策(只在 Attack skill + IN_TASK 触发)===
-                // 见 checkYoloDrivenStrike() 的门控说明:
-                //   1. skill_type == 105
-                //   2. state == IN_TASK (本分支已满足)
-                //   3. !is_guidance_active_
-                //   4. tracked_target_.lock_state == NOT_LOCKED
-                //   5. latest_yolo_ 有效 (1s 内 is_in_fov)
-                //   6. work_mode == SEARCH_STRIKE / SEARCH_TRACK
-                // 满足则触发:SEARCH_STRIKE → triggerStrike();SEARCH_TRACK → 仅锁目标等 attack_cmd
-                checkYoloDrivenStrike(sr);
+                // === cluster_states 10Hz 快照驱动的 strike/lock 决策 ===
+                // 替代原 checkYoloDrivenStrike (后者在 timer 里轮询 latest_yolo_ 做 100Hz→N Hz 的去重判断,
+                // 现由 target_estimator 做聚类后,周期 publish cluster_states,
+                // clusterStatesCallback 已经在这里完成 SEARCH_STRIKE → triggerStrike()
+                //   以及 SEARCH_TRACK → 锁目标 + tracking_state 上报。
+                // IN_TASK 分支不再需要主动轮询 strike/lock 决策,只等 attack_cmd 处理 SEARCH_TRACK 的确认。
+                // (代码保留注释,便于将来在此处加技能超时/计数等通用逻辑。)
 
                 // skill_type=101 集结合:等所有 expected_sns_ 到齐或 timeout
                 if (sr.msg.skill_type == 101) {

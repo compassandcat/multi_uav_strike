@@ -581,24 +581,10 @@ public:
             return;
         }
 
-        // Check if target twist is available (required for intercept)
-        if (!is_target_twist_received_ &&
-            current_strategy_type_ == multi_uav_strike::GuidanceStrategyType::INTERCEPT) {
-            ROS_WARN_THROTTLE(5.0, "[Guidance] Target velocity not available for intercept guidance");
-            // 同样的 OFFBOARD 保活：悬停等待 twist
-            geometry_msgs::Twist hover_cmd;
-            hover_cmd.linear.x = 0.0;
-            hover_cmd.linear.y = 0.0;
-            hover_cmd.linear.z = 0.0;
-            hover_cmd.angular.x = 0.0;
-            hover_cmd.angular.y = 0.0;
-            hover_cmd.angular.z = 0.0;
-            if (!use_sim_) {
-                convertVelNedToEnu(hover_cmd);
-            }
-            vel_cmd_pub_.publish(hover_cmd);
-            return;
-        }
+        // 注:INTERCEPT 制导为纯追踪(定速飞向目标当前位置),不使用 target_twist。
+        // 聚类只产生 2D 位置、无速度,故此处不再门槛拦截 twist。
+        // 若将来对动目标启用提前量拦截(见 InterceptGuidance::computeInterceptPoint 的
+        // target_vel 预测项),需恢复对 target_estimated_twist 的依赖并在此重新加门槛。
 
         // Compute guidance command based on strategy type
         switch (current_strategy_type_) {

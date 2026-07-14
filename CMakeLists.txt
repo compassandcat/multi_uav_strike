@@ -22,6 +22,7 @@ find_package(catkin REQUIRED COMPONENTS
 )
 
 # 要生成的消息列表(本项目所有消息归 multi_uav_strike 拥有)
+# 注意:ClusterTarget 必须在 ClusterState 之前(后者引用前者)
 add_message_files(
   FILES
   WorkMode.msg
@@ -37,6 +38,9 @@ add_message_files(
   InterUavStatus.msg
   AvoidanceCmd.msg
   UavGatherStatus.msg
+  ClusterEvent.msg
+  ClusterTarget.msg
+  ClusterState.msg
 )
 
 # 消息生成的依赖项
