@@ -1,4 +1,5 @@
 #include <ros/ros.h>
+#include <ros/package.h>
 #include <geometry_msgs/Point.h>
 #include <geometry_msgs/Pose.h>
 #include <geometry_msgs/PoseStamped.h>
@@ -10,6 +11,10 @@
 #include <algorithm>
 #include <random>
 #include <chrono>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <sstream>
 
 #include "multi_uav_strike/YoloDetection.h"
 
@@ -76,6 +81,10 @@ private:
     std::string uav_pose_topic_;
     double desired_pitch, desired_yaw;
 
+    // 固定模拟 JPEG(测试用,真实 gimbal 接入后由相机抓拍帧替换)
+    std::vector<uint8_t> fake_jpeg_;
+    std::string fake_jpeg_path_;
+
     // === 云台参数 (新约定: pitch ∈ [-π/2, 0]) ===
     //   current_gimbal_pitch_ = 0      → 水平
     //   current_gimbal_pitch_ = -π/2   → 垂直下视
@@ -122,6 +131,14 @@ public:
         nh_private_.param<double>("loop_freq", loop_freq_, 100.0);
         nh_private_.param<bool>("use_sim", use_sim_, true);
         nh_private_.param<double>("image_noise_std_dev", image_noise_std_dev_, 0.0);
+
+        // 加载固定模拟 JPEG:放到 YoloDetection.img_data 给下游(mission_manager →
+        // starling_bridge → DEVICE_TARGETS 0x2001)组装上行报文;真实 gimbal 接入后
+        // 此参数失效,由相机抓拍帧替换。
+        nh_private_.param<std::string>("fake_jpeg_path", fake_jpeg_path_,
+                                        ros::package::getPath("multi_uav_strike") +
+                                        "/config/fake_target.jpg");
+        loadFakeJpeg(fake_jpeg_path_);
 
         // 新约定下的回退角
         nh_private_.param<double>("default_pitch_deg", default_pitch_deg_, 45.0);
@@ -508,10 +525,37 @@ public:
             out.confidence = (float)conf;
             out.is_in_fov = true;
             in_fov_flag.data = true;
+
+            // 可见帧才携带模拟 JPEG;真实 gimbal 接入后此分支替换为相机抓拍帧
+            out.img_data = fake_jpeg_;
         }
 
         yolo_pub_.publish(out);
         in_fov_pub_.publish(in_fov_flag);
+    }
+
+    // 从磁盘加载固定 JPEG 字节流;加载失败时 fake_jpeg_ 留空(下游 img_data 也空)
+    void loadFakeJpeg(const std::string& path) {
+        std::ifstream ifs(path, std::ios::binary | std::ios::ate);
+        if (!ifs) {
+            ROS_WARN("[GimbalSim] fake_jpeg_path='%s' open failed, img_data will be empty",
+                     path.c_str());
+            return;
+        }
+        const std::streamsize sz = ifs.tellg();
+        if (sz <= 0) {
+            ROS_WARN("[GimbalSim] fake_jpeg_path='%s' is empty", path.c_str());
+            return;
+        }
+        ifs.seekg(0, std::ios::beg);
+        fake_jpeg_.resize(static_cast<size_t>(sz));
+        if (!ifs.read(reinterpret_cast<char*>(fake_jpeg_.data()), sz)) {
+            ROS_WARN("[GimbalSim] fake_jpeg_path='%s' read failed", path.c_str());
+            fake_jpeg_.clear();
+            return;
+        }
+        ROS_INFO("[GimbalSim] loaded fake JPEG: path=%s size=%zu bytes",
+                 path.c_str(), fake_jpeg_.size());
     }
 };
 

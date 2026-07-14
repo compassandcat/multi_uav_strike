@@ -50,6 +50,7 @@
 #include <geometry_msgs/TwistStamped.h>
 #include <geometry_msgs/PoseArray.h>
 #include <geometry_msgs/Point.h>
+#include <sensor_msgs/NavSatFix.h>
 #include <nav_msgs/Path.h>
 #include <mavros_msgs/State.h>
 #include <mavros_msgs/SetMode.h>
@@ -224,9 +225,11 @@ private:
     ros::Subscriber gimbal_los_sub_;
     ros::Subscriber target_est_pose_sub_;
     ros::Subscriber target_est_twist_sub_;
+    ros::Subscriber target_est_gps_sub_;   // target_estimated_gps → 目标真实 GPS
     ros::Subscriber other_uav_poses_sub_;
     ros::Subscriber inter_uav_target_sub_;
     ros::Subscriber self_pose_sub_;
+    ros::Subscriber self_gps_sub_;       // mavros/global_position/global → 真实 GPS
     ros::Subscriber obstacle_sub_;
     ros::Subscriber mavros_state_sub_;    // PX4 SITL: 飞控状态
     // === Phase 2: 类型化订阅 ===
@@ -258,6 +261,7 @@ private:
     ros::Publisher uav_pose_nwu_pub_;     // NWU姿态发布(RViz用)
     // === Phase 2: 类型化发布 ===
     ros::Publisher mission_state_pub_;       // 1Hz 定频上报 multi_uav_strike/MissionState
+    ros::Publisher work_mode_state_pub_;     // 1Hz 定频上报当前 work_mode (typed),bridge 订阅后 KCP 回传
     ros::Publisher detect_target_pub_;       // 单条 target:multi_uav_strike/DetectTarget
     ros::Publisher detect_targets_pub_;      // 批量:multi_uav_strike/DetectTargets
     ros::Publisher tracking_state_pub_;      // multi_uav_strike/TrackingState
@@ -281,6 +285,8 @@ private:
         bool is_locked;
         geometry_msgs::PoseStamped pose;
         geometry_msgs::TwistStamped twist;
+        sensor_msgs::NavSatFix gps;        // 目标 GPS(来自 target_estimated_gps)
+        bool has_gps = false;              // 是否收到过有效 GPS
         double lock_time;  // 锁定持续时间
         bool is_shared;    // 是否已共享给队友
     };
@@ -289,6 +295,11 @@ private:
     // 本机状态
     geometry_msgs::PoseStamped current_pose_;
     bool is_pose_received_;
+
+    // 真实 GPS(来自 mavros/global_position/global,WGS84 + AMSL 米)
+    // 用于 DetectTarget.dev_lat/lon/alt — 替代之前用 current_pose NED 占位
+    sensor_msgs::NavSatFix current_gps_;
+    bool is_gps_received_ = false;
 
     // 邻居无人机
     struct NeighborUav {
@@ -595,6 +606,11 @@ public:
             "target_estimated_twist", 10,
             &MissionManager::targetEstTwistCallback, this);
 
+        // 目标估计 GPS(来自 target_estimator_node 的 target_estimated_gps)
+        target_est_gps_sub_ = nh_.subscribe(
+            "target_estimated_gps", 10,
+            &MissionManager::targetEstGpsCallback, this);
+
         // 邻居无人机位置
         other_uav_poses_sub_ = nh_.subscribe(
             "inter_uav/other_uav_poses", 10,
@@ -609,6 +625,12 @@ public:
         self_pose_sub_ = nh_.subscribe(
             pose_topic_, 10,
             &MissionManager::selfPoseCallback, this);
+
+        // 本机真实 GPS(mavros/global_position/global → NavSatFix)
+        // 真机必须等 GPS lock 后才有有效值;仿真下 mavros SITL 一般也输出
+        self_gps_sub_ = nh_.subscribe(
+            "mavros/global_position/global", 10,
+            &MissionManager::selfGpsCallback, this);
 
         // 毫米波雷达障碍检测
         obstacle_sub_ = nh_.subscribe(
@@ -712,6 +734,10 @@ public:
         mission_state_pub_ = nh_.advertise<multi_uav_strike::MissionState>(
             "mission/mission_state", 10);
 
+        // 当前 work_mode 状态(供 starling_bridge 订阅,KCP BIZ_WORK_MODE_REPORT 0x1004 上报)
+        work_mode_state_pub_ = nh_.advertise<multi_uav_strike::WorkMode>(
+            "mission/current_work_mode", 10);
+
         // 目标上报(单条)
         detect_target_pub_ = nh_.advertise<multi_uav_strike::DetectTarget>(
             "mission/detect_target", 10);
@@ -780,6 +806,19 @@ public:
     void targetEstTwistCallback(const geometry_msgs::TwistStamped::ConstPtr& msg) {
         if (current_target_.is_locked) {
             current_target_.twist = *msg;
+        }
+    }
+
+    /**
+     * target_estimated_gps 回调 — 缓存目标真实 GPS(由 target_estimator_node 用 UAV GPS + 本地偏移算出)
+     * 仅当 status.status >= STATUS_FIX 时认为有效。
+     * 注:暂不要求 is_locked,因为 buildDetectTarget 在 lock 之前也可能用
+     *(typedYoloCallback / checkYoloDrivenStrike 都会立即构造 DetectTarget)
+     */
+    void targetEstGpsCallback(const sensor_msgs::NavSatFix::ConstPtr& msg) {
+        if (msg->status.status >= sensor_msgs::NavSatStatus::STATUS_FIX) {
+            current_target_.gps = *msg;
+            current_target_.has_gps = true;
         }
     }
 
@@ -899,6 +938,18 @@ public:
         uav_pose_nwu.header.stamp = ros::Time::now();
         uav_pose_nwu.header.frame_id = "map";  // RViz
         uav_pose_nwu_pub_.publish(uav_pose_nwu);
+    }
+
+    /**
+     * mavros/global_position/global 回调 — 真实 GPS 缓存
+     * 仅当 status.status >= STATUS_FIX 时认为有效;否则保留上次值但 is_gps_received_ 不置 true,
+     * 避免 buildDetectTarget 用无效 GPS 当目标 GPS 上行。
+     */
+    void selfGpsCallback(const sensor_msgs::NavSatFix::ConstPtr& msg) {
+        if (msg->status.status >= sensor_msgs::NavSatStatus::STATUS_FIX) {
+            current_gps_ = *msg;
+            is_gps_received_ = true;
+        }
     }
 
     void obstacleCallback(const std_msgs::String::ConstPtr& msg) {
@@ -1242,13 +1293,28 @@ public:
         if (tracked_target_.latest) {
             dt.label        = tracked_target_.latest->label;
             dt.confidence   = tracked_target_.latest->confidence;
-            dt.dev_lat      = current_pose_.pose.position.x;  // 简化:用 UAV 位置作 dev
-            dt.dev_lon      = current_pose_.pose.position.y;
-            dt.dev_alt      = -current_pose_.pose.position.z;
+            // 设备 GPS — 同 buildDetectTarget,优先 real GPS,未 lock 时退化为 0
+            if (is_gps_received_) {
+                dt.dev_lat = current_gps_.latitude;
+                dt.dev_lon = current_gps_.longitude;
+                dt.dev_alt = current_gps_.altitude;
+            } else {
+                dt.dev_lat = 0.0;
+                dt.dev_lon = 0.0;
+                dt.dev_alt = 0.0;
+            }
+            // 设备偏航(弧度,NWU)— 从 current_pose 四元数解算
+            {
+                const auto& q = current_pose_.pose.orientation;
+                const double siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
+                const double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+                dt.dev_yaw = std::atan2(siny_cosp, cosy_cosp);
+            }
             dt.obj_lat      = tracked_target_.latest->obj_lat;
             dt.obj_lon      = tracked_target_.latest->obj_lon;
             dt.obj_alt      = tracked_target_.latest->obj_alt;
             dt.target_type  = 3;  // 默认普通搜索目标
+            dt.img_data     = tracked_target_.latest->img_data;  // 透传之前的 JPEG
         }
         dt.img_format = 1;  // JPEG
 
@@ -1259,6 +1325,11 @@ public:
                 ROS_WARN("[MissionManager] AttackCmd action=0 (打) — triggering strike");
                 triggerStrike();
                 detect_target_pub_.publish(dt);
+                {
+                    multi_uav_strike::DetectTargets batch;
+                    batch.targets.push_back(dt);
+                    detect_targets_pub_.publish(batch);
+                }
                 break;
             }
             case 1: {
@@ -1302,6 +1373,11 @@ public:
                 dt.target_type = 2;
                 ROS_WARN("[MissionManager] AttackCmd action=2 (暂存) — adding to blacklist");
                 detect_target_pub_.publish(dt);
+                {
+                    multi_uav_strike::DetectTargets batch;
+                    batch.targets.push_back(dt);
+                    detect_targets_pub_.publish(batch);
+                }
                 if (tracked_target_.latest) {
                     addIgnoredTarget(*tracked_target_.latest, tracked_target_.yolo_label);
                 }
@@ -1380,6 +1456,11 @@ public:
         // 1) DetectTarget 上报(GS 关心的遥测,所有模式都发)
         multi_uav_strike::DetectTarget dt = buildDetectTarget(*msg, /*target_type=*/3);
         detect_target_pub_.publish(dt);
+        {
+            multi_uav_strike::DetectTargets batch;
+            batch.targets.push_back(dt);
+            detect_targets_pub_.publish(batch);
+        }
 
         // TODO(target_dedup): 当前每帧 YOLO 命中都会 publish DetectTarget,
         //   GS 端会收到大量重复目标上报。后续应实现 reported_targets_ 黑名单
@@ -1420,14 +1501,46 @@ public:
         dt.label        = 1;  // 占位
         dt.confidence   = yolo.confidence;
         dt.target_type  = target_type;
-        dt.dev_lat      = current_pose_.pose.position.x;
-        dt.dev_lon      = current_pose_.pose.position.y;
-        dt.dev_alt      = -current_pose_.pose.position.z;
-        // Phase 5 后续:用 gimbal LOS + 相机参数 + UAV GPS 推算目标真实位置
-        dt.obj_lat      = dt.dev_lat;
-        dt.obj_lon      = dt.dev_lon;
-        dt.obj_alt      = 0.0;
+
+        // 设备 GPS — 优先用 mavros/global_position/global (WGS84 lat/lon, AMSL alt)
+        // GPS 未 lock 时退化为 0.0,并打印一次性 WARN,避免把 NED 本地坐标当经纬度上行
+        if (is_gps_received_) {
+            dt.dev_lat = current_gps_.latitude;
+            dt.dev_lon = current_gps_.longitude;
+            dt.dev_alt = current_gps_.altitude;
+        } else {
+            static bool warned_no_gps = false;
+            if (!warned_no_gps) {
+                ROS_WARN_THROTTLE(10.0, "[MissionManager] DetectTarget.dev_lat/lon/alt = 0 "
+                                        "(no GPS lock yet; will not republish this warn)");
+                warned_no_gps = true;
+            }
+            dt.dev_lat = 0.0;
+            dt.dev_lon = 0.0;
+            dt.dev_alt = 0.0;
+        }
+
+        // 从 current_pose (NWU) 四元数解算偏航角,协议 §9.3 要求
+        {
+            const auto& q = current_pose_.pose.orientation;
+            const double siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
+            const double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+            dt.dev_yaw = std::atan2(siny_cosp, cosy_cosp);
+        }
+
+        // 目标 GPS — 优先用 target_estimator 发布的目标估计 GPS(target_estimated_gps)
+        // 还未收到有效目标 GPS 时退化到设备 GPS(临时占位,等 target_estimator 稳定即可消除)
+        if (current_target_.has_gps) {
+            dt.obj_lat = current_target_.gps.latitude;
+            dt.obj_lon = current_target_.gps.longitude;
+            dt.obj_alt = current_target_.gps.altitude;
+        } else {
+            dt.obj_lat = dt.dev_lat;
+            dt.obj_lon = dt.dev_lon;
+            dt.obj_alt = 0.0;
+        }
         dt.img_format   = 1;
+        dt.img_data     = yolo.img_data;  // 透传 gimbal_simulator 嵌入的固定 JPEG
         return dt;
     }
 
@@ -2531,6 +2644,7 @@ public:
      */
     void missionStateTimerCallback(const ros::TimerEvent&) {
         publishMissionState();
+        publishCurrentWorkMode();
     }
 
     void publishMissionState() {
@@ -2550,6 +2664,19 @@ public:
 
         mission_state_pub_.publish(ms);
         last_mission_state_pub_time_ = ros::Time::now();
+    }
+
+    /**
+     * 1Hz 上报当前 work_mode(typed) — 给 starling_bridge 订阅,然后通过 KCP BIZ_WORK_MODE_REPORT(0x1004)
+     * 回传给地面站。注意:这里发的就是内部 current_work_mode_ 的 typed 映射值,与 GS 通过 SET_WORKMODE
+     * 下发的语义一致(starling_bridge 已把 GCS 0/1/2/3 映射为 SEARCH_STRIKE/TRACK/ONLY/DENIED_ENV_FLIGHT)。
+     */
+    void publishCurrentWorkMode() {
+        multi_uav_strike::WorkMode wm;
+        // 当前 WorkMode 枚举值与 typed WorkMode.msg 常量数值对齐(SEARCH_STRIKE=5 等),
+        // 直接 cast 即可,无需 switch。
+        wm.mode = static_cast<uint8_t>(current_work_mode_);
+        work_mode_state_pub_.publish(wm);
     }
 
     static int32_t skillStateToInt(SkillState s) {
@@ -2841,9 +2968,16 @@ public:
         gs.sn = nh_.getNamespace();
         if (!gs.sn.empty() && gs.sn[0] == '/') gs.sn = gs.sn.substr(1);
         gs.arrived_state = 1;  // 已到(IN_TASK 即视为已到)
-        gs.lat = current_pose_.pose.position.x;
-        gs.lon = current_pose_.pose.position.y;
-        gs.alt = -current_pose_.pose.position.z;
+        // GPS 未 lock 时 lat/lon/alt 留 0,避免把 NED 本地坐标当经纬度上报
+        if (is_gps_received_) {
+            gs.lat = current_gps_.latitude;
+            gs.lon = current_gps_.longitude;
+            gs.alt = current_gps_.altitude;
+        } else {
+            gs.lat = 0.0;
+            gs.lon = 0.0;
+            gs.alt = 0.0;
+        }
         gs.priority = 100;  // 占位
         gather_status_pub_.publish(gs);
     }

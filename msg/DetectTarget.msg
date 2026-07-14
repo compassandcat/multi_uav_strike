@@ -17,6 +17,7 @@ uint8    target_type
 float64  dev_lat
 float64  dev_lon
 float64  dev_alt
+float64  dev_yaw       # 无人机偏航(弧度,NWU/机体 z-up),协议 §9.3 要求
 float64  obj_lat
 float64  obj_lon
 float64  obj_alt

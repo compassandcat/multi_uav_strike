@@ -17,6 +17,7 @@ find_package(catkin REQUIRED COMPONENTS
   eigen_conversions
   message_generation
   serial
+  roslib
   mavros_msgs
 )
 

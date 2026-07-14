@@ -3,6 +3,7 @@
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/Twist.h>
 #include <geometry_msgs/TwistStamped.h>
+#include <sensor_msgs/NavSatFix.h>
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
 #include <tf/transform_datatypes.h>
@@ -33,12 +34,14 @@ private:
     ros::NodeHandle nh_;
     ros::Subscriber gimbal_los_sub_;
     ros::Subscriber uav_pose_sub_;
+    ros::Subscriber self_gps_sub_;          // mavros/global_position/global → UAV 真实 GPS
     ros::Subscriber real_target_sub_;  // 真实目标位置（调试用）
     ros::Subscriber target_in_view_sub_;  // 目标是否在云台 FOV 内（gimbal 发布）
     ros::Publisher target_est_marker_pub_;
     ros::Publisher particles_marker_pub_;
     ros::Publisher target_est_pose_pub_;
     ros::Publisher target_est_twist_pub_;
+    ros::Publisher target_est_gps_pub_;     // target_estimated_gps (sensor_msgs/NavSatFix)
     ros::Timer pf_timer_;
 
     int num_particles_;
@@ -73,6 +76,8 @@ private:
     std::vector<Particle> particles_;
     geometry_msgs::Point current_los_angle_;
     geometry_msgs::PoseStamped current_uav_pose_;
+    sensor_msgs::NavSatFix current_gps_;  // UAV 真实 GPS(WGS84 + AMSL),由 self_gps_sub_ 更新
+    bool is_gps_received_ = false;
     geometry_msgs::Point real_target_pos_;  // 真实目标位置（调试用）
     bool is_real_target_received_ = false;
     bool is_los_received_ = false;
@@ -139,10 +144,18 @@ public:
             "detection/target_in_view", 10,
             &TargetEstimator::targetInViewCallback, this);
 
+        // UAV 真实 GPS(用于把"目标相对UAV的本地偏移"转 WGS84)
+        self_gps_sub_ = nh_.subscribe(
+            "mavros/global_position/global", 10,
+            &TargetEstimator::selfGpsCallback, this);
+
         target_est_marker_pub_ = nh_.advertise<visualization_msgs::Marker>("target_estimated_marker", 10);
         particles_marker_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("particles_marker_array", 10);
         target_est_pose_pub_ = nh_.advertise<geometry_msgs::PoseStamped>("target_estimated_pose", 10);
         target_est_twist_pub_ = nh_.advertise<geometry_msgs::TwistStamped>("target_estimated_twist", 10);
+        // target_estimated_gps:估计目标的真实 GPS(sensor_msgs/NavSatFix,WGS84 + AMSL)
+        // 派发流程:估算 → publishEstimatedTargetGps() → mission_manager 直接填 DetectTarget.obj_*
+        target_est_gps_pub_ = nh_.advertise<sensor_msgs::NavSatFix>("target_estimated_gps", 10);
 
         pf_timer_ = nh_.createTimer(ros::Duration(1.0/pf_loop_freq_), &TargetEstimator::pfLoopCallback, this);
 
@@ -200,6 +213,18 @@ public:
         is_uav_pose_received_ = true;
     }
 
+    /**
+     * mavros/global_position/global 回调 — UAV 真实 GPS 缓存
+     * 仅当 status.status >= STATUS_FIX 时认为有效;无效帧保留上次值但不置 is_gps_received_,
+     * publishEstimatedTargetGps 会发 NO_FIX 空帧。
+     */
+    void selfGpsCallback(const sensor_msgs::NavSatFix::ConstPtr& msg) {
+        if (msg->status.status >= sensor_msgs::NavSatStatus::STATUS_FIX) {
+            current_gps_ = *msg;
+            is_gps_received_ = true;
+        }
+    }
+
     void realTargetCallback(const geometry_msgs::Point::ConstPtr& msg) {
         // 真实目标位置（NWU坐标系）
         real_target_pos_ = *msg;
@@ -246,6 +271,7 @@ public:
 
                 publishEstimatedTargetMarker();
                 publishEstimatedTargetPose();
+                publishEstimatedTargetGps();
                 publishEstimatedTargetTwist();
             }
             return;
@@ -667,6 +693,47 @@ public:
 
     void publishEstimatedTargetPose() {
         target_est_pose_pub_.publish(estimated_target_pose_);
+    }
+
+    void publishEstimatedTargetGps() {
+        sensor_msgs::NavSatFix msg;
+        msg.header.stamp = estimated_target_pose_.header.stamp;
+        msg.header.frame_id = "wgs84";
+
+        // 数据不全时发一个 status=NO_FIX 的空帧(下游用 status 过滤,不会拿到错值)
+        if (!is_gps_received_ || !is_uav_pose_received_) {
+            msg.status.status = sensor_msgs::NavSatStatus::STATUS_NO_FIX;
+            msg.status.service = sensor_msgs::NavSatStatus::SERVICE_GPS;
+            msg.latitude = 0.0;
+            msg.longitude = 0.0;
+            msg.altitude = 0.0;
+            target_est_gps_pub_.publish(msg);
+            return;
+        }
+
+        // 1) 目标相对 UAV 的本地 NWU 偏移(m):
+        //    estimated_target_pose_ / current_uav_pose_ 都是 NWU("map" frame)
+        //    NWU: x=北, y=西, z=上
+        const double dx = estimated_target_pose_.pose.position.x - current_uav_pose_.pose.position.x;
+        const double dy = estimated_target_pose_.pose.position.y - current_uav_pose_.pose.position.y;
+        const double dz = estimated_target_pose_.pose.position.z - current_uav_pose_.pose.position.z;
+        const double north_m = dx;   // NWU x = 北
+        const double east_m  = -dy;  // NWU y = 西 → 东 = -y
+        const double up_m    = dz;   // NWU z = 上
+
+        // 2) 平面地球公式(sub-km 误差 < 1m):
+        //    lat += north_m / 111320.0
+        //    lon += east_m  / (111320.0 * cos(lat_uav))
+        const double DEG_PER_M_LAT = 1.0 / 111320.0;
+        const double uav_lat_rad = current_gps_.latitude * M_PI / 180.0;
+        const double DEG_PER_M_LON = 1.0 / (111320.0 * std::cos(uav_lat_rad));
+
+        msg.status.status  = sensor_msgs::NavSatStatus::STATUS_FIX;
+        msg.status.service = sensor_msgs::NavSatStatus::SERVICE_GPS;
+        msg.latitude  = current_gps_.latitude  + north_m * DEG_PER_M_LAT;
+        msg.longitude = current_gps_.longitude + east_m  * DEG_PER_M_LON;
+        msg.altitude  = current_gps_.altitude  + up_m;     // AMSL
+        target_est_gps_pub_.publish(msg);
     }
 
     void publishEstimatedTargetTwist() {
