@@ -16,6 +16,7 @@
 #include <Eigen/Eigen>
 
 #include "multi_uav_strike/guidance_strategies.h"
+#include "multi_uav_strike/one_euro_filter.h"  // 速度指令平滑(2026-07-16),消除聚类抖动→PD→UAV 晃
 
 class GuidanceControlNode {
 private:
@@ -118,6 +119,24 @@ private:
     // 偏航角速度控制参数（PX4 SITL 用）
     double los_kp_yaw_;              // 偏航 P 控制增益
     double los_max_rate_;            // 偏航角速度限幅（rad/s）
+
+    // === 2026-07-16: 速度指令平滑(One Euro Filter) ===
+    // 背景:即使 mission_manager 已经平滑了 target_estimated_pose,这里 P 控制
+    //   v = K_p * (tgt - uav) 还是会把任何位置残留抖动乘以增益变成速度抖动,
+    //   PX4 高刚度控制下就让 UAV 上下左右晃。本节点再过一次 One Euro Filter
+    //   压平速度指令,从根本上消除"速度量调"造成的视觉抖动。
+    multi_uav_strike::OneEuroFilter1D vel_filter_x_;
+    multi_uav_strike::OneEuroFilter1D vel_filter_y_;
+    multi_uav_strike::OneEuroFilter1D vel_filter_z_;
+    multi_uav_strike::OneEuroFilter1D vel_filter_yaw_;
+    ros::Time                    vel_filter_last_time_;
+    // 目标切换检测:目标位置突变(>5m)→ 视为不同物理目标 → reset filter,
+    //   否则旧目标的 x_prev 会污染新目标的初值,造成瞬时偏飞。
+    double last_target_pos_x_ = 0.0;
+    double last_target_pos_y_ = 0.0;
+    double last_target_pos_z_ = 0.0;
+    bool   last_target_pos_valid_ = false;
+    static constexpr double kTargetSwitchJumpM = 5.0;
 
     // STRIKE模式参数
     double strike_min_altitude_;      // 开始下降的最小高度阈值
@@ -237,6 +256,22 @@ public:
         // 偏航角速度控制（PX4 SITL）
         nh_private_.param<double>("los_kp_yaw", los_kp_yaw_, 1.5);
         nh_private_.param<double>("los_max_rate", los_max_rate_, 1.2);
+
+        // === 2026-07-16: 速度指令 One Euro Filter 参数 ===
+        //   调参经验:还看着 UAV 抖 → 把 vel_min_cutoff_hz 降(0.5~1.0);
+        //            UAV 反应迟钝跟不上目标 → 升 vel_beta(0.02~0.05)
+        //   速度通道比位置通道可以略激进(响应要快),所以默认 beta 比位置稍大。
+        double vel_min_cutoff, vel_beta, vel_d_cutoff;
+        nh_private_.param<double>("vel_smooth_min_cutoff_hz", vel_min_cutoff, 1.5);
+        nh_private_.param<double>("vel_smooth_beta",          vel_beta,       0.015);
+        nh_private_.param<double>("vel_smooth_d_cutoff_hz",   vel_d_cutoff,   1.0);
+        vel_filter_x_   = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
+        vel_filter_y_   = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
+        vel_filter_z_   = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
+        vel_filter_yaw_ = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
+        vel_filter_last_time_ = ros::Time();
+        ROS_INFO("[Guidance] Vel cmd OneEuro: min_cutoff=%.2fHz beta=%.3f d_cutoff=%.2fHz",
+                 vel_min_cutoff, vel_beta, vel_d_cutoff);
 
         // STRIKE模式专用参数
         nh_private_.param<double>("strike_min_altitude", strike_min_altitude_, 20.0);  // 开始下降的最小高度阈值
@@ -606,6 +641,8 @@ public:
                     if (!use_sim_) {
                         convertVelNedToEnu(vel_cmd);
                     }
+                    // === 2026-07-16: 速度指令过 One Euro,消除"速度量调"造成的 UAV 视觉晃 ===
+                    filterVelocityCmd(vel_cmd);
                     vel_cmd_pub_.publish(vel_cmd);
                 } else {
                     // STRIKE模式
@@ -657,6 +694,8 @@ public:
                     if (!use_sim_) {
                         convertVelNedToEnu(vel_cmd);
                     }
+                    // STRIKE 模式也喂一次 One Euro,纯追踪对位置抖动更敏感
+                    filterVelocityCmd(vel_cmd);
                     vel_cmd_pub_.publish(vel_cmd);
                     publishInterceptPointMarker(cmd.intercept_point);
                 }
@@ -690,6 +729,52 @@ public:
                 break;
             }
         }
+    }
+
+    // === 2026-07-16: 速度指令 One Euro Filter 统一入口 ===
+    //   TRACK/STRIKE 两个分支在 publish 前都过这里一次,共用 dt / target-switch 检测。
+    //   目标位置突变(>5m)→ reset 所有 filter,丢弃旧目标的 x_prev;
+    //   这样切换目标瞬间,速度不会先跳一段旧值的"残影"再跟上。
+    //   注意:这里读的是 publish 前的 vel_cmd(NED 系),但滤波状态本身与坐标无关,
+    //   同 dt 同样的物理量,坐标转换不影响平滑效果。
+    void filterVelocityCmd(geometry_msgs::Twist& vel_cmd) {
+        // ---- 1) dt + target-switch 检测 ----
+        ros::Time now = ros::Time::now();
+        double te = vel_filter_last_time_.isZero()
+                        ? (1.0 / 50.0)
+                        : (now - vel_filter_last_time_).toSec();
+        vel_filter_last_time_ = now;
+        if (te <= 0.0) te = 1e-3;
+        if (te > 1.0)  te = 1.0;  // 长时间没调用(断流/暂停)→ 限幅,避免 filter 一帧暴走
+
+        const double tx = current_target_pose_.pose.position.x;
+        const double ty = current_target_pose_.pose.position.y;
+        const double tz = current_target_pose_.pose.position.z;
+        if (last_target_pos_valid_) {
+            const double dx = tx - last_target_pos_x_;
+            const double dy = ty - last_target_pos_y_;
+            const double dz = tz - last_target_pos_z_;
+            if (std::sqrt(dx*dx + dy*dy + dz*dz) > kTargetSwitchJumpM) {
+                // 目标切换 → reset 所有 channel,丢掉旧目标的速度平滑状态
+                vel_filter_x_.reset();
+                vel_filter_y_.reset();
+                vel_filter_z_.reset();
+                vel_filter_yaw_.reset();
+                ROS_WARN_THROTTLE(1.0,
+                    "[Guidance] Target switched (jump=%.1fm), reset velocity OneEuro filters",
+                    std::sqrt(dx*dx + dy*dy + dz*dz));
+            }
+        }
+        last_target_pos_x_ = tx;
+        last_target_pos_y_ = ty;
+        last_target_pos_z_ = tz;
+        last_target_pos_valid_ = true;
+
+        // ---- 2) 四通道 One Euro ----
+        vel_cmd.linear.x  = vel_filter_x_.filter(vel_cmd.linear.x,  te);
+        vel_cmd.linear.y  = vel_filter_y_.filter(vel_cmd.linear.y,  te);
+        vel_cmd.linear.z  = vel_filter_z_.filter(vel_cmd.linear.z,  te);
+        vel_cmd.angular.z = vel_filter_yaw_.filter(vel_cmd.angular.z, te);
     }
 
     // TRACK模式专用：基于视线角俯仰角的 stand-off 跟踪

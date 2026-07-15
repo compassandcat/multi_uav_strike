@@ -12,8 +12,8 @@
 # ============================================================================
 targets:
   - {label: "person", x_init: 60.0,  y_init: -100.0, max_speed: 0.0}   # 静止的人
-  - {label: "car",    x_init: 80.0,  y_init: -60.0,  max_speed: 3.0, max_tangential_acc: 1.0, max_normal_acc: 0.5}  # 移动的车
-  - {label: "person", x_init: 55.0,  y_init: -95.0,  max_speed: 1.0, max_normal_acc: 0.5}  # 同类别第二个人(缓慢移动)
+  # - {label: "car",    x_init: 80.0,  y_init: -60.0,  max_speed: 3.0, max_tangential_acc: 1.0, max_normal_acc: 0.5}  # 移动的车
+  - {label: "person", x_init: 0.0,  y_init: -205.0,  max_speed: 1.0, max_normal_acc: 0.5}  # 同类别第二个人(缓慢移动)
 
 # /target_position(Point,兼容 topic)取哪个目标作为主目标
 primary_index: 0

@@ -82,7 +82,11 @@ public:
         // 聚类参数
         p.param<double>("merge_radius_m", merge_radius_m_, 10.0);
         p.param<double>("cluster_ttl_sec", cluster_ttl_sec_, 60.0);
-        p.param<double>("ema_alpha",       ema_alpha_,       0.6);
+        // === 2026-07-16: 默认 0.6 → 0.2,5x 平滑 ===
+        // 0.6 在 10Hz 下对低频噪声增益≈1,基本不滤波;0.2 ≈ 时间常数 0.4s,
+        //   1Hz bbox 抖动衰减 ~96%,且 rescue 慢速目标(行人~1.4m/s)的滞后只有 0.6m,
+        //   完全可接受。如果目标是高速车辆,把 ema_alpha 调回 0.4~0.5。
+        p.param<double>("ema_alpha",       ema_alpha_,       0.2);
         p.param<double>("target_z_prior",  target_z_prior_,  0.0);
         // 发布周期
         p.param<double>("states_publish_freq", states_publish_freq_, 10.0);
@@ -180,7 +184,9 @@ public:
             TargetCluster& c = clusters_[nearest_id];
             c.ned_x = ema_alpha_ * tx + (1.0 - ema_alpha_) * c.ned_x;
             c.ned_y = ema_alpha_ * ty + (1.0 - ema_alpha_) * c.ned_y;
-            c.ned_alt = tz;
+            // === 2026-07-16: Z 也过 EMA,之前 c.ned_alt = tz 直接抄原始值 ===
+            //   bbox 高度投影本身就带噪声,不滤波会让 z 跳 → UAV 俯仰也跟跳
+            c.ned_alt = ema_alpha_ * tz + (1.0 - ema_alpha_) * c.ned_alt;
             c.best_confidence = std::max(c.best_confidence, det.confidence);
             c.last_seen_us = det.stamp_us;
             if (!det.img_data.empty()) {

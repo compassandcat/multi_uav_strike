@@ -82,6 +82,11 @@
 #include "multi_uav_strike/TrackingState.h"
 #include "multi_uav_strike/WaypointStatus.h"
 #include "multi_uav_strike/UavGatherStatus.h"
+#include "multi_uav_strike/one_euro_filter.h"  // 自适应低通,平滑 target_estimated_pose (2026-07-16)
+
+// OneEuroFilter1D 在 multi_uav_strike 命名空间下,本文件的 MissionManager 不在
+// 该命名空间 → 加 using 让类成员声明 (target_smooth_x_) 等直接写短名。
+using multi_uav_strike::OneEuroFilter1D;
 
 #include <std_msgs/UInt64.h>   // mission/primary_target (cluster_id, 主目标) → target_estimator
 
@@ -213,11 +218,16 @@ struct IgnoredTarget {
     std::string  label;          // YoloDetection.label 原值,如 "person"/"car"
     ros::Time    ignore_until;   // 过期时间 (now + ~ignored_retention_sec_)
     ros::Time    ignore_set_time;// 用于日志/debug
-    // 保留位置字段以便未来 C 方案落地时直接复用(暂不参与匹配)
-    double       ned_x           = 0.0;
-    double       ned_y           = 0.0;
+    // === 位置维度(2026-07-16 加入匹配):只屏蔽被 GS action=1/2 指定的
+    //   那个物理目标,同 label 的其他物理目标仍可被锁定 ===
+    double       ned_x           = 0.0;   // 物理目标 NWU 坐标 X(米)
+    double       ned_y           = 0.0;   // 物理目标 NWU 坐标 Y(米)
     double       ned_alt         = 0.0;
+    double       radius          = 10.0;  // 屏蔽半径(米),按 label 类别:人=10m, 车=20m
 };
+
+// OneEuroFilter1D 已抽到 include/multi_uav_strike/one_euro_filter.h,
+//   mission_manager_node.cpp 和 guidance_control_node.cpp 共用。
 
 class MissionManager {
 private:
@@ -473,7 +483,26 @@ private:
     double ignored_retention_sec_;     // 黑名单保留时长 (秒)
     double ignored_match_radius_m_;    // 已弃用:label-only 方案不再做位置匹配;
                                        //   保留 param 仅为兼容 yaml 配置,代码内不读取
+    // === 2026-07-16: 按 label 类别区分屏蔽半径 ===
+    //   person 类(人/行人):     10m (目标小,间隔近)
+    //   vehicle 类(车/卡车/巴士):20m (目标大,可能遮挡视野)
+    //   其它/未知:              default
+    double ignore_radius_person_m_  = 10.0;
+    double ignore_radius_car_m_     = 20.0;
+    double ignore_radius_default_m_ = 10.0;
     ros::Time last_ignored_cleanup_;   // 上次清理过期项的时间(避免每帧遍历)
+
+    // === 2026-07-16: One Euro Filter 平滑跟踪目标位置(NWU x/y/z 各一路) ===
+    //   target_estimator 输出的位置带聚类抖动,直接喂给 guidance_control_node 会让
+    //   UAV 在悬停跟踪时来回晃。One Euro Filter:静止/慢速大幅平滑(去抖),
+    //   快速运动几乎不滞后(跟上),救援目标多为慢速,默认参数足够。
+    OneEuroFilter1D target_smooth_x_;
+    OneEuroFilter1D target_smooth_y_;
+    OneEuroFilter1D target_smooth_z_;
+    ros::Time target_smooth_last_time_;   // 上次滤波调用时间,用于计算 dt
+    // 跟踪目标切换(新 lock / action=1/2 释放 / cluster_id 转移)时必须 reset,
+    //   否则旧目标的 x_prev/dx_prev 会污染新目标的初值,造成切换瞬间位置偏飞。
+    uint64_t target_smooth_locked_cluster_id_ = 0;  // 上次锁定时的 cluster_id
     // WaypointStatus(Phase 4)
     multi_uav_strike::WaypointStatus::ConstPtr latest_wp_status_;
     ros::Time latest_wp_status_time_;
@@ -530,7 +559,8 @@ public:
         max_set_message_rate_retries_(3),
         set_message_rate_start_time_(ros::Time()),  // isZero() 表示还没开始尝试
         set_message_rate_max_wait_sec_(5.0),
-        ignored_retention_sec_(20.0),       // 黑名单默认保留 20s
+        ignored_retention_sec_(3600.0),     // 黑名单默认保留 1 小时(覆盖整个 task_flow,
+                                              //   新 TaskFlow 到达时 taskFlowCallback 会清空)
         ignored_match_radius_m_(20.0),      // 空间匹配默认 20m
         last_ignored_cleanup_(ros::Time()),
         last_reported_cleanup_(ros::Time()) {
@@ -601,9 +631,28 @@ public:
         nh_private_.param<double>("gather_timeout",     gather_timeout_, 60.0);    // 101 集结合计超时 60s
 
         // === 已忽略目标黑名单参数 (Phase 5.5: 目标聚类轻量替代) ===
-        nh_private_.param<double>("ignored_retention_sec",  ignored_retention_sec_,  20.0);  // 默认 20s
-        nh_private_.param<double>("ignored_match_radius_m", ignored_match_radius_m_, 20.0);  // 默认 20m
+        nh_private_.param<double>("ignored_retention_sec",  ignored_retention_sec_,  3600.0);  // 默认 1 小时,覆盖整个 task_flow
+        nh_private_.param<double>("ignored_match_radius_m", ignored_match_radius_m_, 20.0);  // 默认 20m (已弃用,保留兼容)
+        // === 2026-07-16: 按 label 类别区分屏蔽半径 ===
+        nh_private_.param<double>("ignore_radius_person_m",  ignore_radius_person_m_,  10.0);
+        nh_private_.param<double>("ignore_radius_car_m",     ignore_radius_car_m_,     20.0);
+        nh_private_.param<double>("ignore_radius_default_m", ignore_radius_default_m_, 10.0);
         nh_private_.param<int>("unknown_label_id", unknown_label_id_, 1);  // label 映射不到时的兜底类别 ID
+
+        // === 2026-07-16: One Euro Filter 参数 ===
+        //   min_cutoff: 静止时截止频率;越小越平滑(去抖越狠),但低速运动时滞后也越大
+        //              1.0Hz ≈ 时间常数 0.16s,适合目标几乎不动的救援场景
+        //   beta:       速度系数;越大越能跟上快速运动
+        //              0.007 适配慢速行人(0~2m/s);若是高速车辆改为 0.05~0.1
+        //   d_cutoff:   导数通道截止频率,通常固定 1.0Hz 即可
+        // 调参经验:聚类抖动看着还晃 → 降 min_cutoff;UAV 跟不上目标 → 升 beta
+        double te_min_cutoff, te_beta, te_d_cutoff;
+        nh_private_.param<double>("target_smooth_min_cutoff_hz", te_min_cutoff, 1.0);
+        nh_private_.param<double>("target_smooth_beta",          te_beta,       0.007);
+        nh_private_.param<double>("target_smooth_d_cutoff_hz",   te_d_cutoff,   1.0);
+        target_smooth_x_ = OneEuroFilter1D(te_min_cutoff, te_beta, te_d_cutoff);
+        target_smooth_y_ = OneEuroFilter1D(te_min_cutoff, te_beta, te_d_cutoff);
+        target_smooth_z_ = OneEuroFilter1D(te_min_cutoff, te_beta, te_d_cutoff);
 
         // 期望集结 UAV SN 列表(逗号分隔字符串,如 "uav0,uav2")
         std::string sns_str;
@@ -853,9 +902,37 @@ public:
     }
 
     void targetEstPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
-        if (current_target_.is_locked) {
-            current_target_.pose = *msg;
+        if (!current_target_.is_locked) {
+            // 未锁定:仍然 reset filter 避免下次锁定时初值残留
+            target_smooth_x_.reset();
+            target_smooth_y_.reset();
+            target_smooth_z_.reset();
+            target_smooth_last_time_ = ros::Time();
+            return;
         }
+
+        // === 2026-07-16: One Euro Filter 平滑 position,消除聚类抖动 ===
+        // 注意:这里**不要**在 cluster_id 变化时 reset!
+        //   target_estimator 因 LOS 投影偏移会频繁给同一物理目标重分配 cluster_id
+        //   (见 clusterStatesCallback 中 SEARCH_TRACK transfer 注释,1768 行附近),
+        //   如果 cluster_id 变就 reset filter,filter 每帧重来 → 平滑白做。
+        //   物理目标真切换 → 由 triggerStrike() / attackCmdCallback() 的 is_locked=false
+        //   翻转处理(在那里 reset),这里只看 position。
+        (void)locked_cluster_id_;
+        (void)target_smooth_locked_cluster_id_;
+
+        ros::Time now = ros::Time::now();
+        double te = target_smooth_last_time_.isZero()
+                        ? 0.1
+                        : (now - target_smooth_last_time_).toSec();
+        target_smooth_last_time_ = now;
+
+        // 复制整条 msg(保留 stamp / frame_id / orientation 等),
+        // 然后只对 position.x/y/z 覆盖为滤波后值。
+        current_target_.pose               = *msg;
+        current_target_.pose.pose.position.x = target_smooth_x_.filter(msg->pose.position.x, te);
+        current_target_.pose.pose.position.y = target_smooth_y_.filter(msg->pose.position.y, te);
+        current_target_.pose.pose.position.z = target_smooth_z_.filter(msg->pose.position.z, te);
     }
 
     void targetEstTwistCallback(const geometry_msgs::TwistStamped::ConstPtr& msg) {
@@ -1159,9 +1236,13 @@ public:
         // === 新 TaskFlow 到达:清空 cluster dedup 状态 + 锁定目标,允许新一轮上报/锁定 ===
         //   - reported_clusters_ 清空:之前 task_flow 上报过的 cluster_id 在新 flow 中可重新上报
         //     (实际 cluster 已 TTL 或飞离,新 flow 重新看到也大概率是不同目标,但语义上保持独立)
+        //   - ignored_targets_ 清空:新 task_flow 给个干净黑名单起点,避免上一个 flow 的
+        //     "忽略/暂存" 状态泄漏到新 flow;同一个黑名单项(物理目标)在 flow 之间可能已经
+        //     不再相关(cluster_estimator 重启或换搜索区)
         //   - locked_cluster_id_ = 0:cluster_states 缓存失效
         //   - tracked_target_ 的清空见下方 preserve_track 分支(Attack(105)首发时不清)
         reported_clusters_.clear();
+        ignored_targets_.clear();
         locked_cluster_id_     = 0;
         locked_cluster_ned_x_  = 0.0;
         locked_cluster_ned_y_  = 0.0;
@@ -1433,16 +1514,26 @@ public:
                 //   - 必须 disableGuidance() + 发 "resume" 给 waypoint_executor 才能真正"忽略"
                 ROS_WARN("[MissionManager] AttackCmd action=1 (忽略) — adding to blacklist, resume search");
                 if (tracked_target_.latest) {
-                    addIgnoredTarget(*tracked_target_.latest, tracked_target_.yolo_label);
+                    addIgnoredTarget(locked_cluster_ned_x_, locked_cluster_ned_y_, locked_cluster_ned_alt_,
+                                     tracked_target_.yolo_label);
                 }
                 if (is_guidance_active_) {
                     disableGuidance();
                     ROS_WARN("[MissionManager]   - guidance DISABLED (was active before ignore)");
                 }
+                // 清掉 reported_clusters_,让下一个新 cluster(包括同 label 不同位置的目标 2)
+                //   可以重新进入 dispatch 流程,而不是被 dedup 跳过。
+                reported_clusters_.clear();
                 // 清掉 TargetState,避免 handleSearchTrack/Strike 误以为"仍锁定"再次触发 guidance
                 current_target_.is_locked   = false;
                 current_target_.is_detected = false;
                 current_target_.is_shared   = false;
+                // 释放锁定:reset One Euro Filter,旧目标的 x_prev/dx_prev 不再影响下次锁定
+                target_smooth_x_.reset();
+                target_smooth_y_.reset();
+                target_smooth_z_.reset();
+                target_smooth_last_time_        = ros::Time();
+                target_smooth_locked_cluster_id_ = 0;
                 // 重启 waypoint_executor(它现在还是 stop 状态,要 resume 才能继续扫描)
                 {
                     std_msgs::String wp_cmd;
@@ -1470,15 +1561,24 @@ public:
                     detect_targets_pub_.publish(batch);
                 }
                 if (tracked_target_.latest) {
-                    addIgnoredTarget(*tracked_target_.latest, tracked_target_.yolo_label);
+                    addIgnoredTarget(locked_cluster_ned_x_, locked_cluster_ned_y_, locked_cluster_ned_alt_,
+                                     tracked_target_.yolo_label);
                 }
                 if (is_guidance_active_) {
                     disableGuidance();
                     ROS_WARN("[MissionManager]   - guidance DISABLED (was active before stash)");
                 }
+                // 清掉 reported_clusters_,让目标 2(同 label 不同位置)可以重新进入 dispatch。
+                reported_clusters_.clear();
                 current_target_.is_locked   = false;
                 current_target_.is_detected = false;
                 current_target_.is_shared   = false;
+                // 释放锁定:reset One Euro Filter,旧目标的 x_prev/dx_prev 不再影响下次锁定
+                target_smooth_x_.reset();
+                target_smooth_y_.reset();
+                target_smooth_z_.reset();
+                target_smooth_last_time_        = ros::Time();
+                target_smooth_locked_cluster_id_ = 0;
                 {
                     std_msgs::String wp_cmd;
                     wp_cmd.data = "resume";
@@ -1515,6 +1615,12 @@ public:
      *   在 is_locked=true 后会持续更新 current_target_.pose,几帧后即可收敛到精确位置。
      */
     void triggerStrike() {
+        // 新锁定:reset One Euro Filter,确保首次位置不会被旧目标的 x_prev 污染
+        target_smooth_x_.reset();
+        target_smooth_y_.reset();
+        target_smooth_z_.reset();
+        target_smooth_last_time_        = ros::Time();
+        target_smooth_locked_cluster_id_ = 0;  // targetEstPoseCallback 会在下次回调时刷成新 cluster_id
         if (tracked_target_.latest) {
             current_target_.is_detected = true;
             current_target_.is_locked   = true;
@@ -1575,14 +1681,35 @@ public:
             return;
         }
 
+        // === Gating 1.5: UAV 必须已到达 skill_area_path 至少第一条 ===
+        //   102 SEARCH 跟踪起点:必须压线飞到第一条 skill_area 才开始锁/上报目标
+        //   (此前 bug:UAV 还在飞向第一条途中,phase=SKILL_AREA 一进 IN_TASK 立即锁目标)
+        //   waypoint_executor idx 语义: idx = "当前要飞的航点编号" (0=第一条还没到,
+        //                              1=第一条到了开始飞第二条) — 见 executeSegmentFlight:730-732
+        //   所以 skill_idx >= 1 = "至少到过第一条"
+        //   skill_total=0(空 skill_area)跳过此门控,按 SEARCH 无搜索区场景处理
+        if (!latest_wp_status_ || latest_wp_status_->skill_id != sr.msg.skill_id) {
+            return;
+        }
+        if (latest_wp_status_->skill_total > 0 &&
+            latest_wp_status_->skill_idx < 1) {
+            ROS_WARN_THROTTLE(2.0, "[MissionManager] Cluster callback gated: UAV not yet at "
+                              "first skill_area (skill_idx=%u / skill_total=%u), "
+                              "skip lock/report until arrival",
+                              latest_wp_status_->skill_idx, latest_wp_status_->skill_total);
+            return;
+        }
+
         // === Gating 2: 1Hz 节流 dedup 清理(避免每帧遍历) ===
         cleanupReportedClusters();
 
         // === 遍历所有 alive cluster,对每个独立应用 gating + 派发 ===
         for (const auto& cluster : msg->targets) {
-            // 黑名单(GS attack_cmd action=1/2 推入的 label-only 名单)
-            if (isTargetIgnored(cluster.label)) {
-                ROS_WARN_THROTTLE(2.0, "[MissionManager] Cluster[%lu] label=%s IGNORED (in blacklist)",
+            // 黑名单(GS attack_cmd action=1/2 推入的 label + 位置名单)
+            // 必须传 NED:同 label 不同物理目标不应被一起屏蔽(2026-07-16 改造)
+            if (isTargetIgnored(cluster.label, cluster.ned_x, cluster.ned_y)) {
+                ROS_WARN_THROTTLE(2.0, "[MissionManager] Cluster[%lu] label=%s IGNORED (in blacklist, "
+                                  "near ignored target within radius)",
                                   cluster.cluster_id, cluster.label.c_str());
                 continue;
             }
@@ -1845,16 +1972,18 @@ public:
      */
 
     /**
-     * 判断给定 label 是否在 ignored_targets_ 黑名单内
-     * 匹配规则(label-only, 2026-07 简化):
+     * 判断给定 label + 位置的 cluster 是否在 ignored_targets_ 黑名单内
+     * 匹配规则(label + 位置, 2026-07-16 改造):
      *   1. label 必须完全相等(string equality)
-     *   2. ignore_until > now
-     * 注:不再做位置匹配。DetectTarget.obj_lat/lon 实际是 UAV pose 占位,
-     *   扫描时 UAV 一边移动,位置匹配不稳;真实目标位置等云台+pose 反推(C 方案)
-     *   落地后再补空间维度。
+     *   2. ignore_until > now(未过期)
+     *   3. (cluster.ned_x, cluster.ned_y) 与黑名单项 (ned_x, ned_y) 的水平距离
+     *      ≤ 该黑名单项的 radius (按类别:人=10m, 车=20m)
+     * 目的:只屏蔽 GS action=1/2 指定的"那个物理目标",同 label 的其它物理目标
+     *   仍可被锁定/上报。修复前 label-only 方案会把同一 label 的所有目标屏蔽
+     *   (例如 action=2 暂存目标 1 后,目标 2 也被忽略,即使两者距离 15m+)。
      * 副作用:每次调用顺手清理过期条目(throttle 1Hz,避免每帧都遍历)
      */
-    bool isTargetIgnored(const std::string& label) {
+    bool isTargetIgnored(const std::string& label, double ned_x, double ned_y) {
         ros::Time now = ros::Time::now();
         // 节流清理过期项:1Hz 一次足够(ignore_until 精度秒级)
         if ((now - last_ignored_cleanup_).toSec() > 1.0) {
@@ -1875,7 +2004,13 @@ public:
         for (const auto& it : ignored_targets_) {
             if (it.label != label) continue;
             if (now >= it.ignore_until) continue;
-            return true;  // label 相等 + 未过期 → 忽略
+            // 水平距离平方 ≤ 半径平方(避免 sqrt)
+            double dx = ned_x - it.ned_x;
+            double dy = ned_y - it.ned_y;
+            double r2 = it.radius * it.radius;
+            if (dx * dx + dy * dy <= r2) {
+                return true;  // label 相等 + 未过期 + 位置接近 → 忽略
+            }
         }
         return false;
     }
@@ -1883,23 +2018,56 @@ public:
     /**
      * 推一条目标到 ignored_targets_ 黑名单
      * 由 attackCmdCallback 在 action=1/2 时调用
-     * @param dt 锁定的 DetectTarget (位置字段保留备用,目前不参与匹配)
+     * @param ned_x/ned_y/ned_alt  锁定瞬间物理目标的 NWU 坐标(米),用于后续位置匹配
      * @param yolo_label 锁定瞬间 YOLO 原始 string label
+     *
+     * 屏蔽半径按 label 类别自动取值:
+     *   - person 类 → ignore_radius_person_m_  (默认 10m)
+     *   - vehicle 类 → ignore_radius_car_m_     (默认 20m)
+     *   - 其它        → ignore_radius_default_m_ (默认 10m)
+     * 避免同一 label 的不同物理目标(例如两个 person 距离 15m+)被一起屏蔽。
      */
-    void addIgnoredTarget(const multi_uav_strike::DetectTarget& dt,
+    void addIgnoredTarget(double ned_x, double ned_y, double ned_alt,
                           const std::string& yolo_label) {
         IgnoredTarget entry;
-        entry.ned_x           = dt.obj_lat;   // 保留备用(C 方案启用时直接复用)
-        entry.ned_y           = dt.obj_lon;
-        entry.ned_alt         = dt.obj_alt;
+        entry.ned_x           = ned_x;
+        entry.ned_y           = ned_y;
+        entry.ned_alt         = ned_alt;
         entry.label           = yolo_label;
+        entry.radius          = getIgnoreRadiusForLabel(yolo_label);
         entry.ignore_set_time = ros::Time::now();
         entry.ignore_until    = entry.ignore_set_time + ros::Duration(ignored_retention_sec_);
         ignored_targets_.push_back(entry);
-        ROS_WARN("[MissionManager] Added to IGNORED blacklist (label=%s "
-                 "ttl=%.1fs, current_size=%zu)",
-                 entry.label.c_str(),
-                 ignored_retention_sec_, ignored_targets_.size());
+        ROS_WARN("[MissionManager] Added to IGNORED blacklist (label=%s pos=(%.2f,%.2f,%.2f) "
+                 "radius=%.1fm ttl=%.1fs, current_size=%zu)",
+                 entry.label.c_str(), entry.ned_x, entry.ned_y, entry.ned_alt,
+                 entry.radius, ignored_retention_sec_, ignored_targets_.size());
+    }
+
+    /**
+     * 按 YOLO label 返回屏蔽半径(米)
+     * 大小写不敏感,匹配规则:
+     *   - "person" / "human" / "pedestrian"  → ignore_radius_person_m_ (10m)
+     *   - "car" / "vehicle" / "truck" / "bus" / "van" → ignore_radius_car_m_ (20m)
+     *   - 其它        → ignore_radius_default_m_ (10m)
+     */
+    double getIgnoreRadiusForLabel(const std::string& label) const {
+        std::string lower = label;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c){ return std::tolower(c); });
+        if (lower.find("person")    != std::string::npos ||
+            lower.find("human")     != std::string::npos ||
+            lower.find("pedestrian")!= std::string::npos) {
+            return ignore_radius_person_m_;
+        }
+        if (lower.find("car")     != std::string::npos ||
+            lower.find("vehicle") != std::string::npos ||
+            lower.find("truck")   != std::string::npos ||
+            lower.find("bus")     != std::string::npos ||
+            lower.find("van")     != std::string::npos) {
+            return ignore_radius_car_m_;
+        }
+        return ignore_radius_default_m_;
     }
 
     /**
@@ -3107,19 +3275,31 @@ public:
                 // IN_TASK 分支不再需要主动轮询 strike/lock 决策,只等 attack_cmd 处理 SEARCH_TRACK 的确认。
                 // (代码保留注释,便于将来在此处加技能超时/计数等通用逻辑。)
 
-                // skill_type=101 集结合:等所有 expected_sns_ 到齐或 timeout
+                // skill_type=101 集结合:单 UAV 飞到集结点,或多 UAV 全部到齐,或 timeout
                 if (sr.msg.skill_type == 101) {
-                    bool all_arrived = checkAllUavsGathered();
-                    bool timed_out   = gather_timeout_ > 0.0 &&
-                                       (now - sr.gather_enter_time).toSec() > gather_timeout_;
-                    if (all_arrived || timed_out) {
+                    // 单 UAV 到达:本机已飞到 skill_area_path 最后一个航点
+                    //   修复:原 checkAllUavsGathered 永远 true → GATHER 跳过飞航点直接 COMPLETE
+                    //   现在单 UAV 真正压线飞到 skill_area 末点才算完
+                    //   skill_total>0 防护:GATHER 应保证至少 1 条 skill_area,空路径视为异常靠 timeout 兜底
+                    bool single_uav_arrived = latest_wp_status_ &&
+                        latest_wp_status_->skill_id == sr.msg.skill_id &&
+                        latest_wp_status_->skill_total > 0 &&
+                        latest_wp_status_->skill_idx >= latest_wp_status_->skill_total;
+                    // 多 UAV 同步:所有 expected_sns_ 都已到达各自集结点(Phase 7 接入 comm_node 后实现)
+                    bool all_uavs_arrived = checkAllUavsGathered();
+                    bool timed_out = gather_timeout_ > 0.0 &&
+                        (now - sr.gather_enter_time).toSec() > gather_timeout_;
+                    if (single_uav_arrived || all_uavs_arrived || timed_out) {
                         sr.state = SkillState::EXIT_PENDING;
                         sr.state_enter_time = now;
                         sr.last_event = timed_out ?
                             "IN_TASK to EXIT_PENDING (gather timeout)" :
-                            "IN_TASK to EXIT_PENDING (gather complete)";
+                            single_uav_arrived ? "IN_TASK to EXIT_PENDING (single UAV at gather point)" :
+                            "IN_TASK to EXIT_PENDING (all UAVs gathered)";
                         ROS_WARN("[MissionManager] Skill[101] Gather %s",
-                                 timed_out ? "TIMEOUT" : "COMPLETE");
+                                 timed_out ? "TIMEOUT" :
+                                 single_uav_arrived ? "ARRIVED (single UAV at last skill_area)" :
+                                 "COMPLETE (all UAVs)");
                     }
                     // 发本机 gather_status(其它 UAV 看)
                     publishGatherStatus();
@@ -3208,17 +3388,18 @@ public:
     }
 
     /**
-     * 101 集结 — 检查 expected_sns_ 是否都到了
-     * 简化版本:从 heartbeats_ 缓存找,本机到达则总是 true
+     * 101 集结 — 多 UAV 同步检查
+     * 单 UAV 场景(expected_sns_ 空):返回 false,让 single_uav_arrived 处理本机到达判定
+     * 多 UAV 场景(expected_sns_ 非空):Phase 7 之前不查心跳,返回 false(各 UAV 靠 single_uav_arrived 自行退出)
+     *   Phase 7 会接 comm_node 的 inter_uav/gather_status,从 heartbeats_ 缓存查所有 expected_sns_ 是否都已上报 arrived
      */
     bool checkAllUavsGathered() const {
         if (expected_sns_.empty()) {
-            // 没配置期望列表,默认自己到了就算完成
-            return true;
+            // 单 UAV:不在这儿返回 true(否则会跳过 single_uav_arrived,立即 COMPLETE)
+            return false;
         }
-        // 当前实现:不查心跳,只检查本机 IN_TASK 即可
-        // (Phase 7 会接 comm_node 的 inter_uav/gather_status)
-        return true;
+        // TODO Phase 7:遍历 heartbeats_,检查 expected_sns_ 内所有 UAV 都已上报 gather arrived
+        return false;
     }
 
     /**
