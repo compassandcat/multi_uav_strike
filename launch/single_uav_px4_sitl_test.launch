@@ -47,7 +47,7 @@
   <group ns="$(arg uav_name)">
     <include file="$(find mavros)/launch/px4.launch">
       <arg name="fcu_url" value="udp://:14540@127.0.0.1:14580" />
-      <arg name="tgt_system" value="1" />
+      <arg name="tgt_system" value="$(optenv TZS_FCU_ID 1)" />
     </include>
   </group>
 

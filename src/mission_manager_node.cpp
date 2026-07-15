@@ -276,6 +276,13 @@ private:
     ros::Timer avoidance_timer_;
     ros::Timer mission_state_timer_;   // Phase 2: 1Hz MissionState 定频上报
     ros::Timer skill_advance_timer_;   // Phase 3: Skill 状态机推进(独立频率)
+    ros::Timer tracking_state_timer_;  // 跟踪锁定期间定频发 tracking_state(state=1) 给 GCS
+
+    // tracking_state 上报频率(Hz,协议 §6 / 补充规范 §5)。
+    //   跟踪中: 5Hz — GCS 实时闪烁
+    //   未跟踪: 1Hz — 降频保活,让 GCS 知道 UAV 在线但仍能省带宽
+    static constexpr double TRACKING_STATE_RATE_HZ      = 5.0;
+    static constexpr double TRACKING_STATE_IDLE_RATE_HZ = 1.0;
 
     // ============== 状态 ==============
     WorkMode current_work_mode_;
@@ -807,6 +814,13 @@ public:
         skill_advance_timer_ = nh_.createTimer(
             ros::Duration(0.1),
             &MissionManager::skillAdvanceTimerCallback, this);
+
+        // === TrackingState 周期上报 — 协议 §6 ===
+        // GCS 端要连续接收才会高亮 UI。timer 启动时按"未跟踪"1Hz 起步,
+        // 跟踪中时 callback 内 setPeriod(5Hz) 切换。
+        tracking_state_timer_ = nh_.createTimer(
+            ros::Duration(1.0 / TRACKING_STATE_IDLE_RATE_HZ),
+            &MissionManager::trackingStateTimerCallback, this);
     }
 
     void initTargetState() {
@@ -1244,7 +1258,7 @@ public:
 
         if (!preserve_track) {
             tracked_target_.is_valid = false;
-            tracked_target_.lock_state = TrackLockState::NOT_LOCKED;
+            setLockState(TrackLockState::NOT_LOCKED);
         } else {
             ROS_WARN("[MissionManager] TaskFlow first skill is Attack(105) "
                      "(device_id=%u). Preserving current track lock.",
@@ -1252,7 +1266,10 @@ public:
             // current_target_ 不在这里同步 —— Attack skill 推到 waypoint_executor 后
             // 自身会带目标坐标下来覆盖,避免此处重复写造成姿态不一致
         }
-        tracked_target_.lock_state = TrackLockState::NOT_LOCKED;
+        // 兜底清空:此处 setLockState 早 return (因新 flow 总是 NOT_LOCKED→NOT_LOCKED,
+        // 或前面 preserve_track=true 时 lock_state 保持; 总之上面已处理,这里用 setLockState
+        // 兜底以保持所有清空路径统一)。
+        setLockState(TrackLockState::NOT_LOCKED);
     }
 
     /**
@@ -1423,7 +1440,7 @@ public:
                 //   MissionState 上报里 GS 看到的应是航点跟踪阶段,而非 guidance)
                 current_phase_ = MissionPhase::PHASE_WAYPOINT_FOLLOW;
                 tracked_target_.is_valid = false;
-                tracked_target_.lock_state = TrackLockState::NOT_LOCKED;
+                setLockState(TrackLockState::NOT_LOCKED);
                 return;
             }
             case 2: {
@@ -1454,7 +1471,7 @@ public:
                 }
                 current_phase_ = MissionPhase::PHASE_WAYPOINT_FOLLOW;
                 tracked_target_.is_valid = false;
-                tracked_target_.lock_state = TrackLockState::NOT_LOCKED;
+                setLockState(TrackLockState::NOT_LOCKED);
                 return;
             }
             default:
@@ -1463,8 +1480,9 @@ public:
         }
 
         // 无论打还是暂存,清掉锁定态(下一次识别需要重新等确认)
+        // 注:action=1/2 已在前面的 case 里 return,这里只到 action=0(打)路径
         tracked_target_.is_valid = false;
-        tracked_target_.lock_state = TrackLockState::NOT_LOCKED;
+        setLockState(TrackLockState::NOT_LOCKED);
     }
 
     /**
@@ -1552,7 +1570,8 @@ public:
                 // 转移到新 cluster(可能 cluster_id 与上帧不同,只要 label 一致就 transfer)
                 multi_uav_strike::DetectTarget dt = buildDetectTarget(cluster, /*target_type=*/3);
                 tracked_target_.latest     = boost::make_shared<multi_uav_strike::DetectTarget>(dt);
-                tracked_target_.lock_state = TrackLockState::LOCKED_WAIT_CONFIRM;  // 仍等 attack_cmd
+                // 仍是 LOCKED_WAIT_CONFIRM → setLockState 早 return,不发重复 state=2
+                setLockState(TrackLockState::LOCKED_WAIT_CONFIRM);
                 tracked_target_.locked_at  = ros::Time::now();
                 // 更新 locked_cluster_* 用于 triggerStrike
                 locked_cluster_ned_x_   = cluster.ned_x;
@@ -1602,17 +1621,10 @@ public:
                 tracked_target_.is_valid   = true;
                 tracked_target_.latest     = dt_ptr;
                 tracked_target_.yolo_label = cluster.label;  // 字段名沿用,语义改为 cluster label
-                tracked_target_.lock_state = TrackLockState::LOCKED_WAIT_CONFIRM;
+                // setLockState 内部在 NOT_LOCKED→LOCKED_* 转移时自动发一帧 state=2
+                // (识别未跟踪,等 GCS ack);之后由 tracking_state_timer 持续发 state=1。
+                setLockState(TrackLockState::LOCKED_WAIT_CONFIRM);
                 tracked_target_.locked_at  = ros::Time::now();
-
-                multi_uav_strike::TrackingState ts;
-                ts.state       = 1;        // 1 = 跟踪中
-                ts.flag        = 0;
-                ts.target_dist = 50.0;     // 占位(协议 §9.4)
-                ts.target_lat  = dt.obj_lat;
-                ts.target_lon  = dt.obj_lon;
-                ts.target_alt  = dt.obj_alt;
-                tracking_state_pub_.publish(ts);
 
                 reported_clusters_[cluster.cluster_id] = -1;  // -1 = 仅锁未上报
                 guidance_speed_ = sr.msg.task_speed;
@@ -1629,7 +1641,8 @@ public:
                 tracked_target_.is_valid   = true;
                 tracked_target_.latest     = dt_ptr;
                 tracked_target_.yolo_label = cluster.label;
-                tracked_target_.lock_state = TrackLockState::LOCKED_AUTO;
+                // setLockState 内部 NOT_LOCKED→LOCKED_AUTO 转移时自动发 state=2
+                setLockState(TrackLockState::LOCKED_AUTO);
                 tracked_target_.locked_at  = ros::Time::now();
 
                 detect_target_pub_.publish(dt);
@@ -2088,12 +2101,38 @@ public:
                 if (triggerOffboardAndArm()) {
                     takeoff_state_ = TakeoffState::TAKEOFF_TAKEOFF_EXEC;
                     takeoff_start_time_ = ros::Time::now();
+
+                    // ===== 决定本次起飞爬升速率 =====
+                    // 优先取当前 takeoff skill 的 Skill.takeoff_speed(GS 在 task_flow
+                    // 里下发),对 skill_type=100(弹射)/106(地面)均生效。夹到 [1, 5] m/s:
+                    //   - 下限 1:避免风大/弹射后初始姿态不稳时爬升过慢、过渡时间过长
+                    //   - 上限 5:PX4 MPC_VEL_UP_MAX(~5 m/s)安全区,避免速度饱和+overshoot
+                    // skill 字段 <= 0 或当前 skill 非起飞 → 退化为私有 param ~takeoff_climb_rate_
+                    constexpr double MIN_CLIMB = 1.0;
+                    constexpr double MAX_CLIMB = 5.0;
+                    double effective_climb = takeoff_climb_rate_;  // 默认兜底
+                    if (current_skill_index_ < skill_queue_.size()) {
+                        const auto& tk = skill_queue_[current_skill_index_].msg;
+                        if (tk.skill_type == 100 || tk.skill_type == 106) {
+                            if (tk.takeoff_speed > 0.0f) {
+                                double s = static_cast<double>(tk.takeoff_speed);
+                                if (s < MIN_CLIMB) s = MIN_CLIMB;
+                                if (s > MAX_CLIMB) s = MAX_CLIMB;
+                                effective_climb = s;
+                                ROS_INFO("[MissionManager] Takeoff climb rate from skill.takeoff_speed=%.2f "
+                                         "(clamped to [%.1f, %.1f] → %.2f m/s)",
+                                         tk.takeoff_speed, MIN_CLIMB, MAX_CLIMB, effective_climb);
+                            }
+                        }
+                    }
+                    takeoff_climb_rate_ = effective_climb;  // 后续 TAKEOFF_TAKEOFF_EXEC 每 tick 用此值斜坡推
+
                     // ===== 不再阶跃跳到目标高度 =====
                     // 原因: 0.5m → 30m 的阶跃会让 PX4 速度饱和(MPC_VEL_UP_MAX),真机上引起
                     //       40m 级别 overshoot,然后快速下落,衔接 waypoint 时有明显下沉。
                     // 改为: 记录当前实际高度作为斜坡起点,每个 tick 按 takeoff_climb_rate_
-                    //       (默认 3 m/s)线性推高,直到达到 takeoff_altitude_。PX4 在斜坡模式
-                    //       下稳态跟踪,几乎不超调。
+                    //       线性推高,直到达到 takeoff_altitude_。PX4 在斜坡模式下稳态跟踪,
+                    //       几乎不超调。
                     takeoff_start_alt_ = -current_pose_.pose.position.z;
                     takeoff_setpoint_.pose.position.z = takeoff_start_alt_;
                     ROS_WARN("[MissionManager] >>>> OFFBOARD + ARM SUCCESS, takeoff climb started "
@@ -3430,6 +3469,70 @@ public:
             case MissionPhase::PHASE_HOLDING:          return "HOLDING";
             default: return "UNKNOWN";
         }
+    }
+
+    // ===================================================================
+    // TrackingState 上报 — 协议 §6 / 补充规范 §5
+    // 协议只定义两个状态:0=未跟踪, 1=跟踪中。
+    // GCS 端要"连续接收"才会高亮 UI、闪烁提示,故机载端持续发:
+    //   跟踪中  → 5Hz  state=1
+    //   未跟踪  → 1Hz  state=0(保活 + 让 GCS 知道 UAV 在线)
+    // ===================================================================
+
+    /**
+     * 构造并 publish 一帧 TrackingState。
+     * state 严格按协议 §6 编码:0=未跟踪, 1=跟踪中。
+     * 跟踪中时填当前 locked 目标的 GPS;未跟踪时位置字段填 0(协议 §6 未定义).
+     */
+    void publishTrackingState(uint8_t state) {
+        multi_uav_strike::TrackingState ts;
+        ts.state       = state;
+        ts.flag        = 0;
+        ts.target_dist = 0.0f;
+        ts.target_lat  = 0.0;
+        ts.target_lon  = 0.0;
+        ts.target_alt  = 0.0;
+        // 跟踪中:用 latest 的目标位置填 GPS 字段
+        if (state == 1 && tracked_target_.is_valid && tracked_target_.latest) {
+            ts.target_dist = 50.0f;  // 占位(协议 §9.4)
+            ts.target_lat  = tracked_target_.latest->obj_lat;
+            ts.target_lon  = tracked_target_.latest->obj_lon;
+            ts.target_alt  = tracked_target_.latest->obj_alt;
+        }
+        tracking_state_pub_.publish(ts);
+    }
+
+    /**
+     * 集中设置 lock_state。
+     * 不在这里 publish 任何 TrackingState — tracking_state 的发送完全由 timer 驱动
+     * (锁定→5Hz state=1,未锁→1Hz state=0),保证 GCS 持续有流。
+     * 把所有 6+ 处 lock_state 赋值统一收敛到这里,便于以后扩展。
+     */
+    void setLockState(TrackLockState new_state) {
+        if (tracked_target_.lock_state == new_state) return;  // 状态没变,无副作用
+        tracked_target_.lock_state = new_state;
+    }
+
+    /**
+     * 周期 timer:GCS 端要"连续接收"才显示"跟踪中"。
+     *   仅在 SEARCH_TRACK 模式下发送(协议 §6:用于搜索跟踪)。
+     *     锁定 (LOCKED_WAIT_CONFIRM / LOCKED_AUTO) → 5Hz 发 state=1
+     *     未锁定                          → 1Hz 发 state=0(降频保活)
+     *   其他模式(IDLE / GATHER / RETURN / etc.) → 不发
+     * 频率切换:每 tick 都 setPeriod(1-5Hz 时可忽略开销;ROS Noetic ros::Timer 无
+     *   period() getter,无法在外部判断"是否已切换",直接调用最简单)。
+     */
+    void trackingStateTimerCallback(const ros::TimerEvent&) {
+        // 只在 SEARCH_TRACK 模式下上报,其余模式一律不发
+        if (current_work_mode_ != WorkMode::SEARCH_TRACK) {
+            return;
+        }
+        const bool is_locked = (tracked_target_.lock_state == TrackLockState::LOCKED_WAIT_CONFIRM ||
+                                tracked_target_.lock_state == TrackLockState::LOCKED_AUTO);
+        const ros::Duration want_period(is_locked ? (1.0 / TRACKING_STATE_RATE_HZ)        // 5Hz
+                                                  : (1.0 / TRACKING_STATE_IDLE_RATE_HZ));  // 1Hz
+        tracking_state_timer_.setPeriod(want_period);
+        publishTrackingState(is_locked ? 1 : 0);
     }
 
     std::string taskStatusToString() {

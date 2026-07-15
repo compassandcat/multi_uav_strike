@@ -1,12 +1,11 @@
-# TRACKING_STATE(协议 43000)上报
-# 仅在 SEARCH_TRACK 模式下,识别到目标进入跟踪状态时发
-uint8   state
-# state 编码:
-#   0 = 未开始
+# TRACKING_STATE(协议 43000 / TZS §6)上报
+# 协议只定义两个状态值:
+#   0 = 未跟踪
 #   1 = 跟踪中
-#   2 = 已识别未跟踪(等待地面站确认)
-#   3 = 完成(攻击完成或主动退出)
-#   4 = 取消(忽略 / 暂存)
+# GCS 端要"连续接收"才会高亮 UI、闪烁提示 — 故机载端持续发:
+#   跟踪中: 5Hz 发 state=1
+#   未跟踪: 1Hz 发 state=0(保活 + 让 GCS 知道 UAV 在线)
+uint8   state
 uint8   flag
 float32 target_dist
 float64 target_lat

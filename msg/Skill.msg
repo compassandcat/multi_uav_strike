@@ -31,6 +31,14 @@ uint8    takeoff_subtype
 # skill_type != 100 时此字段忽略
 float32  takeoff_altitude
 
+# 仅 skill_type=100 或 106 (地面/弹射起飞)时有效
+# 起飞爬升速度(米/秒)。mission_manager 内部夹在 [1, 5]:
+#   下限 1 — 避免弹射/弱风场景下爬升过慢、过渡时间过长
+#   上限 5 — PX4 MPC_VEL_UP_MAX(~5 m/s)安全区,避免速度饱和+overshoot
+# 0 或负值 → 使用 mission_manager 私有 param ~takeoff_climb_rate 兜底
+# skill_type != 100/106 时此字段忽略
+float32  takeoff_speed
+
 # ============================================================================
 # 任务优先级 — 数值越大优先级越高
 #

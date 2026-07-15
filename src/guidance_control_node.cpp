@@ -12,6 +12,7 @@
 #include <mavros_msgs/HomePosition.h>
 #include <visualization_msgs/Marker.h>
 #include <limits>
+#include <cmath>
 #include <Eigen/Eigen>
 
 #include "multi_uav_strike/guidance_strategies.h"
@@ -630,22 +631,24 @@ public:
                     // 基于视场角pitch的高度控制
                     // pitch大（绝对值）= 俯冲阶段 = 允许下降
                     // pitch小 = 接近阶段 = 限制下降
-                    double pitch = current_los_angle_.y;  // 来自LOS（NED下俯仰角）
-                    double pitch_threshold = 0.5f;  // ~0.5rad，小于此值限制下降
-                    double current_alt = current_uav_pose_.pose.position.z;
+                    //
+                    // 原来用硬 if/else 在 pitch_threshold=0.5rad 边界,|pitch| 跨阈值时
+                    //   vz 会从"完整 desired_z"瞬间跳到"被钳到 0",rqt_plot 上能看到
+                    //   单帧 vz 跳 0 → vel_cmd 视觉抖。
+                    // 改为:在阈值附近做平滑过渡(tanh),避免硬开关颠簸。
+                    double pitch = current_los_angle_.y;                         // NED 下俯仰角
+                    const double pitch_threshold = 0.5;                          // rad,跨此值允许全速下降
+                    const double transition_width = 0.1;                         // rad,过渡带宽
+                    const double max_descent_when_level = 0.0;                   // 接近阶段最大下沉速度 (m/s,NED D+)
 
-                    if (fabs(pitch) > pitch_threshold) {
-                        // pitch大或高度已低，正常下降
-                        vel_cmd.linear.z = -cmd.velocity.z();
-                    } else {
-                        // pitch小且高度还高，限制下沉
-                        double down_limit = -0.0;  // 最大下沉 0.1 m/s
-                        double desired_z = -cmd.velocity.z();
-                        if (desired_z > down_limit) {
-                            desired_z = down_limit;
-                        }
-                        vel_cmd.linear.z = desired_z;
-                    }
+                    // smooth_weight ∈ [0, 1]:
+                    //   |pitch| >> pitch_threshold → ≈1 (放行 desired_z)
+                    //   |pitch| << pitch_threshold → ≈0 (夹到 max_descent_when_level)
+                    double smooth_weight = 0.5 * (std::tanh(
+                        (std::fabs(pitch) - pitch_threshold) / transition_width) + 1.0);
+                    double desired_z = -cmd.velocity.z();  // >0 = 下沉(NED)
+                    if (desired_z < max_descent_when_level) desired_z = max_descent_when_level;
+                    vel_cmd.linear.z = smooth_weight * desired_z;
 
                     vel_cmd.angular.x = 0.0;
                     vel_cmd.angular.y = 0.0;
