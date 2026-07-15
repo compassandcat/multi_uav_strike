@@ -256,14 +256,24 @@ public:
             current_uav_pose_.pose.orientation.y = -msg->pose.orientation.y;
             current_uav_pose_.pose.orientation.z = -msg->pose.orientation.z;
         } else {
-            // ENU → NWU
+            // 位置: ENU → NWU
             current_uav_pose_.pose.position.x =  msg->pose.position.y;
             current_uav_pose_.pose.position.y = -msg->pose.position.x;
             current_uav_pose_.pose.position.z =  msg->pose.position.z;
-            current_uav_pose_.pose.orientation.w =  msg->pose.orientation.w;
-            current_uav_pose_.pose.orientation.x =  msg->pose.orientation.x;
-            current_uav_pose_.pose.orientation.y = -msg->pose.orientation.y;
-            current_uav_pose_.pose.orientation.z = -msg->pose.orientation.z;
+            // 四元数: mavros(ENU 世界 + FRD 机体) → 内部(NWU 世界 + FLU 机体)
+            //   q_internal = q_W · q_mavros · q_B
+            //   q_W = (√2/2, 0, 0, -√2/2)  ENU→NWU: 绕世界 Z 旋转 -90°
+            //   q_B = (0, 1, 0, 0)          FRD→FLU: 绕机体 X 旋转 180°
+            // 与 gimbal_simulator_node.cpp::uavPoseCallback 完全一致,确保 target_estimator
+            // 反投影用的 R_world_cam 与 gimbal forward projection 用的 R_world_cam 一致。
+            // 旧版简单取反 (x, y, z, w)→(x, -y, -z, w) 是绕世界 X 转 180°,不是 ENU→NWU,
+            // 会让 projectBboxToGround 的射线方向错误,导致 cluster 永远建不出来。
+            const double kSqrtHalf = 0.7071067811865475;
+            const auto& qe = msg->pose.orientation;
+            current_uav_pose_.pose.orientation.w = -kSqrtHalf * (qe.x + qe.y);
+            current_uav_pose_.pose.orientation.x =  kSqrtHalf * (qe.w + qe.z);
+            current_uav_pose_.pose.orientation.y =  kSqrtHalf * (qe.z - qe.w);
+            current_uav_pose_.pose.orientation.z =  kSqrtHalf * (qe.x - qe.y);
         }
         current_uav_pose_.header.stamp = msg->header.stamp;
         is_uav_pose_received_ = true;
