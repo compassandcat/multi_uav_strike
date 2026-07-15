@@ -83,6 +83,8 @@
 #include "multi_uav_strike/WaypointStatus.h"
 #include "multi_uav_strike/UavGatherStatus.h"
 
+#include <std_msgs/UInt64.h>   // mission/primary_target (cluster_id, 主目标) → target_estimator
+
 // 工作模式枚举
 // WorkMode 只表达「在任务区域内做什么」(对应 TZS MAV_CMD_SET_WORKMODE 语义)。
 // 起飞/落地/返航/集结等阶段不归 WorkMode 管,由 MissionPhase 表达。
@@ -270,6 +272,8 @@ private:
     ros::Publisher tracking_state_pub_;      // multi_uav_strike/TrackingState
     ros::Publisher waypoint_skill_pub_;      // 向 executor 下发 Skill(分段航点)
     ros::Publisher gather_status_pub_;       // 集结多机状态(Phase 7)
+    ros::Publisher primary_target_pub_;      // 主目标 cluster_id → target_estimator (UInt64)
+                                             // 0 = mission 未指定主目标(estimator 回退最高置信度)
 
     // ============== 定时器 ==============
     ros::Timer mission_timer_;
@@ -794,6 +798,13 @@ public:
         // 集结多机状态(Phase 7)
         gather_status_pub_ = nh_.advertise<multi_uav_strike::UavGatherStatus>(
             "inter_uav/gather_status", 10);
+
+        // 主目标 cluster_id → target_estimator。
+        // 多目标改造: estimator 不再自己挑最高置信度,而是 mission_manager
+        // 显式指定"正在交战的那个 cluster_id",guidance 由此锚定,避免
+        // 最高置信度在目标间跳变。
+        primary_target_pub_ = nh_.advertise<std_msgs::UInt64>(
+            "mission/primary_target", 10);
     }
 
     void initTimers() {
@@ -1156,6 +1167,8 @@ public:
         locked_cluster_ned_y_  = 0.0;
         locked_cluster_ned_alt_ = 0.0;
         locked_cluster_time_   = ros::Time();
+        // 多目标: 新 flow 到达 → 清主目标,estimator 回退最高置信度
+        publishPrimaryTarget(0);
 
         // 重置航点接收标志(避免前序 flow 的 is_waypoints_received_ 残留误导 performTakeoffHandoff)
         is_waypoints_received_ = false;
@@ -1441,6 +1454,8 @@ public:
                 current_phase_ = MissionPhase::PHASE_WAYPOINT_FOLLOW;
                 tracked_target_.is_valid = false;
                 setLockState(TrackLockState::NOT_LOCKED);
+                // 多目标: 忽略主目标后,清掉 primary;estimator 在下一帧重新锚定下一个
+                publishPrimaryTarget(0);
                 return;
             }
             case 2: {
@@ -1472,6 +1487,8 @@ public:
                 current_phase_ = MissionPhase::PHASE_WAYPOINT_FOLLOW;
                 tracked_target_.is_valid = false;
                 setLockState(TrackLockState::NOT_LOCKED);
+                // 多目标: 暂存后清 primary,estimator 在下一帧重新锚定下一个
+                publishPrimaryTarget(0);
                 return;
             }
             default:
@@ -1483,6 +1500,9 @@ public:
         // 注:action=1/2 已在前面的 case 里 return,这里只到 action=0(打)路径
         tracked_target_.is_valid = false;
         setLockState(TrackLockState::NOT_LOCKED);
+        // 多目标: 打完/暂存后清主目标,estimator 在下一帧 cluster_states 重新锚定
+        //   下一个未上报的 cluster(若有)
+        publishPrimaryTarget(0);
     }
 
     /**
@@ -1520,6 +1540,15 @@ public:
      *   SEARCH_ONLY  + 当前 skill IN_TASK + 同 cluster 未上报过: 上报 DetectTarget(type=3 普通搜索目标)一次
      *   SEARCH_TRACK + 当前 skill IN_TASK + 同 cluster 未上报过: 锁目标 + 发布 TrackingState(state=1,等地面站 attack_cmd)
      *   SEARCH_STRIKE + 当前 skill IN_TASK + 同 cluster 未上报过: 上报 DetectTarget(type=1 攻击目标) + 触发 strike
+     *
+     * 多目标改造 (2026-07):
+     *   - 同一 cluster_states 回调里可能含多个 cluster。SEARCH_TRACK/STRIKE 模式下,
+     *     只有**首个**未被报告过、且未被黑名单的 cluster 会被锁定为主目标
+     *     (或转移自同 label);其余 cluster 仅上报 DetectTarget(type=3) 给 GS,不动 tracked_target_。
+     *   - 主目标被选定/转移时,发布 mission/primary_target (UInt64 cluster_id),
+     *     target_estimator 据此锚定 guidance 的 target_estimated_pose,避免最高置信度跳变。
+     *   - tracked_target_ / locked_cluster_* / current_target_ 仍保持**单目标**语义,代表主目标。
+     *   - 打击仍是单机单目标:打完一个 → 状态复位 → 下一帧主目标切下一个未打击 cluster。
      *
      * 关键 gating(同原 clusterEventCallback):
      *   1. work_mode != IDLE
@@ -1581,11 +1610,33 @@ public:
                 locked_cluster_time_    = ros::Time::now();
                 // 当前 cluster_id 也加入 reported(避免同一 cluster 反复 transfer 触发 startGuidanceApproach)
                 reported_clusters_[cluster.cluster_id] = -1;
+                // === 多目标: 通知 estimator 主目标 cluster_id 转移 ===
+                publishPrimaryTarget(cluster.cluster_id);
                 continue;  // 本次循环内此 cluster 处理完,不去 dispatch
             }
 
             // dedup — 同一 cluster_id 同 task_flow 只处理一次
             if (reported_clusters_.count(cluster.cluster_id)) {
+                continue;
+            }
+
+            // === 多目标: SEARCH_TRACK/STRIKE 模式若已锁定(主目标已就位),
+            //     其他新出现的 cluster 仅被动上报 type=3 给 GS,不再覆盖 tracked_target_。
+            //     这样保证一帧里 N 个目标时:UAV 只打一个,GS 能看到 N 个。
+            if ((current_work_mode_ == WorkMode::SEARCH_TRACK ||
+                 current_work_mode_ == WorkMode::SEARCH_STRIKE) &&
+                tracked_target_.is_valid) {
+                multi_uav_strike::DetectTarget dt = buildDetectTarget(cluster, /*target_type=*/3);
+                detect_target_pub_.publish(dt);
+                {
+                    multi_uav_strike::DetectTargets batch;
+                    batch.targets.push_back(dt);
+                    detect_targets_pub_.publish(batch);
+                }
+                reported_clusters_[cluster.cluster_id] = 3;
+                ROS_WARN("[MissionManager] Cluster[%lu] label=%s %s → non-primary, published type=3",
+                         cluster.cluster_id, cluster.label.c_str(),
+                         (current_work_mode_ == WorkMode::SEARCH_TRACK ? "SEARCH_TRACK" : "SEARCH_STRIKE"));
                 continue;
             }
 
@@ -1629,7 +1680,9 @@ public:
                 reported_clusters_[cluster.cluster_id] = -1;  // -1 = 仅锁未上报
                 guidance_speed_ = sr.msg.task_speed;
                 startGuidanceApproach();
-                ROS_WARN("[MissionManager] Cluster[%lu] label=%s SEARCH_TRACK → locked, "
+                // === 多目标: 通知 estimator 主目标 cluster_id ===
+                publishPrimaryTarget(cluster.cluster_id);
+                ROS_WARN("[MissionManager] Cluster[%lu] label=%s SEARCH_TRACK → locked (primary), "
                          "tracking_state published, waiting for attack_cmd",
                          cluster.cluster_id, cluster.label.c_str());
                 break;
@@ -1654,8 +1707,10 @@ public:
                 reported_clusters_[cluster.cluster_id] = 1;
                 guidance_speed_ = sr.msg.task_speed;
                 triggerStrike();
+                // === 多目标: 通知 estimator 主目标 cluster_id ===
+                publishPrimaryTarget(cluster.cluster_id);
                 ROS_WARN("[MissionManager] Cluster[%lu] label=%s SEARCH_STRIKE → "
-                         "strike + published type=1",
+                         "strike + published type=1 (primary)",
                          cluster.cluster_id, cluster.label.c_str());
                 break;
             }
@@ -1664,6 +1719,16 @@ public:
                 break;
             }  // end switch (current_work_mode_)
         }  // end for each cluster
+    }
+
+    /**
+     * 通知 target_estimator 当前主目标 cluster_id。
+     * 0 = 未指定,estimator 回退最高置信度。
+     */
+    void publishPrimaryTarget(uint64_t cluster_id) {
+        std_msgs::UInt64 msg;
+        msg.data = cluster_id;
+        primary_target_pub_.publish(msg);
     }
 
     /**

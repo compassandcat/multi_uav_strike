@@ -1,36 +1,41 @@
 # ============================================================================
-# target_estimator_node 专属参数 (聚类 + LOS 反投影)
+# target_estimator_node 专属参数 (多实例聚类 + per-bbox 反投影)
 # 共享参数 (use_sim) 在 common.yaml 中定义,由 launch 加载。
 #
-# 工作流:
-#   1. gimbal_simulator_node 在每帧 YoloDetection 中给出 is_in_fov + LOS
-#   2. target_estimator_node 把 LOS 反投影到地平面 (z=target_z_prior) → (ned_x, ned_y)
-#   3. 找最近的同 label cluster (距离 ≤ merge_radius_m_) 合并 → EMA 平滑位置
-#   4. 没命中 → 新建 cluster,并 publish 一次 cluster_event
-#   5. 10Hz 周期 publish cluster_states (所有 alive cluster) + best cluster GPS
+# 工作流 (2026-07 多目标改造):
+#   1. gimbal_simulator_node 每帧发布 YoloDetections (batch) — 每条对应一个 FOV 内目标
+#   2. target_estimator_node 取每条 detection 的 bbox 中心,经 camera 几何反投影到
+#      地面 (z=target_z_prior) → (ned_x, ned_y)
+#   3. 遍历 clusters_, 找 label 相同 + 2D 距离 ≤ merge_radius_m_ 的最近 cluster 合并;
+#      没命中 → 新建 cluster,并 publish 一次 cluster_event (mission_manager 据此上报 GS)
+#   4. 10Hz 周期 publish cluster_states (所有 alive cluster) + primary cluster GPS/pose
+#   5. primary = mission/primary_target 指定的 cluster_id; 0 或找不到 → 回退最高置信度
 #
-# 历史: 旧版本是粒子滤波 (500 particles, num_particles/process_noise/...), 已被聚类替代。
+# 反投影与 gimbal_simulator 共用相机模型,所以下面的 image_width/height/fov_h/fov_v
+# 必须与 gimbal_simulator.yaml 完全一致。
 # ============================================================================
 
 # ---- 聚类参数 ----
 merge_radius_m: 10.0          # 2D 距离 ≤ 此值 → 合并到已有 cluster (米)
-                              # 聚类半径只用于 target_estimator 内部 cluster 合并,
-                              # 不用于 mission_manager 的 lock 决策 — SEARCH_TRACK 模式下,
-                              # lock 跟 label 走,不跟 cluster_id(见 clusterStatesCallback)
+                              # 同 label + 同区域才算同一实例;不同类别天然不会合并。
 cluster_ttl_sec: 60.0         # 多久无新命中 → 释放 cluster (秒)
 ema_alpha: 0.6                # 新观测权重(0=完全保留旧值, 1=完全用新值)
 target_z_prior: 0.0           # 反投影 z 假设(地面目标 = 0;空中目标可设 UAV 当前高度)
 
+# ---- 相机几何 (必须与 gimbal_simulator.yaml 同步) ----
+image_width: 1920
+image_height: 1080
+fov_h_deg: 66.0               # 水平 FOV(度)
+fov_v_deg: 52.0               # 垂直 FOV(度);0 = 按方形像素从 fov_h 推导
+
 # ---- 发布频率 ----
-states_publish_freq: 10.0     # cluster_states / target_estimated_marker / target_estimated_gps 发布频率 (Hz)
+states_publish_freq: 10.0     # cluster_states / target_estimated_marker / target_estimated_gps/pose 发布频率 (Hz)
 cleanup_freq: 1.0             # 过期 cluster 清理频率 (Hz)
 
 # ---- UAV Pose 输入 ----
-# 仿真: 走 mavros 仿真节点给的 pose; 真机: 走 mavros/local_position/pose
-# (use_sim=true → "quad/pose", use_sim=false → "mavros/local_position/pose")
 uav_pose_topic: "mavros/local_position/pose"
 
-# ---- 标记颜色 (RViz Marker) ----
+# ---- 标记颜色 (RViz Marker, TextViewFacing 显示 label) ----
 est_marker_r: 1.0
 est_marker_g: 1.0
 est_marker_b: 0.0

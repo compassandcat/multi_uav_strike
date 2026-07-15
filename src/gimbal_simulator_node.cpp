@@ -17,6 +17,9 @@
 #include <sstream>
 
 #include "multi_uav_strike/YoloDetection.h"
+#include "multi_uav_strike/YoloDetections.h"
+#include "multi_uav_strike/SimTarget.h"
+#include "multi_uav_strike/SimTargets.h"
 
 using namespace std;
 
@@ -56,7 +59,8 @@ private:
     ros::Publisher los_angle_pub_;     // 目标 LOS (保持)
     ros::Publisher gimbal_pose_pub_;   // 云台姿态 (RViz 用, 保持)
     ros::Publisher camera_pose_pub_;   // 相机世界姿态 (保持)
-    ros::Publisher yolo_pub_;          // typed YoloDetection (合并自 detection_simulator)
+    ros::Publisher yolo_pub_;          // typed YoloDetection (单条,主目标,兼容 comm_node)
+    ros::Publisher yolo_results_pub_;  // typed YoloDetections (多目标,供 target_estimator)
     ros::Publisher in_fov_pub_;        // Bool (合并自 detection_simulator)
 
     ros::Timer control_timer_;
@@ -98,21 +102,27 @@ private:
     std::normal_distribution<double> noise_dist_;
 
     // === 状态 ===
-    geometry_msgs::Point current_target_pos_;
+    std::vector<multi_uav_strike::SimTarget> targets_;   // 全部仿真目标(来自 /sim_targets)
     geometry_msgs::PoseStamped current_uav_pose_;   // NWU
     bool is_target_received_ = false;
     bool is_uav_pose_received_ = false;
 
-    // === 每 loop tick 缓存的相机-目标投影 ===
-    //   由 recomputeCameraTargetProjection() 在循环开头一次性算出,
-    //   之后所有 FOV 判定 / 像素投影 / distance / camera pose 发布都读这些缓存,
-    //   不再重复算四元数、旋转矩阵、t_cam 投影。
+    // === 每 loop tick 缓存的相机-目标投影(逐目标) ===
+    //   由 recomputeAllProjections() 在循环开头一次性算出所有目标的投影,
+    //   之后 FOV 判定 / 像素投影 / distance / camera pose / 逐目标 YoloDetection 都读缓存。
+    struct TargetProj {
+        uint32_t    id       = 0;
+        std::string label;
+        geometry_msgs::Point pos;      // 目标 NWU 世界坐标
+        bool   visible   = false;      // 在 FOV 里
+        double u_px      = 0.0;        // 像素 u
+        double v_px      = 0.0;        // 像素 v
+        double distance  = 0.0;        // 相机系距离
+    };
     Eigen::Quaterniond cached_q_cam_world_;
-    bool   cached_proj_valid_   = false;   // 数据齐了
-    bool   cached_visible_      = false;   // 在 FOV 里
-    double cached_u_px_         = 0.0;     // 像素 u
-    double cached_v_px_         = 0.0;     // 像素 v
-    double cached_distance_     = 0.0;     // 相机系距离
+    bool   cached_proj_valid_ = false;             // 数据齐了(有目标 + 有 pose)
+    std::vector<TargetProj> projections_;          // 与 targets_ 对齐
+    int    primary_idx_ = -1;                      // projections_ 内的主目标索引(FOV 内最近);-1=无
 
 public:
     GimbalSimulator() {
@@ -172,8 +182,8 @@ public:
         noise_dist_ = std::normal_distribution<double>(0.0, image_noise_std_dev_);
 
         // 订阅
-        target_sub_ = nh_.subscribe("/target_position", 10,
-                                    &GimbalSimulator::targetCallback, this);
+        target_sub_ = nh_.subscribe("/sim_targets", 10,
+                                    &GimbalSimulator::targetsCallback, this);
         uav_pose_sub_ = nh_.subscribe(uav_pose_topic_, 10,
                                       &GimbalSimulator::uavPoseCallback, this);
 
@@ -188,6 +198,12 @@ public:
         if (!ns.empty() && ns != "/") yolo_t = ns + "/" + yolo_t;
         if (yolo_t.find("//") == 0) yolo_t = yolo_t.substr(1);
         yolo_pub_ = nh_.advertise<multi_uav_strike::YoloDetection>(yolo_t, 10);
+
+        // 多目标批量检测(供 target_estimator)
+        std::string yolos_t = "detection/yolo_results";
+        if (!ns.empty() && ns != "/") yolos_t = ns + "/" + yolos_t;
+        if (yolos_t.find("//") == 0) yolos_t = yolos_t.substr(1);
+        yolo_results_pub_ = nh_.advertise<multi_uav_strike::YoloDetections>(yolos_t, 10);
 
         std::string fov_t = "detection/target_in_view";
         if (!ns.empty() && ns != "/") fov_t = ns + "/" + fov_t;
@@ -213,9 +229,9 @@ public:
     // 订阅回调
     // ====================================================================
 
-    void targetCallback(const geometry_msgs::Point::ConstPtr& msg) {
-        current_target_pos_ = *msg;
-        is_target_received_ = true;
+    void targetsCallback(const multi_uav_strike::SimTargets::ConstPtr& msg) {
+        targets_ = msg->targets;
+        is_target_received_ = !targets_.empty();
     }
 
     void uavPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
@@ -255,36 +271,44 @@ public:
     // ====================================================================
 
     void controlLoopCallback(const ros::TimerEvent&) {
-        // === 1. 一次性算出所有相机-目标投影(后续都读缓存) ===
-        recomputeCameraTargetProjection();
+        // === 1. 一次性算出所有目标的相机投影(后续都读缓存),并选主目标 ===
+        recomputeAllProjections();
 
         // 数据没到齐:发"空帧"+保持当前云台角度
         if (!cached_proj_valid_) {
-            ROS_WARN_THROTTLE(5.0, "[GimbalSim] waiting for target/pose ...");
-            publishYoloDetection();
+            ROS_WARN_THROTTLE(5.0, "[GimbalSim] waiting for targets/pose ...");
+            publishYoloDetections();
             return;
         }
 
-        // === 2. 决定 desired_pitch(读 cached_visible_) ===
-        desired_pitch = cached_visible_ ? computePitchAndYawToTarget() : default_pitch_rad_;
-        // Print out throttled message when target is in view
-        if (cached_visible_) {
-            ROS_INFO_THROTTLE(5.0, "[GimbalSim] target in view: u_px=%.1f, v_px=%.1f, "
-                                "distance=%.2fm, desired_pitch=%.2fdeg",
-                              cached_u_px_, cached_v_px_, cached_distance_,
-                              desired_pitch * 180.0 / M_PI);
+        // === 2. 决定 desired_pitch(指向主目标;无主目标则回退默认角) ===
+        bool has_primary = (primary_idx_ >= 0);
+        if (has_primary) {
+            const TargetProj& p = projections_[primary_idx_];
+            desired_pitch = computePitchAndYawToTarget(p.pos.x, p.pos.y);
+            ROS_INFO_THROTTLE(5.0, "[GimbalSim] primary target id=%u label=%s in view: "
+                                "u_px=%.1f v_px=%.1f distance=%.2fm desired_pitch=%.2fdeg "
+                                "(total_visible=%zu)",
+                              p.id, p.label.c_str(), p.u_px, p.v_px, p.distance,
+                              desired_pitch * 180.0 / M_PI, countVisible());
+        } else {
+            desired_pitch = default_pitch_rad_;
         }
-        // cerr<<"Current pitch: "<<current_gimbal_pitch_ * 180.0 / M_PI<<"deg"<<endl;
-        // cerr<<"Desired pitch: "<<desired_pitch * 180.0 / M_PI<<"deg"<<endl;
 
         // === 3. 云台比例控制 ===
         updateGimbalAngles(desired_pitch);
 
-        // === 4. 发布(全部用 cached_*) ===
-        publishLOSAngle(desired_pitch, desired_yaw);       // target_los_angle
+        // === 4. 发布 ===
+        publishLOSAngle(desired_pitch, desired_yaw);       // target_los_angle(指向主目标)
         publishGimbalPose();                  // gimbal_pose (RViz)
         publishCameraPose();                  // camera/pose (用缓存的 q_cam_world_)
-        publishYoloDetection();               // YoloDetection (用 cached u_px/v_px/distance)
+        publishYoloDetections();              // YoloDetections(全部可见目标) + 单条 YoloDetection(主目标)
+    }
+
+    size_t countVisible() const {
+        size_t n = 0;
+        for (const auto& p : projections_) if (p.visible) ++n;
+        return n;
     }
 
     // ====================================================================
@@ -299,12 +323,10 @@ public:
     // 计算目标相对无人机的"几何"俯仰角(忽略云台当前状态)
     // 新约定: 0=水平, -π/2=垂直下视
     //   uav 高于 target 时, target 在视野下方, desired_pitch 为负
-    double computePitchAndYawToTarget() {
+    double computePitchAndYawToTarget(double target_x, double target_y) {
         double uav_x = current_uav_pose_.pose.position.x;
         double uav_y = current_uav_pose_.pose.position.y;
         double uav_alt = current_uav_pose_.pose.position.z;  // NWU: z=高度
-        double target_x = current_target_pos_.x;
-        double target_y = current_target_pos_.y;
 
         if (image_noise_std_dev_ > 0.0) {
             target_x += noise_dist_(rng_);
@@ -326,64 +348,59 @@ public:
     }
 
     // ====================================================================
-    // 单次投影: 把所有相机-目标几何算出来, 缓存到成员变量
+    // 单次投影: 对所有目标算出相机-目标几何, 缓存到 projections_, 并选主目标
     // ====================================================================
     //
     // 每 tick 在 controlLoopCallback 开头调一次, 后续全部读缓存:
-    //   - cached_visible_       (FOV 判定)
-    //   - cached_u_px_/v_px_    (YoloDetection bbox)
-    //   - cached_distance_      (YoloDetection confidence)
+    //   - projections_[i].visible/u_px/v_px/distance
     //   - cached_q_cam_world_   (camera/pose 发布)
+    //   - primary_idx_          (FOV 内距 UAV 最近的目标; -1=无)
     //
     // 相机世界姿态 = uav_quat(NWU) * R(0, gimbal_pitch, 0)
     // 相机系约定: x=前, y=右, z=下
-    // 目标在前方 (t_cam.x > 0) 且投影在矩形内 → visible
-    void recomputeCameraTargetProjection() {
+    // 目标在前方 (t_cam.z > 0) 且投影在矩形内 → visible
+    void recomputeAllProjections() {
         cached_proj_valid_ = is_target_received_ && is_uav_pose_received_;
-        cached_visible_ = false;
-        cached_u_px_ = cached_v_px_ = cached_distance_ = 0.0;
+        projections_.clear();
+        primary_idx_ = -1;
 
         if (!cached_proj_valid_) return;
 
-        // 1) 相机世界姿态
+        // 相机世界姿态(所有目标共用)
         cached_q_cam_world_ = currentCameraWorldQuat();
         Eigen::Matrix3d R_world_cam = cached_q_cam_world_.toRotationMatrix();
 
-        // 2) 目标相对相机的向量(NWU → 相机系)
-        Eigen::Vector3d world_diff(
-            current_target_pos_.x - current_uav_pose_.pose.position.x,
-            current_target_pos_.y - current_uav_pose_.pose.position.y,
-            current_target_pos_.z - current_uav_pose_.pose.position.z);
-        Eigen::Vector3d t_cam = R_world_cam.transpose() * world_diff;
+        double best_dist = 1e18;
+        projections_.reserve(targets_.size());
+        for (const auto& t : targets_) {
+            TargetProj pr;
+            pr.id    = t.id;
+            pr.label = t.label;
+            pr.pos   = t.position;
 
-        // 3) 目标在相机后方 / 紧贴 → 不可见
-        if (t_cam.z() <= 0.05) return;
+            Eigen::Vector3d world_diff(
+                t.position.x - current_uav_pose_.pose.position.x,
+                t.position.y - current_uav_pose_.pose.position.y,
+                t.position.z - current_uav_pose_.pose.position.z);
+            Eigen::Vector3d t_cam = R_world_cam.transpose() * world_diff;
 
-        // 4) 投到像平面(像素坐标)
-        double u_ndc = t_cam.y() / t_cam.z();   // 水平 NDC = y/z
-        double v_ndc = -t_cam.x() / t_cam.z();   // 垂直 NDC = x/z
-        cached_u_px_ = u_ndc * focal_x_ + image_width_  / 2.0;
-        cached_v_px_ = v_ndc * focal_y_ + image_height_ / 2.0;
+            if (t_cam.z() > 0.05) {
+                double u_ndc = t_cam.y() / t_cam.z();
+                double v_ndc = -t_cam.x() / t_cam.z();
+                pr.u_px = u_ndc * focal_x_ + image_width_  / 2.0;
+                pr.v_px = v_ndc * focal_y_ + image_height_ / 2.0;
+                bool u_ok = (pr.u_px >= 0.0 && pr.u_px < image_width_);
+                bool v_ok = (pr.v_px >= 0.0 && pr.v_px < image_height_);
+                pr.visible = u_ok && v_ok;
+                pr.distance = t_cam.norm();
+            }
 
-        // 5) 矩形 FOV 判定
-        bool u_ok = (cached_u_px_ >= 0.0 && cached_u_px_ < image_width_);
-        bool v_ok = (cached_v_px_ >= 0.0 && cached_v_px_ < image_height_);
-        cached_visible_ = u_ok && v_ok;
-
-        // 6) distance (visible 时才有意义,但为统一接口也算)
-        cached_distance_ = t_cam.norm();
-
-        // 7) 打印调试信息
-        // ROS_WARN("[GimbalSim] t_cam=(%.2f, %.2f, %.2f) u_px=%.1f v_px=%.1f visible=%d distance=%.2f",
-        //           t_cam.x(), t_cam.y(), t_cam.z(),
-        //           cached_u_px_, cached_v_px_, cached_visible_ ? 1 : 0, cached_distance_);
-        // ROS_WARN("[GimbalSim] uav=(%.2f, %.2f, %.2f) target=(%.2f, %.2f, %.2f)",
-        //           current_uav_pose_.pose.position.x,
-        //           current_uav_pose_.pose.position.y,
-        //           current_uav_pose_.pose.position.z,
-        //           current_target_pos_.x,
-        //           current_target_pos_.y,
-        //           current_target_pos_.z);
+            if (pr.visible && pr.distance < best_dist) {
+                best_dist = pr.distance;
+                primary_idx_ = static_cast<int>(projections_.size());
+            }
+            projections_.push_back(pr);
+        }
     }
 
     // 计算相机世界姿态(纯函数, 不改状态)
@@ -494,43 +511,66 @@ public:
         camera_pose_pub_.publish(msg);
     }
 
-    // YoloDetection + Bool (合并自 detection_simulator_node)
-    // 所有几何字段都从 cached_* 读, 函数内只做 bbox 计算和发布
-    void publishYoloDetection() {
+    // 从一个 TargetProj 构造一条 YoloDetection(仅在 visible 时填 bbox/conf/img)
+    multi_uav_strike::YoloDetection buildDetection(const TargetProj& pr, uint32_t frame_seq,
+                                                   uint64_t stamp_us) {
         multi_uav_strike::YoloDetection out;
-        out.frame_seq = ++frame_seq_;
-        out.stamp_us = ros::Time::now().toNSec() / 1000;
-        out.label = label_;
+        out.frame_seq = frame_seq;
+        out.stamp_us = stamp_us;
+        out.label = pr.label;
         out.confidence = 0.0f;
-        out.x_min = 0.0f; out.y_min = 0.0f;
-        out.x_max = 0.0f; out.y_max = 0.0f;
+        out.x_min = out.y_min = out.x_max = out.y_max = 0.0f;
         out.is_in_fov = false;
-
-        std_msgs::Bool in_fov_flag;
-        in_fov_flag.data = false;
-
-        if (cached_visible_) {
+        if (pr.visible) {
             // 简化的 bbox: size ∝ 1/distance
             double size_px = std::min(image_width_, image_height_) * 0.05 +
-                             1000.0 / (cached_distance_ + 1.0);
+                             1000.0 / (pr.distance + 1.0);
             size_px = std::min(size_px, std::min(image_width_, image_height_) * 0.4);
             double half = size_px / 2.0;
-
-            out.x_min = (float)std::max(0.0, (cached_u_px_ - half) / image_width_);
-            out.y_min = (float)std::max(0.0, (cached_v_px_ - half) / image_height_);
-            out.x_max = (float)std::min(1.0, (cached_u_px_ + half) / image_width_);
-            out.y_max = (float)std::min(1.0, (cached_v_px_ + half) / image_height_);
-
-            double conf = std::max(0.4, 0.95 - 0.001 * cached_distance_);
-            out.confidence = (float)conf;
+            out.x_min = (float)std::max(0.0, (pr.u_px - half) / image_width_);
+            out.y_min = (float)std::max(0.0, (pr.v_px - half) / image_height_);
+            out.x_max = (float)std::min(1.0, (pr.u_px + half) / image_width_);
+            out.y_max = (float)std::min(1.0, (pr.v_px + half) / image_height_);
+            out.confidence = (float)std::max(0.4, 0.95 - 0.001 * pr.distance);
             out.is_in_fov = true;
-            in_fov_flag.data = true;
-
             // 可见帧才携带模拟 JPEG;真实 gimbal 接入后此分支替换为相机抓拍帧
             out.img_data = fake_jpeg_;
         }
+        return out;
+    }
 
-        yolo_pub_.publish(out);
+    // 发布:YoloDetections(全部可见目标,供 target_estimator)
+    //       + 单条 YoloDetection(主目标,兼容 comm_node)
+    //       + Bool(是否有任一目标在 FOV)
+    void publishYoloDetections() {
+        uint32_t seq = ++frame_seq_;
+        uint64_t stamp_us = ros::Time::now().toNSec() / 1000;
+
+        multi_uav_strike::YoloDetections batch;
+        bool any_visible = false;
+        for (const auto& pr : projections_) {
+            if (!pr.visible) continue;   // 只把在 FOV 内的目标放入批量(与原单目标语义一致)
+            batch.detections.push_back(buildDetection(pr, seq, stamp_us));
+            any_visible = true;
+        }
+        yolo_results_pub_.publish(batch);
+
+        // 单条 = 主目标(无主目标则空帧 is_in_fov=false)
+        multi_uav_strike::YoloDetection primary;
+        if (primary_idx_ >= 0) {
+            primary = buildDetection(projections_[primary_idx_], seq, stamp_us);
+        } else {
+            primary.frame_seq = seq;
+            primary.stamp_us = stamp_us;
+            primary.label = "";
+            primary.confidence = 0.0f;
+            primary.x_min = primary.y_min = primary.x_max = primary.y_max = 0.0f;
+            primary.is_in_fov = false;
+        }
+        yolo_pub_.publish(primary);
+
+        std_msgs::Bool in_fov_flag;
+        in_fov_flag.data = any_visible;
         in_fov_pub_.publish(in_fov_flag);
     }
 

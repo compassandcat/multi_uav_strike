@@ -1,16 +1,29 @@
 # ============================================================================
-# target_motion_simulator_node 专属参数
-# 节点没有读取 common.yaml 里的共享参数，所以无需去重。
-# 注意：以下默认值与代码 param() 调用中的默认值保持一致，
-#       这样删掉 yaml 任何一行都不会让行为"突然变化"。
+# target_motion_simulator_node 专属参数(2026-07 多目标改造)
+#
+# targets: 目标列表,支持不同类别 + 同类别多实例。每项字段:
+#   label              类别("person"/"car"/"truck"...),与 YOLO label 语义一致
+#   x_init, y_init     初始位置(米,NWU)
+#   max_speed          最大速度(m/s;设 0 = 静止目标)
+#   min_speed          最小速度(m/s)
+#   max_tangential_acc 最大切向加速度(m/s²)
+#   max_normal_acc     最大法向加速度(m/s²)
+# 缺省字段回落到下方全局默认值(删任意一行都不会让行为突然变化)。
 # ============================================================================
-x_init: 60.0                # 初始 x 位置（米，NWU）
-y_init: -100.0                # 初始 y 位置（米，NWU）
-max_speed: 0.01            # 最大速度（m/s）
-min_speed: 0.0             # 最小速度（m/s）
-max_tangential_acc: 0.0    # 最大切向加速度（m/s²）
-max_normal_acc: 0.0        # 最大法向加速度（m/s²）
-sim_freq: 100.0            # 仿真频率（Hz）
-trigger_freq: 0.1          # 触发频率（Hz）
+targets:
+  - {label: "person", x_init: 60.0,  y_init: -100.0, max_speed: 0.0}   # 静止的人
+  - {label: "car",    x_init: 80.0,  y_init: -60.0,  max_speed: 3.0, max_tangential_acc: 1.0, max_normal_acc: 0.5}  # 移动的车
+  - {label: "person", x_init: 55.0,  y_init: -95.0,  max_speed: 1.0, max_normal_acc: 0.5}  # 同类别第二个人(缓慢移动)
+
+# /target_position(Point,兼容 topic)取哪个目标作为主目标
+primary_index: 0
+
+# ===== 全局默认运动参数(targets 项缺省时回落;同时兼容旧单目标 x_init/y_init/label) =====
+max_speed: 0.01            # 最大速度(m/s)
+min_speed: 0.0             # 最小速度(m/s)
+max_tangential_acc: 0.0    # 最大切向加速度(m/s²)
+max_normal_acc: 0.0        # 最大法向加速度(m/s²)
+sim_freq: 100.0            # 仿真频率(Hz)
+trigger_freq: 0.1          # 加减速触发频率(Hz)
 marker_size: 1.0           # 目标标记大小
 marker_frame: "map"        # 目标标记参考坐标系

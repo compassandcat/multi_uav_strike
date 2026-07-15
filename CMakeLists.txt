@@ -33,6 +33,9 @@ add_message_files(
   DetectTarget.msg
   DetectTargets.msg
   YoloDetection.msg
+  YoloDetections.msg
+  SimTarget.msg
+  SimTargets.msg
   TrackingState.msg
   WaypointStatus.msg
   InterUavStatus.msg
