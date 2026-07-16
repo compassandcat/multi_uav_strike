@@ -71,6 +71,24 @@ public:
         // 最新一帧 YoloDetection.img_data(可为 JPEG 字节,空 = 当前没图)
         std::vector<uint8_t> img_data;
         uint8_t              img_format = 0;  // 1 = JPEG(与 DetectTarget.img_format 对齐)
+
+        // === 2026-07-16: Plan A 像素空间 EMA (scale-invariant) ===
+        //   关键改动:UAV pose 抖动 → bbox 像素抖动 → 投影回世界时被距离 10-30m 放大成
+        //   米级跳动。改在像素空间先 EMA,再投影,1px 抖动不再被距离放大。
+        //   raw_cx/cy 与 ema_cx/cy 都在 [0, image_width/height] 范围。
+        double    ema_cx          = 0.0;     // 平滑后 bbox 中心 x (像素)
+        double    ema_cy          = 0.0;     // 平滑后 bbox 中心 y (像素)
+        bool      ema_pixel_valid = false;   // 首次检测时初始化为原始像素
+
+        // === 2026-07-16: 多次命中才晋升为正式 cluster ===
+        //   hit_count: 累计被 detection 命中的次数(含本次)
+        //   is_promoted: 达到 min_hit_count_ 后才置 true,之后才:
+        //                - 发 cluster_event(让 mission_manager 决定上报/跟踪)
+        //                - 进 cluster_states 10Hz 快照(RViz 显示)
+        //                - 用 cluster_ttl_sec_ 长 TTL(确认存在的目标)
+        //   未晋升的 tentative 用更短的 tentative_ttl_sec_ 过期丢弃。
+        uint32_t  hit_count       = 0;
+        bool      is_promoted     = false;
     };
 
     TargetClusterer() {
@@ -82,11 +100,20 @@ public:
         // 聚类参数
         p.param<double>("merge_radius_m", merge_radius_m_, 10.0);
         p.param<double>("cluster_ttl_sec", cluster_ttl_sec_, 60.0);
-        // === 2026-07-16: 默认 0.6 → 0.2,5x 平滑 ===
-        // 0.6 在 10Hz 下对低频噪声增益≈1,基本不滤波;0.2 ≈ 时间常数 0.4s,
-        //   1Hz bbox 抖动衰减 ~96%,且 rescue 慢速目标(行人~1.4m/s)的滞后只有 0.6m,
-        //   完全可接受。如果目标是高速车辆,把 ema_alpha 调回 0.4~0.5。
-        p.param<double>("ema_alpha",       ema_alpha_,       0.2);
+        // === 2026-07-16: 多次命中门禁 (兼筛选) ===
+        //   同一 cluster (label + merge_radius_m 范围内) 被检测到 hit_count_ ≥
+        //   min_hit_count_ 才晋升为正式目标。同位置多次命中 = 真目标的强信号;
+        //   单次或零星命中 = YOLO 误检 / 飞过飞回的残影,直接被门禁过滤掉。
+        //   经验值:10Hz yolo → 20 hits ≈ 2s 持续命中,误检基本进不来;
+        //          真目标在视野停留 3~5s 时稳定晋升。
+        p.param<int>("min_hit_count", min_hit_count_, 20);
+        p.param<double>("tentative_ttl_sec", tentative_ttl_sec_, 1.0);
+        // === 2026-07-16: Plan A — ema_alpha 改为像素空间平滑 ===
+        //   0.6 在 10Hz 下对低频噪声增益≈1,基本不滤波;0.2 ≈ 时间常数 0.4s,
+        //   1Hz bbox 抖动衰减 ~80%。注意这是像素域的 EMA,与距离无关,所以
+        //   0.2 对近/远目标的滞后是一致的(都是 0.4s 时间常数)。
+        //   如果目标是高速车辆,可调回 0.4~0.5;如果还看到残影,降到 0.10。
+        p.param<double>("ema_alpha",       ema_alpha_,       0.05);
         p.param<double>("target_z_prior",  target_z_prior_,  0.0);
         // 发布周期
         p.param<double>("states_publish_freq", states_publish_freq_, 10.0);
@@ -109,6 +136,11 @@ public:
                                             &TargetClusterer::yoloBatchCallback, this);
         gimbal_pose_sub_    = nh_.subscribe("gimbal_pose", 10,
                                             &TargetClusterer::gimbalPoseCallback, this);
+        // === 2026-07-16: 改为订阅稳像 camera/pose 作为反投影唯一真源 ===
+        // gimbal_simulator_node.cpp::publishCameraPose 现在发布的是稳像世界 quat,
+        // 与 forward projection 完全一致,这里直接拿来用。
+        camera_pose_sub_    = nh_.subscribe("camera/pose", 10,
+                                            &TargetClusterer::cameraPoseCallback, this);
         uav_pose_sub_       = nh_.subscribe(uav_pose_topic_, 10,
                                             &TargetClusterer::uavPoseCallback, this);
         self_gps_sub_       = nh_.subscribe("mavros/global_position/global", 10,
@@ -146,7 +178,8 @@ public:
 
     // 每帧 batch YoloDetections:每条 detection 独立反投影 + 聚类
     void yoloBatchCallback(const multi_uav_strike::YoloDetections::ConstPtr& msg) {
-        if (!is_uav_pose_received_ || !is_gimbal_pose_received_) return;
+        // === 2026-07-16: 改用稳像 camera/pose 作为反投影真源 ===
+        if (!is_uav_pose_received_ || !is_camera_pose_received_) return;
         for (const auto& det : msg->detections) {
             processSingleDetection(det);
         }
@@ -155,40 +188,66 @@ public:
     // 单条 detection → 反投影地面点 → 命中已有 cluster (label + 2D 距离) 或新建
     void processSingleDetection(const multi_uav_strike::YoloDetection& det) {
         if (!det.is_in_fov) return;
-        if (!is_uav_pose_received_ || !is_gimbal_pose_received_) return;
+        if (!is_uav_pose_received_ || !is_camera_pose_received_) return;
 
-        double tx = 0.0, ty = 0.0, tz = target_z_prior_;
-        if (!projectBboxToGround(det, tx, ty, tz)) return;
+        // === 2026-07-16: Plan A 像素空间 EMA ===
+        //   先取原始 bbox 中心像素,后面再做 EMA → 投影
+        const double raw_cx = (det.x_min + det.x_max) * 0.5 * image_width_;
+        const double raw_cy = (det.y_min + det.y_max) * 0.5 * image_height_;
 
         std::lock_guard<std::mutex> g(clusters_mtx_);
         const std::string& label = det.label;
 
-        // 实例聚类:遍历 clusters_, 找 label 相同 + 2D 距离 ≤ merge_radius_m_ 的最近 cluster
+        // 实例聚类:把当前帧的 raw 像素先投影成世界点(临时),与已有 cluster 的
+        //   上一次稳定位置 c.ned_x/ned_y 算 2D 距离 → 选最近且 <merge_radius_m_ 的。
+        //   注:c.ned_x/ned_y 是上一帧像素 EMA 投影后的稳定值,用做匹配参考点不会
+        //       跟随单帧噪声漂移。
+        double cand_tx = 0.0, cand_ty = 0.0, cand_tz = 0.0;
+        const bool cand_valid = projectPixelToGround(raw_cx, raw_cy, cand_tx, cand_ty, cand_tz);
         const double r2 = merge_radius_m_ * merge_radius_m_;
         uint64_t nearest_id = 0;
         double   best_dist_sq = r2;
-        for (const auto& kv : clusters_) {
-            const TargetCluster& c = kv.second;
-            if (c.label != label) continue;  // 不同 label 不合并
-            double dx = tx - c.ned_x;
-            double dy = ty - c.ned_y;
-            double d2 = dx*dx + dy*dy;
-            if (d2 < best_dist_sq) {
-                best_dist_sq = d2;
-                nearest_id = c.id;
+        if (cand_valid) {
+            for (const auto& kv : clusters_) {
+                const TargetCluster& c = kv.second;
+                if (c.label != label) continue;  // 不同 label 不合并
+                double dx = cand_tx - c.ned_x;
+                double dy = cand_ty - c.ned_y;
+                double d2 = dx*dx + dy*dy;
+                if (d2 < best_dist_sq) {
+                    best_dist_sq = d2;
+                    nearest_id = c.id;
+                }
             }
         }
 
         if (nearest_id != 0) {
-            // 命中已有 cluster:EMA 平滑刷新 + 刷新 last_seen/img/conf
+            // 命中已有 cluster:先在像素空间 EMA,再投影回世界
             TargetCluster& c = clusters_[nearest_id];
-            c.ned_x = ema_alpha_ * tx + (1.0 - ema_alpha_) * c.ned_x;
-            c.ned_y = ema_alpha_ * ty + (1.0 - ema_alpha_) * c.ned_y;
-            // === 2026-07-16: Z 也过 EMA,之前 c.ned_alt = tz 直接抄原始值 ===
-            //   bbox 高度投影本身就带噪声,不滤波会让 z 跳 → UAV 俯仰也跟跳
-            c.ned_alt = ema_alpha_ * tz + (1.0 - ema_alpha_) * c.ned_alt;
+            if (!c.ema_pixel_valid) {
+                // 首帧 EMA 初始化
+                c.ema_cx = raw_cx;
+                c.ema_cy = raw_cy;
+                c.ema_pixel_valid = true;
+            } else {
+                c.ema_cx = ema_alpha_ * raw_cx + (1.0 - ema_alpha_) * c.ema_cx;
+                c.ema_cy = ema_alpha_ * raw_cy + (1.0 - ema_alpha_) * c.ema_cy;
+            }
+            // 投影平滑后的像素 → 世界
+            double tx = 0.0, ty = 0.0, tz = target_z_prior_;
+            if (!projectPixelToGround(c.ema_cx, c.ema_cy, tx, ty, tz)) return;
+            // 平滑后的像素投影已经稳定,直接赋值(不再做世界坐标 EMA,避免双重平滑引入滞后)
+            c.ned_x = tx;
+            c.ned_y = ty;
+            c.ned_alt = tz;
             c.best_confidence = std::max(c.best_confidence, det.confidence);
             c.last_seen_us = det.stamp_us;
+            // === 2026-07-16: 命中计数 + 晋升门禁 ===
+            c.hit_count++;
+            if (!c.is_promoted && static_cast<int>(c.hit_count) >= min_hit_count_) {
+                c.is_promoted = true;
+                emitClusterEvent(c);
+            }
             if (!det.img_data.empty()) {
                 c.img_data   = det.img_data;
                 c.img_format = 1;  // JPEG(与 gimbal_simulator 输出一致)
@@ -196,37 +255,59 @@ public:
             return;
         }
 
-        // 新建 cluster
+        // 新建 cluster:首帧像素直接作为 EMA 初值,但暂不晋升、不发 event
         TargetCluster nc;
         nc.id              = ++next_cluster_id_;
         nc.label           = label;
         nc.label_hash      = hashLabel(label);
-        nc.ned_x           = tx;
-        nc.ned_y           = ty;
-        nc.ned_alt         = tz;
+        nc.ema_cx          = raw_cx;
+        nc.ema_cy          = raw_cy;
+        nc.ema_pixel_valid = true;
+        if (!projectPixelToGround(nc.ema_cx, nc.ema_cy, nc.ned_x, nc.ned_y, nc.ned_alt)) {
+            return;  // 投影失败(射线水平或朝后)就不建 cluster
+        }
         nc.best_confidence = det.confidence;
         nc.first_seen_us   = det.stamp_us;
         nc.last_seen_us    = det.stamp_us;
         nc.img_data        = det.img_data;
         nc.img_format      = det.img_data.empty() ? 0 : 1;
+        // === 2026-07-16: 首次进入 tentative 态 ===
+        nc.hit_count       = 1;
+        nc.is_promoted     = false;
         clusters_[nc.id]   = nc;
 
-        // 推 cluster_event (仅一次, mission_manager 据此决定上报/跟踪/打击)
+        ROS_INFO_THROTTLE(1.0, "[TargetClusterer] NEW tentative id=%lu label=%s "
+                              "(ned=%.1f,%.1f,%.1f conf=%.2f hit=%u/%d, total=%zu)",
+                           nc.id, nc.label.c_str(), nc.ned_x, nc.ned_y, nc.ned_alt,
+                           nc.best_confidence, nc.hit_count, min_hit_count_,
+                           clusters_.size());
+
+        // 若 min_hit_count_ ≤ 1 (关闭门禁),立即晋升并发 event
+        if (min_hit_count_ <= 1) {
+            clusters_[nc.id].is_promoted = true;
+            emitClusterEvent(clusters_[nc.id]);
+        }
+    }
+
+    // === 2026-07-16: 抽出 cluster_event 发送逻辑 ===
+    //   同一 cluster 整个生命周期只发一次(首次晋升时),
+    //   mission_manager 据此决定上报/跟踪/打击。
+    void emitClusterEvent(const TargetCluster& c) {
         multi_uav_strike::ClusterEvent ev;
-        ev.cluster_id    = nc.id;
-        ev.label_hash    = nc.label_hash;
-        ev.label         = nc.label;
-        ev.confidence    = nc.best_confidence;
-        ev.first_seen_us = nc.first_seen_us;
-        ev.ned_x         = nc.ned_x;
-        ev.ned_y         = nc.ned_y;
-        ev.ned_alt       = nc.ned_alt;
+        ev.cluster_id    = c.id;
+        ev.label_hash    = c.label_hash;
+        ev.label         = c.label;
+        ev.confidence    = c.best_confidence;
+        ev.first_seen_us = c.first_seen_us;
+        ev.ned_x         = c.ned_x;
+        ev.ned_y         = c.ned_y;
+        ev.ned_alt       = c.ned_alt;
         cluster_event_pub_.publish(ev);
 
-        ROS_INFO_THROTTLE(1.0, "[TargetClusterer] NEW cluster id=%lu label=%s "
-                              "(ned=%.1f,%.1f,%.1f conf=%.2f, total_clusters=%zu)",
-                           nc.id, nc.label.c_str(), nc.ned_x, nc.ned_y, nc.ned_alt,
-                           nc.best_confidence, clusters_.size());
+        ROS_INFO("[TargetClusterer] PROMOTE cluster id=%lu label=%s "
+                 "(ned=%.1f,%.1f,%.1f conf=%.2f hit=%u)",
+                 c.id, c.label.c_str(), c.ned_x, c.ned_y, c.ned_alt,
+                 c.best_confidence, c.hit_count);
     }
 
     // 从 gimbal_pose 提取当前云台俯仰(q = setRPY(0, pitch, 0))
@@ -244,6 +325,19 @@ public:
         tf::Matrix3x3(q).getRPY(r, p, y);
         current_gimbal_pitch_ = p;
         is_gimbal_pose_received_ = true;
+    }
+
+    // === 2026-07-16: 接收稳像 camera/pose 作为反投影唯一真源 ===
+    // 不再做 uav_quat * setRPY(pitch) 重建,直接用 gimbal 算好的稳像世界 quat,
+    // 保证前向/反向投影用同一个 R_world_cam,且完全不依赖 UAV roll/机体 pitch。
+    void cameraPoseCallback(const geometry_msgs::PoseStamped::ConstPtr& msg) {
+        current_camera_world_quat_ = Eigen::Quaterniond(
+            msg->pose.orientation.w,
+            msg->pose.orientation.x,
+            msg->pose.orientation.y,
+            msg->pose.orientation.z);
+        current_camera_world_quat_.normalize();
+        is_camera_pose_received_ = true;
     }
 
     void primaryTargetCallback(const std_msgs::UInt64::ConstPtr& msg) {
@@ -297,18 +391,23 @@ public:
     // 10Hz:publish 所有 alive cluster 快照 + 可视化 + primary GPS / pose
     void statesTimerCb(const ros::TimerEvent&) {
         std::lock_guard<std::mutex> g(clusters_mtx_);
-        if (clusters_.empty()) {
+        // === 2026-07-16: 仅展示已晋升的 cluster ===
+        //   tentative 在晋升前不出现在 snapshot / marker 里,避免污染 RViz
+        size_t promoted_count = 0;
+        for (const auto& kv : clusters_) if (kv.second.is_promoted) ++promoted_count;
+        if (promoted_count == 0) {
             publishEmptyGps();
             return;
         }
 
         multi_uav_strike::ClusterState state;
         visualization_msgs::MarkerArray markers;
-        state.targets.reserve(clusters_.size());
-        markers.markers.reserve(clusters_.size());
+        state.targets.reserve(promoted_count);
+        markers.markers.reserve(promoted_count);
 
         for (const auto& kv : clusters_) {
             const TargetCluster& c = kv.second;
+            if (!c.is_promoted) continue;  // 未晋升的 tentative 不外发
             multi_uav_strike::ClusterTarget t;
             t.cluster_id    = c.id;
             t.label         = c.label;
@@ -327,17 +426,18 @@ public:
         cluster_states_pub_.publish(state);
         target_est_marker_pub_.publish(markers);
 
-        // primary 选择: 优先 primary_cluster_id_, 否则最高置信度
+        // primary 选择: 优先 primary_cluster_id_, 否则最高置信度 (仅看 promoted)
         const TargetCluster* primary = nullptr;
         if (primary_cluster_id_ != 0) {
             auto it = clusters_.find(primary_cluster_id_);
-            if (it != clusters_.end()) {
+            if (it != clusters_.end() && it->second.is_promoted) {
                 primary = &it->second;
             }
         }
         if (primary == nullptr) {
             for (const auto& kv : clusters_) {
                 const TargetCluster& c = kv.second;
+                if (!c.is_promoted) continue;
                 if (primary == nullptr || c.best_confidence > primary->best_confidence) {
                     primary = &c;
                 }
@@ -358,9 +458,17 @@ public:
             ros::Time last_seen;
             last_seen.fromNSec(c.last_seen_us * 1000ULL);
             double age = (now - last_seen).toSec();
-            if (age > cluster_ttl_sec_) {
-                ROS_INFO_THROTTLE(2.0, "[TargetClusterer] EXPIRED cluster id=%lu label=%s "
-                                       "(alive %.1fs)", c.id, c.label.c_str(), age);
+            // === 2026-07-16: tentative 用更短 TTL,promoted 用 cluster_ttl_sec_ ===
+            double ttl = c.is_promoted ? cluster_ttl_sec_ : tentative_ttl_sec_;
+            if (age > ttl) {
+                if (c.is_promoted) {
+                    ROS_INFO("[TargetClusterer] EXPIRED cluster id=%lu label=%s "
+                             "(alive %.1fs)", c.id, c.label.c_str(), age);
+                } else {
+                    ROS_INFO("[TargetClusterer] DROP tentative id=%lu label=%s "
+                             "(hit=%u/%d, age=%.2fs)", c.id, c.label.c_str(),
+                             c.hit_count, min_hit_count_, age);
+                }
                 it = clusters_.erase(it);
             } else {
                 ++it;
@@ -376,6 +484,8 @@ private:
 
     double merge_radius_m_   = 10.0;
     double cluster_ttl_sec_  = 60.0;
+    int    min_hit_count_    = 3;       // 同 cluster 被检测到这么多次才晋升
+    double tentative_ttl_sec_ = 1.0;    // 未晋升的 tentative 在这么久没刷新就丢弃
     double ema_alpha_        = 0.6;
     double target_z_prior_   = 0.0;
     double states_publish_freq_ = 10.0;
@@ -392,6 +502,7 @@ private:
 
     ros::Subscriber yolo_batch_sub_;
     ros::Subscriber gimbal_pose_sub_;
+    ros::Subscriber camera_pose_sub_;
     ros::Subscriber uav_pose_sub_;
     ros::Subscriber self_gps_sub_;
     ros::Subscriber primary_target_sub_;
@@ -407,9 +518,12 @@ private:
     geometry_msgs::PoseStamped  current_uav_pose_;
     sensor_msgs::NavSatFix      current_gps_;
     double                      current_gimbal_pitch_ = 0.0;
+    // === 2026-07-16: 稳像世界 quat,直接来自 gimbal 的 camera/pose ===
+    Eigen::Quaterniond          current_camera_world_quat_{1.0, 0.0, 0.0, 0.0};
     bool is_uav_pose_received_    = false;
     bool is_gps_received_         = false;
     bool is_gimbal_pose_received_ = false;
+    bool is_camera_pose_received_ = false;
 
     uint64_t primary_cluster_id_ = 0;   // 0 = mission 未指定, 回退最高置信度
 
@@ -438,45 +552,32 @@ private:
         return h;
     }
 
-    // 构造 world_cam quat = uav_quat * body_cam_quat (setRPY(0, pitch, 0))
-    // 与 gimbal_simulator_node.cpp::currentCameraWorldQuat() 完全一致,
-    // 这是 forward projection 用到的那个 R_world_cam 的来源。
-    Eigen::Quaterniond cameraWorldQuat() const {
-        tf::Quaternion body_cam_quat;
-        body_cam_quat.setRPY(0.0, current_gimbal_pitch_, 0.0);
-
-        tf::Quaternion uav_quat(
-            current_uav_pose_.pose.orientation.x,
-            current_uav_pose_.pose.orientation.y,
-            current_uav_pose_.pose.orientation.z,
-            current_uav_pose_.pose.orientation.w);
-
-        tf::Quaternion world_cam_quat = uav_quat * body_cam_quat;
-        world_cam_quat.normalize();
-
-        return Eigen::Quaterniond(world_cam_quat.w(),
-                                  world_cam_quat.x(),
-                                  world_cam_quat.y(),
-                                  world_cam_quat.z());
-    }
-
     // Per-detection bbox 反投影: 与 gimbal 的 forward projection 完全互逆。
     //   1) bbox 中心像素 → (u_ndc, v_ndc)
     //   2) 相机射线方向 (cam frame, +z = 光学轴):  t_cam ∝ (-v_ndc, u_ndc, 1)
-    //   3) world 射线 = R_world_cam * t_cam
+    //   3) world 射线 = R_world_cam * t_cam (R_world_cam 来自 gimbal 的稳像 camera/pose)
     //   4) 射线与 z = target_z_prior_ 平面求交 → 目标世界 (NWU) 坐标
     bool projectBboxToGround(const multi_uav_strike::YoloDetection& det,
                              double& tx, double& ty, double& tz) {
         double cx = (det.x_min + det.x_max) * 0.5 * image_width_;
         double cy = (det.y_min + det.y_max) * 0.5 * image_height_;
+        return projectPixelToGround(cx, cy, tx, ty, tz);
+    }
 
+    // === 2026-07-16: 像素级 helper (Plan A 用) ===
+    //   processSingleDetection 先在像素空间做 EMA,再调本函数投影到世界。
+    //   几何部分与 projectBboxToGround 完全相同,只是输入换成已平滑的像素。
+    bool projectPixelToGround(double cx, double cy,
+                              double& tx, double& ty, double& tz) {
         double u_ndc = (cx - image_width_  / 2.0) / focal_x_;
         double v_ndc = (cy - image_height_ / 2.0) / focal_y_;
 
         Eigen::Vector3d cam_ray(-v_ndc, u_ndc, 1.0);
         cam_ray.normalize();
 
-        Eigen::Matrix3d R_world_cam = cameraWorldQuat().toRotationMatrix();
+        // === 2026-07-16: 直接使用 gimbal 算好的稳像世界 quat (camera/pose) ===
+        // 不再在 estimator 这边自己重建 R_world_cam,消除前/反投影用不同 uav_quat 时的漂移。
+        Eigen::Matrix3d R_world_cam = current_camera_world_quat_.toRotationMatrix();
         Eigen::Vector3d world_ray  = R_world_cam * cam_ray;
 
         Eigen::Vector3d cam_pos(

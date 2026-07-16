@@ -44,6 +44,7 @@ add_message_files(
   ClusterEvent.msg
   ClusterTarget.msg
   ClusterState.msg
+  TargetFilterDebug.msg     # 2026-07-16: 位置/速度滤波前后对比(debug)
 )
 
 # 消息生成的依赖项

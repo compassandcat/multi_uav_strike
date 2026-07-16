@@ -82,6 +82,7 @@
 #include "multi_uav_strike/TrackingState.h"
 #include "multi_uav_strike/WaypointStatus.h"
 #include "multi_uav_strike/UavGatherStatus.h"
+#include "multi_uav_strike/TargetFilterDebug.h"  // 滤波前后对比 debug msg (2026-07-16)
 #include "multi_uav_strike/one_euro_filter.h"  // 自适应低通,平滑 target_estimated_pose (2026-07-16)
 
 // OneEuroFilter1D 在 multi_uav_strike 命名空间下,本文件的 MissionManager 不在
@@ -269,6 +270,7 @@ private:
     ros::Publisher guidance_enable_pub_;
     ros::Publisher guidance_mode_pub_;       // 模式："strike" 或 "track"
     ros::Publisher guidance_target_pub_;
+    ros::Publisher target_filter_debug_pub_;   // 2026-07-16: 位置滤波前后对比 debug topic
     ros::Publisher guidance_speed_pub_;  // 拦截速度(下发到 guidance_control)
     ros::Publisher avoidance_vector_pub_;
     ros::Publisher emergency_stop_pub_;
@@ -798,6 +800,9 @@ public:
         guidance_target_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(
             "guidance/target_pose", 10);
 
+        target_filter_debug_pub_ = nh_.advertise<multi_uav_strike::TargetFilterDebug>(
+            "mission/target_filter_debug", 10);
+
         avoidance_vector_pub_ = nh_.advertise<geometry_msgs::Point>(
             "avoidance/vector", 10);
 
@@ -933,6 +938,29 @@ public:
         current_target_.pose.pose.position.x = target_smooth_x_.filter(msg->pose.position.x, te);
         current_target_.pose.pose.position.y = target_smooth_y_.filter(msg->pose.position.y, te);
         current_target_.pose.pose.position.z = target_smooth_z_.filter(msg->pose.position.z, te);
+
+        // === 2026-07-16: Debug — 把 raw 和 filtered 一起发到 debug topic ===
+        //   用来 rqt_plot / rostopic echo 对比,看 One Euro 是否真的在工作
+        //   以及 residual 噪声(=|delta|)还有多大。publish 频率自然 = 10Hz
+        //   (target_estimated_pose 的频率);若嫌刷屏可以 throttle。
+        multi_uav_strike::TargetFilterDebug dbg;
+        dbg.header.stamp = now;
+        dbg.header.frame_id = msg->header.frame_id;
+        dbg.pos_raw.x       = msg->pose.position.x;
+        dbg.pos_raw.y       = msg->pose.position.y;
+        dbg.pos_raw.z       = msg->pose.position.z;
+        dbg.pos_filtered.x  = current_target_.pose.pose.position.x;
+        dbg.pos_filtered.y  = current_target_.pose.pose.position.y;
+        dbg.pos_filtered.z  = current_target_.pose.pose.position.z;
+        dbg.pos_delta.x     = dbg.pos_raw.x - dbg.pos_filtered.x;
+        dbg.pos_delta.y     = dbg.pos_raw.y - dbg.pos_filtered.y;
+        dbg.pos_delta.z     = dbg.pos_raw.z - dbg.pos_filtered.z;
+        // 速度维度本节点不直接产生(由 guidance_control_node 计算),填 0
+        dbg.vel_raw = dbg.vel_filtered = dbg.vel_delta = geometry_msgs::Vector3();
+        dbg.cluster_id = locked_cluster_id_;
+        dbg.is_locked  = true;
+        dbg.source     = "position";
+        target_filter_debug_pub_.publish(dbg);
     }
 
     void targetEstTwistCallback(const geometry_msgs::TwistStamped::ConstPtr& msg) {

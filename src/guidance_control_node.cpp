@@ -16,6 +16,7 @@
 #include <Eigen/Eigen>
 
 #include "multi_uav_strike/guidance_strategies.h"
+#include "multi_uav_strike/TargetFilterDebug.h"  // 滤波前后对比 debug msg (2026-07-16)
 #include "multi_uav_strike/one_euro_filter.h"  // 速度指令平滑(2026-07-16),消除聚类抖动→PD→UAV 晃
 
 class GuidanceControlNode {
@@ -47,6 +48,7 @@ private:
     ros::Publisher uav_pose_nwu_pub_;     // NWU姿态发布(RViz用)
     ros::Publisher intercept_point_pub_; // 拦截点可视化
     ros::Publisher debug_pub_;           // 调试信息
+    ros::Publisher target_filter_debug_pub_;  // 2026-07-16: 速度滤波前后对比 debug topic
 
     // Timer for guidance computation
     ros::Timer guidance_timer_;
@@ -357,6 +359,9 @@ public:
 
         intercept_point_pub_ = nh_.advertise<visualization_msgs::Marker>(
             "intercept_point", 10);  // 拦截点可视化
+
+        target_filter_debug_pub_ = nh_.advertise<multi_uav_strike::TargetFilterDebug>(
+            "guidance/target_filter_debug", 10);  // 2026-07-16: 速度滤波前后对比
     }
 
     void initGuidanceStrategy() {
@@ -771,10 +776,43 @@ public:
         last_target_pos_valid_ = true;
 
         // ---- 2) 四通道 One Euro ----
+        // 先 snapshot raw(NED),filter 之后再 publish 一起发到 debug topic
+        const double raw_vx = vel_cmd.linear.x;
+        const double raw_vy = vel_cmd.linear.y;
+        const double raw_vz = vel_cmd.linear.z;
+        const double raw_wz = vel_cmd.angular.z;
         vel_cmd.linear.x  = vel_filter_x_.filter(vel_cmd.linear.x,  te);
         vel_cmd.linear.y  = vel_filter_y_.filter(vel_cmd.linear.y,  te);
         vel_cmd.linear.z  = vel_filter_z_.filter(vel_cmd.linear.z,  te);
         vel_cmd.angular.z = vel_filter_yaw_.filter(vel_cmd.angular.z, te);
+
+        // === 2026-07-16: Debug — raw vs filtered 速度 ===
+        //   用 rqt_plot 看 vel_raw - vel_filtered 的 residual,
+        //   若 residual 平稳但 UAV 还抖 → 不是 filter 的问题,可能是 PX4 控制环增益
+        //   若 residual 跟 UAV 抖同步 → One Euro 不够强,降 min_cutoff 或升 beta
+        multi_uav_strike::TargetFilterDebug dbg;
+        dbg.header.stamp    = now;
+        dbg.header.frame_id = "map";
+        // 位置维度本节点不直接产生(由 mission_manager 计算),填 0
+        dbg.pos_raw = dbg.pos_filtered = dbg.pos_delta = geometry_msgs::Point();
+        // 注:raw 是 NED 系(进入 filterVelocityCmd 之前),filtered 同 NED;
+        //   想跟 PX4 期望对比就直接 echo /guidance/target_filter_debug
+        dbg.vel_raw.x = raw_vx;  dbg.vel_raw.y = raw_vy;  dbg.vel_raw.z = raw_vz;
+        dbg.vel_filtered.x = vel_cmd.linear.x;
+        dbg.vel_filtered.y = vel_cmd.linear.y;
+        dbg.vel_filtered.z = vel_cmd.linear.z;
+        dbg.vel_delta.x = raw_vx - vel_cmd.linear.x;
+        dbg.vel_delta.y = raw_vy - vel_cmd.linear.y;
+        dbg.vel_delta.z = raw_vz - vel_cmd.linear.z;
+        // yaw_rate 走的是 angular.z(TRACK 模式才非 0),塞到 vel_delta.z 不合适,
+        //   直接把 raw_wz / filtered wz 也保留在 vel_* 里(overwrite 上面):
+        dbg.vel_raw.z    = raw_wz;       // 把 angular.z 也展示一下,用户看 rqt_plot 自己辨认
+        dbg.vel_filtered.z = vel_cmd.angular.z;
+        dbg.vel_delta.z  = raw_wz - vel_cmd.angular.z;
+        dbg.cluster_id = 0;  // 本节点不感知 cluster_id,留给 mission_manager 的 msg
+        dbg.is_locked  = is_target_pose_received_;
+        dbg.source     = "velocity";
+        target_filter_debug_pub_.publish(dbg);
     }
 
     // TRACK模式专用：基于视线角俯仰角的 stand-off 跟踪

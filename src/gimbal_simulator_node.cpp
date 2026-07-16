@@ -94,6 +94,7 @@ private:
     //   current_gimbal_pitch_ = -π/2   → 垂直下视
     //   default_pitch_deg_             → 目标丢失时回退到此角度(默认 -45)
     double current_gimbal_pitch_ = 0.0;
+    double current_uav_yaw_      = 0.0;   // 仅保留机头朝向,用于稳像世界姿态构造
     double default_pitch_deg_;
     double default_pitch_rad_;
 
@@ -263,6 +264,14 @@ public:
         }
         current_uav_pose_.header.stamp = msg->header.stamp;
         current_uav_pose_.header.frame_id = msg->header.frame_id;
+
+        // 提取机头朝向 (NWU 世界 + FLU 机体 下的 yaw)
+        //   yaw = atan2(2(wz + xy), 1 - 2(y² + z²))
+        // 用于稳像世界姿态构造,与 roll/pitch 解耦
+        const auto& qn = current_uav_pose_.pose.orientation;
+        current_uav_yaw_ = std::atan2(2.0 * (qn.w * qn.z + qn.x * qn.y),
+                                      1.0 - 2.0 * (qn.y * qn.y + qn.z * qn.z));
+
         is_uav_pose_received_ = true;
     }
 
@@ -405,28 +414,46 @@ public:
 
     // 计算相机世界姿态(纯函数, 不改状态)
     // 注意: 不写缓存, 调用方要么自己存、要么用 recomputeCameraTargetProjection() 缓存版
+    //
+    // === 2026-07-16: 稳像世界姿态 (Plan B) ===
+    // 老版本 world_cam = uav_quat * setRPY(0, pitch, 0) 把 UAV 的 roll/pitch 全部
+    // 叠进了相机姿态,导致任何机体抖动都被斜距放大成目标估计横漂。
+    // 新版本: 仅用 (uav_yaw, gimbal_pitch) 直接构造 R_world_cam,
+    //   光轴在 NWU 世界系 = (cos p·cos y, cos p·sin y, -sin p)
+    //   图像上方向 = world_up 在光轴平面的投影
+    //   图像右方向 = 光轴 × 上方向
+    // 完全不依赖 UAV roll/机体 pitch,UAV 一滚转 R_world_cam 不变。
     Eigen::Quaterniond currentCameraWorldQuat() const {
-        // body 系: UAV 机体 (NWU: x=前, y=左, z=上)
-        // 相机相对机体只有 pitch (新约定: 0=水平, -π/2=下视)
-        // 注意: setRPY 在 NWU 下, 负 pitch 意味着"低头"
-        tf::Quaternion body_cam_quat;
-        body_cam_quat.setRPY(0.0, current_gimbal_pitch_, 0.0);
+        const double cy = std::cos(current_uav_yaw_);
+        const double sy = std::sin(current_uav_yaw_);
+        const double cp = std::cos(current_gimbal_pitch_);
+        const double sp = std::sin(current_gimbal_pitch_);
 
-        // UAV 在 NWU 下的姿态
-        tf::Quaternion uav_quat(
-            current_uav_pose_.pose.orientation.x,
-            current_uav_pose_.pose.orientation.y,
-            current_uav_pose_.pose.orientation.z,
-            current_uav_pose_.pose.orientation.w);
+        // 光轴 (cam +z) → 世界方向
+        Eigen::Vector3d opt(cp * cy, cp * sy, -sp);
+        // 图像上 (cam +x) → world_up 在光轴平面的投影
+        Eigen::Vector3d world_up(0.0, 0.0, 1.0);
+        Eigen::Vector3d up_proj = world_up - opt * world_up.dot(opt);
+        if (up_proj.norm() < 1e-3) {
+            // 极限: 相机光轴正上/正下 → 用机头方向作 "上"
+            up_proj = Eigen::Vector3d(cy, sy, 0.0);
+        }
+        up_proj.normalize();
+        // 图像右 (cam +y) → 光轴 × 上方向
+        Eigen::Vector3d right = opt.cross(up_proj);
+        if (right.norm() < 1e-6) {
+            right = Eigen::Vector3d::UnitY();
+        } else {
+            right.normalize();
+        }
+        // 重新正交化 up
+        Eigen::Vector3d up_orth = right.cross(opt);
 
-        // 复合: 先 body 旋转, 再 UAV 旋转 → 世界系
-        tf::Quaternion world_cam_quat = uav_quat * body_cam_quat;
-        world_cam_quat.normalize();
-
-        return Eigen::Quaterniond(world_cam_quat.w(),
-                                  world_cam_quat.x(),
-                                  world_cam_quat.y(),
-                                  world_cam_quat.z());
+        Eigen::Matrix3d R;
+        R.col(0) = up_orth;
+        R.col(1) = right;
+        R.col(2) = opt;
+        return Eigen::Quaterniond(R).normalized();
     }
 
     // ====================================================================
@@ -476,38 +503,20 @@ public:
         gimbal_pose_pub_.publish(msg);
     }
 
-    // camera/pose: 相机世界姿态(直接复用缓存的 q_cam_world_)
+    // camera/pose: 相机世界姿态 (稳像, 与 forward projection 共用 currentCameraWorldQuat)
     void publishCameraPose() {
         geometry_msgs::PoseStamped msg;
         msg.header.stamp = ros::Time::now();
         msg.header.frame_id = "map";
         msg.pose.position = current_uav_pose_.pose.position;
-        // msg.pose.orientation.x = cached_q_cam_world_.x();
-        // msg.pose.orientation.y = cached_q_cam_world_.y();
-        // msg.pose.orientation.z = cached_q_cam_world_.z();
-        // msg.pose.orientation.w = cached_q_cam_world_.w();
-        
-        // body 系: UAV 机体 (NWU: x=前, y=左, z=上)
-        // 相机相对机体只有 pitch (新约定: 0=水平, -π/2=下视)
-        // 注意: setRPY 在 NWU 下, 负 pitch 意味着"低头"
-        tf::Quaternion body_cam_quat;
-        body_cam_quat.setRPY(0.0, -current_gimbal_pitch_, 0.0);
 
-        // UAV 在 NWU 下的姿态
-        tf::Quaternion uav_quat(
-            current_uav_pose_.pose.orientation.x,
-            current_uav_pose_.pose.orientation.y,
-            current_uav_pose_.pose.orientation.z,
-            current_uav_pose_.pose.orientation.w);
-
-        // 复合: 先 body 旋转, 再 UAV 旋转 → 世界系
-        tf::Quaternion world_cam_quat = uav_quat * body_cam_quat;
-        world_cam_quat.normalize();
-
-        msg.pose.orientation.x = world_cam_quat.x();
-        msg.pose.orientation.y = world_cam_quat.y();
-        msg.pose.orientation.z = world_cam_quat.z();
-        msg.pose.orientation.w = world_cam_quat.w();
+        // === 2026-07-16: 改为稳像世界姿态 ===
+        // 与 forward projection 完全一致,UAV 一滚转 camera/pose 不抖。
+        Eigen::Quaterniond q = currentCameraWorldQuat();
+        msg.pose.orientation.x = q.x();
+        msg.pose.orientation.y = q.y();
+        msg.pose.orientation.z = q.z();
+        msg.pose.orientation.w = q.w();
         camera_pose_pub_.publish(msg);
     }
 
