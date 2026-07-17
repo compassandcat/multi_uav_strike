@@ -13,6 +13,7 @@ find_package(catkin REQUIRED COMPONENTS
   sensor_msgs
   nav_msgs
   tf
+  tf2_ros
   visualization_msgs
   eigen_conversions
   message_generation
@@ -57,7 +58,7 @@ generate_messages(
 
 # 声明catkin包（供其他包依赖）
 catkin_package(
-  CATKIN_DEPENDS roscpp std_msgs std_srvs geometry_msgs sensor_msgs nav_msgs tf visualization_msgs mavros_msgs serial message_runtime
+  CATKIN_DEPENDS roscpp std_msgs std_srvs geometry_msgs sensor_msgs nav_msgs tf tf2_ros visualization_msgs mavros_msgs serial message_runtime
 )
 
 # 包含ROS头文件目录

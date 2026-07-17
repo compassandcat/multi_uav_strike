@@ -58,6 +58,8 @@
 #include <mavros_msgs/CommandLong.h>
 #include <mavros_msgs/HomePosition.h>
 #include <tf/transform_datatypes.h> // 用于RPY转四元数
+#include <tf2_ros/static_transform_broadcaster.h>
+#include <geometry_msgs/TransformStamped.h>
 
 #include <string>
 #include <cmath>
@@ -82,6 +84,7 @@
 #include "multi_uav_strike/TrackingState.h"
 #include "multi_uav_strike/WaypointStatus.h"
 #include "multi_uav_strike/UavGatherStatus.h"
+#include "multi_uav_strike/InterUavStatus.h"     // 多机心跳订阅(多机 gather 同步用)
 #include "multi_uav_strike/TargetFilterDebug.h"  // 滤波前后对比 debug msg (2026-07-16)
 #include "multi_uav_strike/one_euro_filter.h"  // 自适应低通,平滑 target_estimated_pose (2026-07-16)
 
@@ -175,6 +178,11 @@ struct SkillRuntime {
     ros::Time                in_task_enter_time;
     // 集结超时计时(仅 skill_type=101 适用)
     ros::Time                gather_enter_time;
+    // 集结期望伙伴名单(仅 skill_type=101 适用)
+    //   - 任务流注入:从 Skill.params_json["devices_sn"] 解出(GS 真实协议)
+    //   - 老路径 fallback:launch 私有 param ~expected_sns(空时)
+    //   - 空 → 单机路径(single_uav_arrived)
+    std::vector<std::string> gather_partners_;
     // 暂停/失败原因,日志用
     std::string              last_event;
 };
@@ -254,6 +262,7 @@ private:
     ros::Subscriber attack_cmd_sub_;       // MAV_CMD_ATTACK typed(multi_uav_strike/AttackCmd)
     // cluster_states_sub_ 在上方已声明
     ros::Subscriber waypoint_status_sub_;  // 航段状态(Phase 4 启用)
+    ros::Subscriber inter_uav_status_sub_; // 多机心跳(/inter_uav/uav_status) — 多机 gather 同步用
 
     // ============== Service Client ==============
     ros::ServiceClient set_mode_client_; // PX4 SITL: 模式切换
@@ -293,6 +302,7 @@ private:
     ros::Timer mission_state_timer_;   // Phase 2: 1Hz MissionState 定频上报
     ros::Timer skill_advance_timer_;   // Phase 3: Skill 状态机推进(独立频率)
     ros::Timer tracking_state_timer_;  // 跟踪锁定期间定频发 tracking_state(state=1) 给 GCS
+    ros::Timer viz_tf_timer_;          // 周期重广播 static TF map->viz_frame_(防止 rviz 漏接 latch)
 
     // tracking_state 上报频率(Hz,协议 §6 / 补充规范 §5)。
     //   跟踪中: 5Hz — GCS 实时闪烁
@@ -347,6 +357,25 @@ private:
     double ref_alt_;
     bool ref_initialized_ = false;
     ros::Subscriber home_position_sub_;
+
+    // 共享世界参考点(只用于 RViz 显示的世界坐标偏移,与控制链路无关)
+    // 多机 SITL 时各机 home 不同。改法:各机 RViz 内容仍发布在本机 local 帧
+    //   "<ns>/map"(原点=本机 home),再由 mission_manager 广播 static TF
+    //   map -> <ns>/map,平移量 = 本机 home 相对 world_ref 的 NWU 偏移。
+    //   这样 plane / 航线 / marker 全都统一被 TF 偏移,不再各算各的。
+    // 单一 UAV(world_ref_auto=true):world_ref=home → 偏移 0 → identity TF → 永在原点。
+    double world_ref_lat_;
+    double world_ref_lon_;
+    double world_ref_alt_;
+    // 单机自动取本机 home 作为 world_ref(默认 true):
+    //   - 单机场景:world_ref = home → 偏移 = 0 → static TF 为 identity → UAV 在原点
+    //   - 多机场景:launch 把 world_ref_auto 设为 false + 注入共享 world_ref(通常 = uav0 home)
+    //              → uav0 identity 在原点,uav1/uav2 按 GPS 偏移分开
+    bool world_ref_auto_ = true;
+    // RViz 帧名 = "<ns>/map"(去掉命名空间前导 '/');无命名空间时回落 "map"
+    std::string viz_frame_;
+    // static TF 广播器:home 锁定后发一次 map -> viz_frame_
+    tf2_ros::StaticTransformBroadcaster static_tf_broadcaster_;
 
     // 避障参数
     double avoidance_safe_distance_;
@@ -457,6 +486,19 @@ private:
     double gather_timeout_;       // 101 集结合计超时默认 60s
     // 期望集结 UAV SN 列表(参数 --expected-sns "uav0,uav2"),101 用
     std::vector<std::string> expected_sns_;
+    // === 多机集结同步(Phase 7 接通)===
+    // 伙伴心跳缓存(来自 comm_node 发的 /inter_uav/uav_status)
+    //  - key = 伙伴 SN
+    //  - value = (last InterUavStatus, 最近刷新时间)
+    // 用途:IN_TASK (skill_type=101) 时遍历 expected/gather_partners_ 名单,
+    //       查心跳里 skill_type==101 的伙伴数,达到 gather_threshold_ 视为齐了
+    struct PartnerHeartbeat {
+        multi_uav_strike::InterUavStatus::ConstPtr latest;
+        ros::Time last_update;
+    };
+    std::map<std::string, PartnerHeartbeat> partner_heartbeats_;
+    double partner_heartbeat_timeout_;  // 伙伴心跳超时(秒,默认 3.0)
+    double gather_threshold_;           // 门限 1.0=全齐,0.7=70% 即可
     // task_flow 最新缓存(防止回调顺序与启动冲突)
     multi_uav_strike::TaskFlow::ConstPtr latest_task_flow_;
     // 来自 typed WorkMode 的 topic,优先级高于 String(过渡期双订阅)
@@ -602,6 +644,20 @@ public:
         nh_private_.param<double>("ref_lat", ref_lat_, 36.096);
         nh_private_.param<double>("ref_lon", ref_lon_, 114.392);
         nh_private_.param<double>("ref_alt", ref_alt_, 100.0);
+        // 共享世界参考点(只用于 RViz quad/pose_nwu 的世界坐标转换,不参与控制)
+        nh_private_.param<double>("world_ref_lat", world_ref_lat_, 36.058);
+        nh_private_.param<double>("world_ref_lon", world_ref_lon_, 114.549);
+        nh_private_.param<double>("world_ref_alt", world_ref_alt_, 75.0);
+        // 单机自动模式:默认 true → home 到位后把 world_ref 覆盖成本机 home,
+        //   使 x/y offset=0,单机永远在原点;多机 launch 设 false 并注入共享 world_ref。
+        nh_private_.param<bool>("world_ref_auto", world_ref_auto_, true);
+
+        // RViz 帧名:去掉命名空间前导 '/' 后拼 "/map"(如 /uav0 → uav0/map);无命名空间 → map
+        {
+            std::string ns = nh_.getNamespace();
+            if (!ns.empty() && ns[0] == '/') ns = ns.substr(1);
+            viz_frame_ = ns.empty() ? "map" : (ns + "/map");
+        }
 
         // 起飞后 work_mode 兜底值(默认 SEARCH_ONLY,兼容老 GS 不发 SET_WORKMODE 的场景)
         // 用户已通过 SET_WORKMODE 设过 SEARCH_TRACK/STRIKE 时,起飞后保留用户的设置,不会落到这里
@@ -670,6 +726,15 @@ public:
         if (!expected_sns_.empty()) {
             ROS_INFO("[MissionManager] Expected gather SNs: %zu", expected_sns_.size());
         }
+
+        // === 多机集结同步参数(Phase 7 接通)===
+        // 伙伴心跳超时:超过此时间未刷新视为失联,失联 SN 从 arrived 集合中剔除
+        nh_private_.param<double>("partner_heartbeat_timeout", partner_heartbeat_timeout_, 3.0);
+        // 集结门限:到达伙伴数 / 期望伙伴数 ≥ 此值 → 视为"齐了",推进下一条 skill
+        // 1.0 = 必须全部到齐;0.7 = 70% 到齐即可(降级兼容掉队 UAV)
+        nh_private_.param<double>("gather_threshold", gather_threshold_, 1.0);
+        ROS_INFO("[MissionManager] Gather sync: heartbeat_timeout=%.1fs, threshold=%.2f",
+                 partner_heartbeat_timeout_, gather_threshold_);
 
     }
 
@@ -770,6 +835,12 @@ public:
         // waypoint_executor 段状态(Phase 4 启用)
         waypoint_status_sub_ = nh_.subscribe("waypoint_executor/status", 10,
                                               &MissionManager::waypointStatusCallback, this);
+
+        // 多机心跳(由 comm_node 发布到 /inter_uav/uav_status) — 多机 gather 同步
+        // 50Hz 上限避免高频回调拖累,实际 comm_node 自适应 1/5/20Hz
+        inter_uav_status_sub_ = nh_.subscribe(
+            "/inter_uav/uav_status", 20,
+            &MissionManager::interUavStatusCallback, this);
 
         // === PX4 home 自动加载(ref_lat/lon/alt 的唯一权威来源)===
         home_position_sub_ = nh_.subscribe("mavros/home_position/home", 10,
@@ -886,6 +957,13 @@ public:
         tracking_state_timer_ = nh_.createTimer(
             ros::Duration(1.0 / TRACKING_STATE_IDLE_RATE_HZ),
             &MissionManager::trackingStateTimerCallback, this);
+
+        // 静态 TF 周期重广播:home 锁定后启动,每 30s 重发一次,防止 rviz 启动晚于广播时机
+        // 漏接 latched TF、或 TF 缓存被回收后丢失 viz_frame_。
+        viz_tf_timer_ = nh_.createTimer(
+            ros::Duration(30.0),
+            &MissionManager::vizTfTimerCallback, this);
+        viz_tf_timer_.stop();  // 等 home 锁定后再 start()
     }
 
     void initTargetState() {
@@ -1013,6 +1091,66 @@ public:
         ref_lon_ = msg->geo.longitude;
         ref_alt_ = msg->geo.altitude;
         ref_initialized_ = true;
+
+        // 单机自动模式:把 world_ref 覆盖成本机 home → 偏移 = 0 → identity TF → 永在原点。
+        // 多机 launch 关掉 world_ref_auto 并注入共享 world_ref(通常 = uav0 home),
+        // 各机据此算出自己相对 world_ref 的偏移。
+        if (world_ref_auto_) {
+            world_ref_lat_ = ref_lat_;
+            world_ref_lon_ = ref_lon_;
+            world_ref_alt_ = ref_alt_;
+            ROS_WARN("[MissionManager] world_ref_auto: world_ref <- home (%.7f, %.7f, %.2f)",
+                     world_ref_lat_, world_ref_lon_, world_ref_alt_);
+        }
+
+        // 广播 static TF: map -> viz_frame_
+        // 本机所有 RViz 内容(plane / 航线 / marker)都发布在 viz_frame_(local, 原点=本机 home),
+        // 由这条 TF 统一平移到世界 map 帧。平移 = 本机 home 相对 world_ref 的 NWU 偏移。
+        //   north_m = (home_lat - world_ref_lat) * 111000
+        //   east_m  = (home_lon - world_ref_lon) * 111000 * cos(world_ref_lat)
+        //   NWU: x = north_m, y = -east_m, z = 0(各机 home 高一致 + 避 geoid 陷阱)
+        publishVizFrameTf();
+        // 启动周期重广播 timer,防止 rviz 启动晚于 home 锁定时漏接 latched TF。
+        if (!viz_tf_timer_.hasStarted()) {
+            viz_tf_timer_.start();
+        }
+    }
+
+    /**
+     * 广播 static TF: map -> viz_frame_
+     * 本机所有 RViz 内容(plane / 航线 / marker)都发布在 viz_frame_(local, 原点=本机 home),
+     * 由这条 TF 统一平移到世界 map 帧。平移 = 本机 home 相对 world_ref 的 NWU 偏移。
+     *   north_m = (home_lat - world_ref_lat) * 111000
+     *   east_m  = (home_lon - world_ref_lon) * 111000 * cos(world_ref_lat)
+     *   NWU: x = north_m, y = -east_m, z = 0(各机 home 高一致 + 避 geoid 陷阱)
+     * 周期性重广播是为了兜底 rviz 启动晚于 home 锁定、或 TF 缓存被回收时
+     * 仍能找到 viz_frame_(否则 target_estimator / gimbal 等会报 Frame does not exist)。
+     */
+    void publishVizFrameTf() {
+        if (!ref_initialized_) return;  // home 还没锁定,无参考点可发
+        const double cos_lat = std::cos(world_ref_lat_ * M_PI / 180.0);
+        const double north_m = (ref_lat_ - world_ref_lat_) * 111000.0;
+        const double east_m  = (ref_lon_ - world_ref_lon_) * 111000.0 * cos_lat;
+
+        geometry_msgs::TransformStamped tf_msg;
+        tf_msg.header.stamp = ros::Time::now();
+        tf_msg.header.frame_id = "map";       // 世界帧(RViz Fixed Frame)
+        tf_msg.child_frame_id  = viz_frame_;  // 本机 local 帧
+        tf_msg.transform.translation.x =  north_m;
+        tf_msg.transform.translation.y = -east_m;
+        tf_msg.transform.translation.z =  0.0;
+        tf_msg.transform.rotation.w = 1.0;    // 只平移,不旋转
+        static_tf_broadcaster_.sendTransform(tf_msg);
+        ROS_INFO_THROTTLE(60.0,
+            "[MissionManager] static TF map -> %s : (%.2f, %.2f, 0)",
+            viz_frame_.c_str(), north_m, -east_m);
+    }
+
+    /**
+     * 周期重广播 static TF,见 publishVizFrameTf() 注释。
+     */
+    void vizTfTimerCallback(const ros::TimerEvent&) {
+        publishVizFrameTf();
     }
 
     /**
@@ -1101,11 +1239,14 @@ public:
         is_pose_received_ = true;
 
         // 发布NWU姿态用于RViz显示
-        // NED -> NWU: x不变, y取反, z取反
+        // 内容全在本机 local 帧 viz_frame_(原点=本机 home),多机分离交给 static TF map->viz_frame_。
+        //   位置:local NED -> NWU(x=north, y=-east, z=-down),不再自己算 GPS 偏移。
+        //   单机:TF identity → 原点;多机:TF 平移 → 各机分开。
+        // 控制链路完全不受影响(此 topic 仅 RViz 订阅)。
         geometry_msgs::PoseStamped uav_pose_nwu;
-        uav_pose_nwu.pose.position.x = current_pose_.pose.position.x;
-        uav_pose_nwu.pose.position.y = -current_pose_.pose.position.y;
-        uav_pose_nwu.pose.position.z = -current_pose_.pose.position.z;
+        uav_pose_nwu.pose.position.x = current_pose_.pose.position.x;   // north
+        uav_pose_nwu.pose.position.y = -current_pose_.pose.position.y;  // -east
+        uav_pose_nwu.pose.position.z = -current_pose_.pose.position.z;  // -down (up)
         // 四元数 NED/FRD -> NWU/FLU:对 yaw,只取 y,z 取反即可保持航向角取负
         // (NED yaw 83° CW from N → NWU yaw -83° CCW from N)
         uav_pose_nwu.pose.orientation.w =  current_pose_.pose.orientation.w;
@@ -1113,7 +1254,7 @@ public:
         uav_pose_nwu.pose.orientation.y = -current_pose_.pose.orientation.y;
         uav_pose_nwu.pose.orientation.z = -current_pose_.pose.orientation.z;
         uav_pose_nwu.header.stamp = ros::Time::now();
-        uav_pose_nwu.header.frame_id = "map";  // RViz
+        uav_pose_nwu.header.frame_id = viz_frame_;  // 本机 local 帧,由 static TF 偏移
         uav_pose_nwu_pub_.publish(uav_pose_nwu);
     }
 
@@ -1291,6 +1432,28 @@ public:
             sr.state = SkillState::PENDING;
             sr.state_enter_time = ros::Time::now();
             sr.last_event = "queued";
+            // === 集结合(skill_type=101):从 params_json 解 devices_sn 作多机同步名单 ===
+            //   1) 任务流带 "devices_sn":[...] → 用它(GS 真实协议下发)
+            //   2) 没带 → fallback 到 launch 私有 param ~expected_sns(老路径)
+            //   3) 都没 → gather_partners_ 留空,IN_TASK 走 single_uav_arrived
+            if (s.skill_type == 101) {
+                sr.gather_partners_ = parseDevicesSnFromParamsJson(s.params_json);
+                if (sr.gather_partners_.empty()) {
+                    sr.gather_partners_ = expected_sns_;  // fallback
+                }
+                if (!sr.gather_partners_.empty()) {
+                    ROS_INFO("[MissionManager] Gather skill '%s' partners (%zu): %s",
+                             s.skill_id.c_str(), sr.gather_partners_.size(),
+                             [&]() {
+                                 std::string s_joined;
+                                 for (size_t i = 0; i < sr.gather_partners_.size(); ++i) {
+                                     if (i) s_joined += ",";
+                                     s_joined += sr.gather_partners_[i];
+                                 }
+                                 return s_joined;
+                             }().c_str());
+                }
+            }
             skill_queue_.push_back(sr);
         }
         current_skill_index_ = 0;
@@ -2105,6 +2268,61 @@ public:
     void waypointStatusCallback(const multi_uav_strike::WaypointStatus::ConstPtr& msg) {
         latest_wp_status_ = msg;
         latest_wp_status_time_ = ros::Time::now();
+    }
+
+    /**
+     * 多机心跳回调 — 多机 gather 同步用
+     *   - 仅缓存本机(由 nh_.getNamespace() 决定)以外的 SN
+     *   - 缓存带时间戳,skill_advance_timer 周期清理超时
+     * 注:回调里不做"是否到齐"判断,统一在 skillAdvanceTimerCallback IN_TASK 分支
+     *   调 checkAllUavsGathered() 做实时快照,避免竞争
+     */
+    void interUavStatusCallback(const multi_uav_strike::InterUavStatus::ConstPtr& msg) {
+        std::string my_ns = nh_.getNamespace();
+        if (!my_ns.empty() && my_ns[0] == '/') my_ns = my_ns.substr(1);
+        if (msg->sn == my_ns) {
+            return;  // 忽略自己的
+        }
+        partner_heartbeats_[msg->sn].latest      = msg;
+        partner_heartbeats_[msg->sn].last_update = ros::Time::now();
+    }
+
+    /**
+     * 从 Skill.params_json 解析 "devices_sn":["uav0","uav1",...]
+     *   - 简单子串提取,无 nlohmann/json 依赖
+     *   - 容错:解析失败或字段缺失 → 返回空 vector(→ 单机路径)
+     *   - 取出的字符串会 strip 首尾空白
+     */
+    std::vector<std::string> parseDevicesSnFromParamsJson(const std::string& json_str) {
+        std::vector<std::string> result;
+        const std::string key = "\"devices_sn\"";
+        size_t key_pos = json_str.find(key);
+        if (key_pos == std::string::npos) return result;
+        size_t arr_start = json_str.find('[', key_pos);
+        if (arr_start == std::string::npos) return result;
+        size_t arr_end = json_str.find(']', arr_start);
+        if (arr_end == std::string::npos) return result;
+        std::string arr = json_str.substr(arr_start + 1, arr_end - arr_start - 1);
+        size_t pos = 0;
+        while (pos < arr.size()) {
+            while (pos < arr.size() &&
+                   (arr[pos] == ' ' || arr[pos] == '\t' || arr[pos] == '\n' ||
+                    arr[pos] == '\r' || arr[pos] == ',')) {
+                ++pos;
+            }
+            if (pos >= arr.size() || arr[pos] != '"') break;
+            ++pos;
+            size_t end_quote = arr.find('"', pos);
+            if (end_quote == std::string::npos) break;
+            std::string item = arr.substr(pos, end_quote - pos);
+            // strip 前后空白
+            size_t a = 0, b = item.size();
+            while (a < b && (item[a] == ' ' || item[a] == '\t')) ++a;
+            while (b > a && (item[b-1] == ' ' || item[b-1] == '\t')) --b;
+            if (b > a) result.push_back(item.substr(a, b - a));
+            pos = end_quote + 1;
+        }
+        return result;
     }
 
     // ============== 定时器回调 ==============
@@ -3313,8 +3531,10 @@ public:
                         latest_wp_status_->skill_id == sr.msg.skill_id &&
                         latest_wp_status_->skill_total > 0 &&
                         latest_wp_status_->skill_idx >= latest_wp_status_->skill_total;
-                    // 多 UAV 同步:所有 expected_sns_ 都已到达各自集结点(Phase 7 接入 comm_node 后实现)
-                    bool all_uavs_arrived = checkAllUavsGathered();
+                    // 多 UAV 同步:本机 + 期望伙伴中达到门限的 SN 数 / 期望数 ≥ gather_threshold_
+                    //   名单来自 SkillRuntime.gather_partners_(任务流 devices_sn 注入)
+                    //   空名单 → 多机同步关闭,等价于单 UAV 路径
+                    bool all_uavs_arrived = checkAllUavsGathered(sr.gather_partners_);
                     bool timed_out = gather_timeout_ > 0.0 &&
                         (now - sr.gather_enter_time).toSec() > gather_timeout_;
                     if (single_uav_arrived || all_uavs_arrived || timed_out) {
@@ -3324,10 +3544,11 @@ public:
                             "IN_TASK to EXIT_PENDING (gather timeout)" :
                             single_uav_arrived ? "IN_TASK to EXIT_PENDING (single UAV at gather point)" :
                             "IN_TASK to EXIT_PENDING (all UAVs gathered)";
-                        ROS_WARN("[MissionManager] Skill[101] Gather %s",
+                        ROS_WARN("[MissionManager] Skill[101] Gather %s (partners=%zu, threshold=%.2f)",
                                  timed_out ? "TIMEOUT" :
                                  single_uav_arrived ? "ARRIVED (single UAV at last skill_area)" :
-                                 "COMPLETE (all UAVs)");
+                                 "COMPLETE (all UAVs)",
+                                 sr.gather_partners_.size(), gather_threshold_);
                     }
                     // 发本机 gather_status(其它 UAV 看)
                     publishGatherStatus();
@@ -3416,18 +3637,50 @@ public:
     }
 
     /**
-     * 101 集结 — 多 UAV 同步检查
-     * 单 UAV 场景(expected_sns_ 空):返回 false,让 single_uav_arrived 处理本机到达判定
-     * 多 UAV 场景(expected_sns_ 非空):Phase 7 之前不查心跳,返回 false(各 UAV 靠 single_uav_arrived 自行退出)
-     *   Phase 7 会接 comm_node 的 inter_uav/gather_status,从 heartbeats_ 缓存查所有 expected_sns_ 是否都已上报 arrived
+     * 101 集结 — 多 UAV 同步检查(Phase 7 接通)
+     * 参数:gather_partners — 本条 gather skill 的期望伙伴 SN 列表(从 Skill.params_json 解出)
+     *   空 → 单机路径,返回 false(让 single_uav_arrived 决定)
+     *   非空 → 遍历名单,在 partner_heartbeats_ 缓存里查:
+     *     - 伙伴 SN 在缓存中存在
+     *     - 心跳未超时(默认 3s)
+     *     - 伙伴当前 skill_type == 101(在集结合)
+     *   满足的伙伴数 / 名单数(去本机) ≥ gather_threshold_ → 返回 true
+     *
+     * 注 1:本机不计入"到达"判定(由 single_uav_arrived 单独处理)
+     * 注 2:不查 partner.skill_id — 不同 UAV 用不同 skill_id 是常见情况
+     *   (e.g., uav0_gather / uav1_gather),只看 skill_type 即可识别"在集结合"
+     * 注 3:本检查有 race:伙伴刚进 IN_TASK(skill_type 切到 101)但还没到点
+     *   也会算到。gather_timeout_ 兜底(掉队机不响应 → 最终超时推进)
+     *   严格"到达"判定需 InterUavStatus 加 arrived 字段,目前用 skill_type 粗判
      */
-    bool checkAllUavsGathered() const {
-        if (expected_sns_.empty()) {
-            // 单 UAV:不在这儿返回 true(否则会跳过 single_uav_arrived,立即 COMPLETE)
+    bool checkAllUavsGathered(const std::vector<std::string>& gather_partners) const {
+        if (gather_partners.empty()) {
+            // 单机/未配置多机 → 让 single_uav_arrived 处理
             return false;
         }
-        // TODO Phase 7:遍历 heartbeats_,检查 expected_sns_ 内所有 UAV 都已上报 gather arrived
-        return false;
+        ros::Time now = ros::Time::now();
+        size_t arrived_count = 0;
+        size_t valid_partners = 0;
+        std::string my_ns = nh_.getNamespace();
+        if (!my_ns.empty() && my_ns[0] == '/') my_ns = my_ns.substr(1);
+
+        for (const auto& sn : gather_partners) {
+            if (sn == my_ns) continue;  // 跳过自己
+            ++valid_partners;
+            auto it = partner_heartbeats_.find(sn);
+            if (it == partner_heartbeats_.end()) continue;
+            const auto& ph = it->second;
+            if (!ph.latest) continue;
+            if ((now - ph.last_update).toSec() > partner_heartbeat_timeout_) continue;
+            if (ph.latest->skill_type == 101) {
+                ++arrived_count;
+            }
+        }
+        if (valid_partners == 0) {
+            return false;  // 名单里全是本机 → 等同单机路径
+        }
+        double ratio = static_cast<double>(arrived_count) / static_cast<double>(valid_partners);
+        return ratio >= gather_threshold_;
     }
 
     /**

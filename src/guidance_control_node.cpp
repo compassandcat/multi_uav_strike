@@ -45,10 +45,10 @@ private:
     ros::Publisher flight_mode_pub_;      // flight_mode
     ros::Publisher strike_eval_pub_;      // 打击评估结果
     ros::Publisher thrust_dir_pub_;       // 推力方向可视化
-    ros::Publisher uav_pose_nwu_pub_;     // NWU姿态发布(RViz用)
     ros::Publisher intercept_point_pub_; // 拦截点可视化
     ros::Publisher debug_pub_;           // 调试信息
     ros::Publisher target_filter_debug_pub_;  // 2026-07-16: 速度滤波前后对比 debug topic
+    std::string viz_frame_;              // RViz 帧名 "<ns>/map"(多机分离由 static TF 偏移)
 
     // Timer for guidance computation
     ros::Timer guidance_timer_;
@@ -330,6 +330,13 @@ public:
     }
 
     void initPublishers() {
+        // RViz 帧名:去掉命名空间前导 '/' 后拼 "/map"(如 /uav0 → uav0/map);无命名空间 → map
+        {
+            std::string vns = nh_.getNamespace();
+            if (!vns.empty() && vns[0] == '/') vns = vns.substr(1);
+            viz_frame_ = vns.empty() ? "map" : (vns + "/map");
+        }
+
         vel_cmd_pub_ = nh_.advertise<geometry_msgs::Twist>(
             vel_cmd_topic_, 10);
 
@@ -353,9 +360,6 @@ public:
 
         thrust_dir_pub_ = nh_.advertise<visualization_msgs::Marker>(
             "thrust_direction", 10);  // 发布推力方向可视化
-
-        uav_pose_nwu_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(
-            "quad/pose_nwu", 10);  // NWU姿态发布(RViz用)
 
         intercept_point_pub_ = nh_.advertise<visualization_msgs::Marker>(
             "intercept_point", 10);  // 拦截点可视化
@@ -1177,7 +1181,7 @@ public:
     void publishThrustDirectionMarker(const multi_uav_strike::AttitudeThrustCommand& cmd) {
         visualization_msgs::Marker marker;
         marker.header.stamp = ros::Time::now();
-        marker.header.frame_id = "map";
+        marker.header.frame_id = viz_frame_;
         marker.ns = "thrust_direction";
         marker.id = 0;
         marker.type = visualization_msgs::Marker::ARROW;
@@ -1216,7 +1220,7 @@ public:
     void publishInterceptPointMarker(const Eigen::Vector3d& intercept_point) {
         visualization_msgs::Marker marker;
         marker.header.stamp = ros::Time::now();
-        marker.header.frame_id = "map";
+        marker.header.frame_id = viz_frame_;
         marker.ns = "intercept_point";
         marker.id = 0;
         marker.type = visualization_msgs::Marker::SPHERE;

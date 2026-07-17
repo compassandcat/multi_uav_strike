@@ -44,6 +44,8 @@
 #include "multi_uav_strike/InterUavStatus.h"
 #include "multi_uav_strike/UavGatherStatus.h"
 #include "multi_uav_strike/YoloDetection.h"
+#include "multi_uav_strike/MissionState.h"   // 用于把当前 skill_type/skill_id 灌进 InterUavStatus
+#include "multi_uav_strike/WorkMode.h"       // 用于把当前 work_mode 灌进 InterUavStatus
 
 class CommNode {
 private:
@@ -58,6 +60,9 @@ private:
     ros::Subscriber target_est_pose_sub_;    // 目标估计位置
     // === Phase 7: 其他 UAV 心跳 ===
     ros::Subscriber inter_uav_status_sub_;
+    // === Phase 7: 本机 mission_state 订阅(把 skill_type/skill_id 灌进 InterUavStatus)===
+    ros::Subscriber mission_state_sub_;
+    ros::Subscriber work_mode_state_sub_;
     // === PX4 home 自动加载 ===
     ros::Subscriber home_position_sub_;
 
@@ -197,6 +202,16 @@ public:
         inter_uav_status_sub_ = nh_.subscribe(
             "/inter_uav/uav_status", 50,
             &CommNode::interUavStatusCallback, this);
+
+        // === Phase 7: 本机 mission_state(1Hz,来自 mission_manager)===
+        //   用来把 current_skill_type_/skill_id_/work_mode_ 灌进 InterUavStatus,
+        //   否则心跳里 skill_type 永远是 0(占位),多机 gather 同步无法判别伙伴当前阶段。
+        mission_state_sub_ = nh_.subscribe(
+            "mission/mission_state", 10,
+            &CommNode::missionStateCallback, this);
+        work_mode_state_sub_ = nh_.subscribe(
+            "mission/work_mode_state", 10,
+            &CommNode::workModeStateCallback, this);
 
         // === PX4 home 自动加载(ref_lat/lon/alt 的唯一来源,不再硬编码)===
         home_position_sub_ = nh_.subscribe(
@@ -470,6 +485,23 @@ public:
             ROS_INFO("[Comm] >>>> Heartbeat rate adjusted to %.1f Hz (closest UAV: %.1f m)",
                      current_heartbeat_rate_, min_dist);
         }
+    }
+
+    /**
+     * mission_state 回调(mission_manager 1Hz 上报) — 把当前 skill_type/skill_id
+     * 缓存下来,InterUavStatus 发布时携带。
+     *   -1 表示无 active skill,心跳里照样发出 -1(下游应忽略)。
+     */
+    void missionStateCallback(const multi_uav_strike::MissionState::ConstPtr& msg) {
+        current_skill_type_ = msg->skill_type;  // 可能是 -1(无 active skill)
+        current_skill_id_   = msg->skill_id;
+    }
+
+    /**
+     * work_mode_state 回调(mission_manager 1Hz 上报) — 把当前 work_mode 灌进心跳
+     */
+    void workModeStateCallback(const multi_uav_strike::WorkMode::ConstPtr& msg) {
+        current_typed_work_mode_ = msg->mode;
     }
 
     /**

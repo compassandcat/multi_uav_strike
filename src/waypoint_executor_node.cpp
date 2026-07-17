@@ -77,6 +77,7 @@ private:
     ros::Publisher status_pub_;              // 执行状态
     ros::Publisher waypoints_rviz_pub_;     // 航点显示（RViz）
     ros::Publisher waypoint_path_pub_;      // 航点路径（RViz Path显示）
+    std::string viz_frame_;                  // RViz 帧名 "<ns>/map"(多机分离由 static TF 偏移)
     // === Phase 4: 类型化发布 ===
     ros::Publisher waypoint_status_pub_;    // typed WaypointStatus(给 mission_manager 用)
     ros::Publisher current_target_pub_;     // 当前航段终点 PoseStamped(给 uav_avoidance_node 用)
@@ -256,6 +257,13 @@ public:
             uav_id_ = atoi(num_str.c_str());
         } else {
             uav_id_ = 0;
+        }
+
+        // RViz 帧名:去掉命名空间前导 '/' 后拼 "/map"(如 /uav0 → uav0/map);无命名空间 → map
+        {
+            std::string vns = ns;
+            if (!vns.empty() && vns[0] == '/') vns = vns.substr(1);
+            viz_frame_ = vns.empty() ? "map" : (vns + "/map");
         }
 
         // 基准点参数: 不再硬编码,而由 homePositionCallback() 从 PX4 自动加载
@@ -967,13 +975,15 @@ public:
         visualization_msgs::MarkerArray marker_array;
 
         visualization_msgs::Marker line_strip;
-        line_strip.header.frame_id = "map";
+        line_strip.header.frame_id = viz_frame_;
         line_strip.header.stamp = ros::Time::now();
         line_strip.ns = "waypoint_path";
         line_strip.id = 0;
         line_strip.type = visualization_msgs::Marker::LINE_STRIP;
         line_strip.action = visualization_msgs::Marker::ADD;
         line_strip.scale.x = 0.3;
+        // LINE_STRIP 不用 orientation,但 RViz 仍会校验四元数,显式置 identity
+        line_strip.pose.orientation.w = 1.0;
         // 颜色根据 uav_id 设置
         line_strip.color.r = 1.0;
         line_strip.color.g = 0.3 + 0.2 * uav_id_;
@@ -981,7 +991,7 @@ public:
         line_strip.color.a = 1.0;
 
         nav_msgs::Path path_msg;
-        path_msg.header.frame_id = "map";
+        path_msg.header.frame_id = viz_frame_;
         path_msg.header.stamp = ros::Time::now();
 
         for (size_t i = 0; i < waypoint_queue_.size(); ++i) {
@@ -996,7 +1006,7 @@ public:
 
             // Path for RViz
             geometry_msgs::PoseStamped path_pose;
-            path_pose.header.frame_id = "map";
+            path_pose.header.frame_id = viz_frame_;
             path_pose.header.stamp = ros::Time::now();
             path_pose.pose.position.x = wp.ned_x;
             path_pose.pose.position.y = -wp.ned_y;
@@ -1005,7 +1015,7 @@ public:
             path_msg.poses.push_back(path_pose);
 
             visualization_msgs::Marker marker;
-            marker.header.frame_id = "map";
+            marker.header.frame_id = viz_frame_;
             marker.header.stamp = ros::Time::now();
             marker.ns = "waypoints";
             marker.id = i + 1;
@@ -1042,7 +1052,10 @@ public:
         }
 
         line_strip.lifetime = ros::Duration(0);
-        marker_array.markers.push_back(line_strip);
+        // LINE_STRIP 至少要 2 个点;takeoff 等 skill 队列空/单点时跳过,避免 RViz 警告
+        if (line_strip.points.size() >= 2) {
+            marker_array.markers.push_back(line_strip);
+        }
 
         waypoints_rviz_pub_.publish(marker_array);
         waypoint_path_pub_.publish(path_msg);

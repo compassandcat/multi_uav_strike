@@ -1,68 +1,68 @@
 <?xml version="1.0"?>
 <!--
-  single_uav_px4_sitl_test.launch
-  单机 PX4 SITL 测试 launch
+  per_uav_sitl_group.launch
+  ============================================================
+  单个 UAV 的完整 SITL 子树(SITL 仿真场景)
+  ============================================================
+  用途:多机 launch 文件 (multi_uav_px4_sitl_test_*.launch) 通过
+       `<include file="per_uav_sitl_group.launch">` 调用本文件 N 次,
+       每次传不同的 uav_name / fcu_url / tgt_system / flow / device_id,
+       实现"per-UAV 配置独立 + UAV 共享 target_motion"。
 
-  使用方法：
-  1. 先启动 PX4 SITL: ./src/PX4_Firmware/Tools/sitl_dual_run.sh
-  2. 再启动此 launch: roslaunch multi_uav_strike single_uav_px4_sitl_test.launch
+  包含节点 (8 个):
+    1. mavros                       (PX4 SITL <-> ROS 桥)
+    2. gimbal_simulator_node        (云台仿真 + YOLO 模拟)
+    3. target_estimator_node        (反投影 + 多实例聚类)
+    4. guidance_control_node        (制导律)
+    5. waypoint_executor_node       (航点执行 + 状态上报)
+    6. comm_node                    (机间通信: 广播本机位姿 + 接收邻居)
+    7. mission_manager_node         (TaskFlow 状态机)
+    8. uav_avoidance_node           (机间避障决策)
+    9. gs_simulator_node.py         (模拟地面站,发布 typed TaskFlow)
 
-  参数组织：
-  - 跨节点共享参数：config/common.yaml（每个节点都加载一次）
-  - 各节点专属参数：config/<node_name>.yaml（平铺结构，键名与 C++ 完全一致）
-  - 命令行可覆盖参数：本文件顶部 <arg>
+  使用方法:
+    <include file="$(find multi_uav_strike)/launch/per_uav_sitl_group.launch">
+      <arg name="uav_name"  value="uav0" />
+      <arg name="fcu_url"   value="udp://:14540@127.0.0.1:14580" />
+      <arg name="tgt_system" value="1" />
+      <arg name="flow"      value="ground_search_track" />
+      <arg name="device_id" value="0" />
+    </include>
 
-  加载机制：
-  <rosparam command="load" file="..." /> 在 <node> 内部时，参数会被加载到该节点的
-  私有命名空间（/<ns>/<node_name>/），正好是 nh_private_.param 的查找路径。
-  关键：YAML 必须是平铺结构，不能有嵌套 group，否则会出现双层前缀
-  （如 <rosparam ns="gimbal" /> 加上 YAML 里的 gimbal: 嵌套，会变成
-   /<ns>/<node>/gimbal/gimbal/<key>，C++ 找不到）。
+  默认值对齐单 UAV 的 single_uav_px4_sitl_test.launch,所以本文件单独
+  运行(不放在 <group ns=...> 里)时表现与单机完全一致。
 -->
 <launch>
-  <!-- ====================================================================== -->
-  <!-- 命令行可覆盖参数                                                         -->
-  <!-- ====================================================================== -->
-  <!-- 默认 IDLE：飞机在地面等待，不会自动起飞。
-       flow 选定后由 gs_simulator_node.py 发布 typed TaskFlow 到 /<ns>/mission/task_flow,
-       mission_manager 根据首发 skill 自动切 work_mode。
-       可选 flow:
-         - ground_search_strike  (地面起飞 + 搜索 + 打击)
-         - ground_search_track   (地面起飞 + 搜索跟踪)
-         - ground_gather_search  (地面起飞 + 集结 + 搜索)
-         - catapult_search_return(弹射起飞 + 搜索 + 返航)
-         - ground_search         (地面起飞 + 搜索)
-  -->
-  <arg name="uav_name" default="uav0" />
-  <arg name="flow" default="ground_search_track" />
+  <!-- 默认参数(单机版测试兼容) -->
+  <arg name="uav_name"   default="uav0" />
+  <arg name="fcu_url"    default="udp://:14540@127.0.0.1:14580" />
+  <arg name="tgt_system" default="1" />
+  <arg name="flow"       default="ground_search_track" />
+  <arg name="device_id"  default="0" />
+  <!-- 多机集结伙伴名单(逗号分隔,如 "uav0,uav1,uav2")。空 = 单机路径 -->
+  <arg name="gather_partners" default="" />
+  <!-- RViz 世界参考点:单机 auto=true → world_ref=本机 home,永在原点。 -->
+  <!-- 多机 launch 传 world_ref_auto=false + 共享 world_ref_lat/lon/alt,各机按 GPS 偏移分开。 -->
+  <arg name="world_ref_auto" default="true" />
+  <arg name="world_ref_lat"  default="36.058" />
+  <arg name="world_ref_lon"  default="114.549" />
+  <arg name="world_ref_alt"  default="75.0" />
 
-  <!-- Set GeographicLib data path -->
+  <!-- Set GeographicLib data path (PX4 GPS 转换需要) -->
   <env name="GEOGRAPHICLIB_DATA" value="$(env HOME)/.GeographicLib" />
 
   <!-- ====================================================================== -->
-  <!-- 1. MAVROS + PX4 SITL                                                  -->
+  <!-- 1. MAVROS + PX4 SITL                                                   -->
   <!-- ====================================================================== -->
   <group ns="$(arg uav_name)">
     <include file="$(find mavros)/launch/px4.launch">
-      <arg name="fcu_url" value="udp://:14540@127.0.0.1:14580" />
-      <arg name="tgt_system" value="$(optenv TZS_FCU_ID 1)" />
+      <arg name="fcu_url"    value="$(arg fcu_url)" />
+      <arg name="tgt_system" value="$(arg tgt_system)" />
     </include>
   </group>
 
   <!-- ====================================================================== -->
-  <!-- 2. 目标运动模拟（仿真目标车辆）                                          -->
-  <!-- ====================================================================== -->
-  <node name="target_motion_simulator_node"
-        pkg="multi_uav_strike"
-        type="target_motion_simulator_node"
-        output="screen"
-        respawn="false">
-    <rosparam command="load"
-              file="$(find multi_uav_strike)/config/target_motion_simulator.yaml" />
-  </node>
-
-  <!-- ====================================================================== -->
-  <!-- 3. 云台模拟节点                                                          -->
+  <!-- 2. 云台仿真节点                                                          -->
   <!-- ====================================================================== -->
   <group ns="$(arg uav_name)">
     <node name="gimbal_simulator_node"
@@ -78,7 +78,7 @@
   </group>
 
   <!-- ====================================================================== -->
-  <!-- 4. 目标估计节点（粒子滤波）                                              -->
+  <!-- 3. 目标估计节点 (粒子滤波 / 像素反投影)                                  -->
   <!-- ====================================================================== -->
   <group ns="$(arg uav_name)">
     <node name="target_estimator_node"
@@ -94,7 +94,7 @@
   </group>
 
   <!-- ====================================================================== -->
-  <!-- 5. 制导控制节点                                                          -->
+  <!-- 4. 制导控制节点                                                          -->
   <!-- ====================================================================== -->
   <group ns="$(arg uav_name)">
     <node name="guidance_control_node"
@@ -110,7 +110,7 @@
   </group>
 
   <!-- ====================================================================== -->
-  <!-- 6. 航点执行器节点                                                        -->
+  <!-- 5. 航点执行器节点                                                        -->
   <!-- ====================================================================== -->
   <group ns="$(arg uav_name)">
     <node name="waypoint_executor_node"
@@ -126,7 +126,7 @@
   </group>
 
   <!-- ====================================================================== -->
-  <!-- 7. 通信节点                                                              -->
+  <!-- 6. 通信节点 (机间共享: 发布本机位姿 / 接收邻居位姿 / 共享目标)            -->
   <!-- ====================================================================== -->
   <group ns="$(arg uav_name)">
     <node name="comm_node"
@@ -141,7 +141,7 @@
   </group>
 
   <!-- ====================================================================== -->
-  <!-- 8. 任务管理器节点                                                        -->
+  <!-- 7. 任务管理器 (TaskFlow 状态机)                                          -->
   <!-- ====================================================================== -->
   <group ns="$(arg uav_name)">
     <node name="mission_manager_node"
@@ -149,7 +149,11 @@
           type="mission_manager_node"
           output="screen"
           respawn="false">
-      <param name="device_id" value="0" />
+      <param name="device_id" value="$(arg device_id)" />
+      <param name="world_ref_auto" value="$(arg world_ref_auto)" />
+      <param name="world_ref_lat"  value="$(arg world_ref_lat)" />
+      <param name="world_ref_lon"  value="$(arg world_ref_lon)" />
+      <param name="world_ref_alt"  value="$(arg world_ref_alt)" />
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
@@ -158,8 +162,7 @@
   </group>
 
   <!-- ====================================================================== -->
-  <!-- 8b. 机间避障决策节点(基于优先级,横向严禁 + 高度 bias + 速度 scale)        -->
-  <!--    注: 检测功能已合并到 gimbal_simulator_node(FOV 由当前云台角度决定)   -->
+  <!-- 8. 机间避障决策节点 (基于优先级 + 横向严禁 + 高度 bias + 速度 scale)     -->
   <!-- ====================================================================== -->
   <group ns="$(arg uav_name)">
     <node name="uav_avoidance_node"
@@ -175,27 +178,22 @@
   </group>
 
   <!-- ====================================================================== -->
-  <!-- 9. 地面站模拟器（仿真测试用）                                            -->
+  <!-- 9. 地面站模拟器 (typed TaskFlow 发布者, 模拟真实 GS 给本机派任务)         -->
+  <!--    必须在全局命名空间,因为它读取 uav_ns 自己发 /<uav_ns>/mission/task_flow -->
+  <!--    每个 UAV 一个实例,各自独立的 uav_ns + flow                            -->
+  <!--    节点名带 uav_name 后缀以保证多机 include 时节点名不冲突                -->
   <!-- ====================================================================== -->
-
- 
-  <group ns="$(arg uav_name)">
-    <node pkg="starling_bridge" type="starling_bridge" name="starling_bridge" output="screen">
-      <!-- 地面站 IP 和端口 -->
-      <param name="gcs_ip" value="192.168.1.92" />
-      <param name="gcs_udp_port" value="14550" />
-      <param name="gcs_kcp_port" value="18990" />
-      <param name="device_name" value="$(optenv TZS_DEVICE_SN 1-0)" />
-      <param name="device_sn" value="$(optenv TZS_DEVICE_SN 1-0)" />
-      <!--param name="uav_id" value="2" />
-      <param name="device_sn" value="MAVLink_2_1" /-->
-    </node>
-  </group>
-
-  <!-- ====================================================================== -->
-  <!-- 10. RViz 可视化                                                          -->
-  <!-- ====================================================================== -->
-  <node name="rviz" pkg="rviz" type="rviz"
-        args="-d $(find multi_uav_strike)/rviz/view_strike_SITL.rviz" />
+  <node name="gs_simulator_node_$(arg uav_name)"
+        pkg="multi_uav_strike"
+        type="gs_simulator_node.py"
+        output="screen"
+        respawn="false"
+        launch-prefix="bash -c 'sleep 2; $@' --">
+    <param name="flow"   value="$(arg flow)" />
+    <param name="uav_ns" value="$(arg uav_name)" />
+    <param name="gather_partners" value="$(arg gather_partners)" />
+    <rosparam command="load"
+              file="$(find multi_uav_strike)/config/common.yaml" />
+  </node>
 
 </launch>

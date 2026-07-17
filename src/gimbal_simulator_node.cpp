@@ -59,6 +59,7 @@ private:
     ros::Publisher los_angle_pub_;     // 目标 LOS (保持)
     ros::Publisher gimbal_pose_pub_;   // 云台姿态 (RViz 用, 保持)
     ros::Publisher camera_pose_pub_;   // 相机世界姿态 (保持)
+    std::string viz_frame_;            // RViz 帧名 "<ns>/map"(多机分离由 static TF 偏移)
     ros::Publisher yolo_pub_;          // typed YoloDetection (单条,主目标,兼容 comm_node)
     ros::Publisher yolo_results_pub_;  // typed YoloDetections (多目标,供 target_estimator)
     ros::Publisher in_fov_pub_;        // Bool (合并自 detection_simulator)
@@ -79,7 +80,8 @@ private:
     // === 控制参数 ===
     double gimbal_p_gain_;
     double max_pitch_rate_;
-    double loop_freq_;
+    double loop_freq_;          // 云台控制循环 Hz(默认 100)
+    double yolo_pub_freq_;      // yolo_results / yolo (单条) 实际发布频率 Hz(默认 10)
     bool use_sim_;
     double image_noise_std_dev_;
     std::string uav_pose_topic_;
@@ -140,6 +142,17 @@ public:
         nh_private_.param<double>("gimbal_p_gain", gimbal_p_gain_, 0.8);
         nh_private_.param<double>("max_pitch_rate", max_pitch_rate_, 1.2);
         nh_private_.param<double>("loop_freq", loop_freq_, 100.0);
+        // === yolo 仿真发布频率 ===
+        //   真实 YOLO 一般 10~30Hz。loop_freq_=100 让 yolo 也跟着 100Hz 太假了,
+        //   会让 target_estimator 的 hit_count 语义完全错位(20 hits @ 100Hz = 0.2s)。
+        //   这里独立节流:yolo_pub_freq_ 决定 yolo_results / 单条 yolo 的发布频率,
+        //   云台控制仍按 loop_freq_ 跑。yolo_pub_freq_ 必须 ≤ loop_freq_。
+        nh_private_.param<double>("yolo_pub_freq", yolo_pub_freq_, 10.0);
+        if (yolo_pub_freq_ > loop_freq_) {
+            ROS_WARN("[GimbalSim] yolo_pub_freq=%.1f > loop_freq=%.1f, clamp to loop_freq",
+                     yolo_pub_freq_, loop_freq_);
+            yolo_pub_freq_ = loop_freq_;
+        }
         nh_private_.param<bool>("use_sim", use_sim_, true);
         nh_private_.param<double>("image_noise_std_dev", image_noise_std_dev_, 0.0);
 
@@ -195,6 +208,12 @@ public:
 
         // 发布(合并自 detection_simulator)
         std::string ns = nh_.getNamespace();
+        // RViz 帧名:去掉命名空间前导 '/' 后拼 "/map"(如 /uav0 → uav0/map);无命名空间 → map
+        {
+            std::string vns = ns;
+            if (!vns.empty() && vns[0] == '/') vns = vns.substr(1);
+            viz_frame_ = vns.empty() ? "map" : (vns + "/map");
+        }
         std::string yolo_t = "detection/yolo_result";
         if (!ns.empty() && ns != "/") yolo_t = ns + "/" + yolo_t;
         if (yolo_t.find("//") == 0) yolo_t = yolo_t.substr(1);
@@ -490,7 +509,7 @@ public:
     void publishGimbalPose() {
         geometry_msgs::PoseStamped msg;
         msg.header.stamp = ros::Time::now();
-        msg.header.frame_id = "map";
+        msg.header.frame_id = viz_frame_;
         msg.pose.position = current_uav_pose_.pose.position;
 
         tf::Quaternion q;
@@ -507,7 +526,7 @@ public:
     void publishCameraPose() {
         geometry_msgs::PoseStamped msg;
         msg.header.stamp = ros::Time::now();
-        msg.header.frame_id = "map";
+        msg.header.frame_id = viz_frame_;
         msg.pose.position = current_uav_pose_.pose.position;
 
         // === 2026-07-16: 改为稳像世界姿态 ===
@@ -552,31 +571,44 @@ public:
     //       + 单条 YoloDetection(主目标,兼容 comm_node)
     //       + Bool(是否有任一目标在 FOV)
     void publishYoloDetections() {
+        // === 2026-07-16: yolo_pub_freq 节流 (与云台 loop_freq 解耦) ===
+        //   frame_seq_ 每 tick 自增,作为 loop tick 计数器。
+        //   period = loop_freq / yolo_pub_freq:loop=100Hz / yolo=10Hz → 每 10 tick 发一次。
+        //   仅 YoloDetection(单条/批量) 被节流,in_fov_pub_ 保持原频率
+        //   (gimbal FOV 状态对 comm_node 不是 detection,不需要节流)。
+        const uint32_t period = std::max(1u,
+            static_cast<uint32_t>(std::round(loop_freq_ / yolo_pub_freq_)));
+        const bool emit_yolo = (frame_seq_ % period) == 0;
         uint32_t seq = ++frame_seq_;
         uint64_t stamp_us = ros::Time::now().toNSec() / 1000;
 
-        multi_uav_strike::YoloDetections batch;
         bool any_visible = false;
-        for (const auto& pr : projections_) {
-            if (!pr.visible) continue;   // 只把在 FOV 内的目标放入批量(与原单目标语义一致)
-            batch.detections.push_back(buildDetection(pr, seq, stamp_us));
-            any_visible = true;
-        }
-        yolo_results_pub_.publish(batch);
+        if (emit_yolo) {
+            multi_uav_strike::YoloDetections batch;
+            for (const auto& pr : projections_) {
+                if (!pr.visible) continue;   // 只把在 FOV 内的目标放入批量(与原单目标语义一致)
+                batch.detections.push_back(buildDetection(pr, seq, stamp_us));
+                any_visible = true;
+            }
+            yolo_results_pub_.publish(batch);
 
-        // 单条 = 主目标(无主目标则空帧 is_in_fov=false)
-        multi_uav_strike::YoloDetection primary;
-        if (primary_idx_ >= 0) {
-            primary = buildDetection(projections_[primary_idx_], seq, stamp_us);
+            // 单条 = 主目标(无主目标则空帧 is_in_fov=false)
+            multi_uav_strike::YoloDetection primary;
+            if (primary_idx_ >= 0) {
+                primary = buildDetection(projections_[primary_idx_], seq, stamp_us);
+            } else {
+                primary.frame_seq = seq;
+                primary.stamp_us = stamp_us;
+                primary.label = "";
+                primary.confidence = 0.0f;
+                primary.x_min = primary.y_min = primary.x_max = primary.y_max = 0.0f;
+                primary.is_in_fov = false;
+            }
+            yolo_pub_.publish(primary);
         } else {
-            primary.frame_seq = seq;
-            primary.stamp_us = stamp_us;
-            primary.label = "";
-            primary.confidence = 0.0f;
-            primary.x_min = primary.y_min = primary.x_max = primary.y_max = 0.0f;
-            primary.is_in_fov = false;
+            // 即使本 tick 不发 yolo,也更新 any_visible(in_fov 仍反映当前 FOV 状态)
+            for (const auto& pr : projections_) if (pr.visible) { any_visible = true; break; }
         }
-        yolo_pub_.publish(primary);
 
         std_msgs::Bool in_fov_flag;
         in_fov_flag.data = any_visible;

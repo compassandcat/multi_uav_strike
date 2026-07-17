@@ -1,0 +1,244 @@
+{
+  "constraints": {
+    "fence": [],
+    "threat_area": []
+  },
+  "devices_sn": [
+    "1-001",
+    "1-002",
+    "1-003"
+  ],
+  "skill_flow_id": "a7da_normal",
+  "skills": [
+    {
+      "arrive_path": {
+        "points": []
+      },
+      "devices_sn": [
+        "1-001",
+        "1-002",
+        "1-003"
+      ],
+      "skill_area_flag": 0,
+      "skill_ctl": 1,
+      "skill_id": "9d26",
+      "skill_params": {
+        "attack_speed": 5.0,
+        "cruise_height": 30.0,
+        "cruise_speed": 10.0,
+        "formation_safe_dis_in_task": 10.0,
+        "formation_shape_in_task": 0,
+        "low_height": 30.0,
+        "search_count": 99,
+        "search_duration": 15.0,
+        "takeoff_height": 30.0,
+        "takeoff_mode": 1,
+        "takeoff_speed": 5.0,
+        "takeoff_time_interval": 20.0,
+        "tracking_dis": {
+          "h_dist": 1000.0,
+          "v_dist": 500.0
+        }
+      },
+      "skill_type": 106
+    },
+    {
+      "arrive_path": {
+        "frame": 0,
+        "global_params": [],
+        "points": []
+      },
+      "devices_sn": [
+        "1-001",
+        "1-002",
+        "1-003"
+      ],
+      "skill_area": {
+        "data": [
+          36.06024803,
+          114.55304727,
+          30.0
+        ],
+        "type": 1
+      },
+      "skill_area_flag": 2,
+      "skill_area_path": [
+        {
+          "device_sn": "1-001",
+          "waypoints": {
+            "frame": 0,
+            "global_params": [],
+            "points": [
+              {
+                "seq": 0,
+                "x": 36.06009272361563,
+                "y": 114.55280787925572,
+                "z": 30.0
+              }
+            ]
+          }
+        }
+      ],
+      "skill_ctl": 1,
+      "skill_id": "a51c",
+      "skill_params": {
+        "attack_speed": 5.0,
+        "cruise_height": 30.0,
+        "cruise_speed": 10.0,
+        "formation_safe_dis_in_task": 10.0,
+        "formation_shape_in_task": 0,
+        "gather_height": 30.0,
+        "gather_speed": 5.0,
+        "low_height": 30.0,
+        "max_duration": 15.0,
+        "search_count": 99,
+        "takeoff_mode": 1,
+        "tracking_dis": {
+          "h_dist": 1000.0,
+          "v_dist": 500.0
+        }
+      },
+      "skill_type": 101
+    },
+    {
+      "arrive_path": {
+        "frame": 0,
+        "global_params": [],
+        "points": []
+      },
+      "devices_sn": [
+        "1-001",
+        "1-002",
+        "1-003"
+      ],
+      "skill_area": {
+        "data": [
+          36.0603489,
+          114.5537245,
+          36.0603489,
+          114.5569003,
+          36.058675,
+          114.5569003,
+          36.058675,
+          114.5537245
+        ],
+        "type": 2
+      },
+      "skill_area_flag": 2,
+      "skill_area_path": [
+        {
+          "device_sn": "1-001",
+          "waypoints": {
+            "frame": 0,
+            "global_params": [],
+            "points": [
+              {
+                "seq": 0,
+                "x": 36.05867500001517,
+                "y": 114.55377743545033,
+                "z": 45.0
+              },
+              {
+                "seq": 1,
+                "x": 36.06034889998483,
+                "y": 114.55377743545033,
+                "z": 45.0
+              },
+              {
+                "seq": 2,
+                "x": 36.06034889998483,
+                "y": 114.55372449999606,
+                "z": 45.0
+              },
+              {
+                "seq": 3,
+                "x": 36.05867500001517,
+                "y": 114.55372449999606,
+                "z": 45.0
+              }
+            ]
+          }
+        }
+      ],
+      "skill_ctl": 1,
+      "skill_id": "b278",
+      "skill_params": {
+        "attack_speed": 5.0,
+        "cruise_height": 30.0,
+        "formation": 0,
+        "low_height": 45.0,
+        "max_duration": 15.0,
+        "safe_distance": 10.0,
+        "search_arrive_speed": 10.0,
+        "search_count": 99,
+        "search_height": 45.0,
+        "search_speed": 5.0,
+        "takeoff_mode": 1,
+        "tracking_dis": {
+          "h_dist": 1000.0,
+          "v_dist": 500.0
+        }
+      },
+      "skill_type": 102
+    },
+    {
+      "arrive_path": {
+        "frame": 0,
+        "global_params": [],
+        "points": []
+      },
+      "devices_sn": [
+        "1-001",
+        "1-002",
+        "1-003"
+      ],
+      "skill_area": {
+        "data": [
+          36.05948587,
+          114.55274954,
+          25.071097110317435
+        ],
+        "type": 1
+      },
+      "skill_area_flag": 2,
+      "skill_area_path": [
+        {
+          "device_sn": "1-001",
+          "waypoints": {
+            "frame": 0,
+            "global_params": [],
+            "points": [
+              {
+                "seq": 0,
+                "x": 36.05936824711663,
+                "y": 114.55257054545878,
+                "z": 30.0
+              }
+            ]
+          }
+        }
+      ],
+      "skill_ctl": 1,
+      "skill_id": "a6c8",
+      "skill_params": {
+        "attack_speed": 5.0,
+        "cruise_height": 30.0,
+        "cruise_speed": 10.0,
+        "formation_safe_dis_in_task": 10.0,
+        "formation_shape_in_task": 0,
+        "low_height": 30.0,
+        "max_duration": 15.0,
+        "return_height": 30.0,
+        "return_speed": 8.0,
+        "search_count": 99,
+        "takeoff_mode": 1,
+        "task_mode": 1,
+        "tracking_dis": {
+          "h_dist": 1000.0,
+          "v_dist": 500.0
+        }
+      },
+      "skill_type": 103
+    }
+  ]
+}

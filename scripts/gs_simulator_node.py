@@ -21,6 +21,7 @@ import multi_uav_strike.msg as mus_msg
 import sys
 import argparse
 import time
+import json
 from math import cos, pi
 
 
@@ -391,21 +392,240 @@ DEMO_FLOWS = {
             },
         ],
     },
+
+    # ============================================================================
+    # 多机协同搜索航线(20-30 个搜索航点 + 起飞/集结/返航,路径有交集供避障触发)
+    # 坐标系: 每机本地 NED(米),NED 原点 = 该机 PX4 home(GPS)。
+    # 各机 home 在 SITL 启动时给不同 GPS,通常差 ~30m,搜索区(±50m)GPS 上有大量重叠。
+    # ============================================================================
+
+    # ---------- 多机 1: 东西向蛇形搜索 30 点 ----------
+    # 6 条横线 y=[-50,-30,-10,10,30,50],每条 5 点 x=[-50,-25,0,25,50],相邻行反向
+    "multi_uav0_search": {
+        "flow_id": "multi_uav0_search_001",
+        "work_mode": 3,  # SEARCH_ONLY
+        "skills": [
+            {
+                "skill_id": "uav0_takeoff",
+                "skill_type": 106,
+                "takeoff_subtype": 0,
+                "takeoff_altitude": 30.0,
+                "priority": 100,
+                "cruise_speed": 8.0,
+                "task_speed": 8.0,
+                "arrive_path": [],
+                "skill_area_path": [],
+            },
+            {
+                "skill_id": "uav0_gather",
+                "skill_type": 101,
+                "priority": 100,
+                "cruise_speed": 5.0,
+                "task_speed": 4.0,
+                "arrive_path": [],
+                "skill_area_path": [(20.0, 0.0, 30.0),  # 集结到 home 东侧 20m
+                ],
+            },
+            {
+                "skill_id": "uav0_search",
+                "skill_type": 102,
+                "priority": 100,
+                "cruise_speed": 8.0,
+                "task_speed": 5.0,
+                "arrive_path": [
+                    (-50.0, -50.0, 30.0),  # 搜索起点:西南角
+                ],
+                "skill_area_path": [
+                    # y=-50, 西→东
+                    (-50.0, -50.0, 30.0), (-25.0, -50.0, 30.0), (0.0, -50.0, 30.0), (25.0, -50.0, 30.0), (50.0, -50.0, 30.0),
+                    # y=-30, 东→西
+                    (50.0, -30.0, 30.0), (25.0, -30.0, 30.0), (0.0, -30.0, 30.0), (-25.0, -30.0, 30.0), (-50.0, -30.0, 30.0),
+                    # y=-10, 西→东
+                    (-50.0, -10.0, 30.0), (-25.0, -10.0, 30.0), (0.0, -10.0, 30.0), (25.0, -10.0, 30.0), (50.0, -10.0, 30.0),
+                    # y=10, 东→西
+                    (50.0, 10.0, 30.0), (25.0, 10.0, 30.0), (0.0, 10.0, 30.0), (-25.0, 10.0, 30.0), (-50.0, 10.0, 30.0),
+                    # y=30, 西→东
+                    (-50.0, 30.0, 30.0), (-25.0, 30.0, 30.0), (0.0, 30.0, 30.0), (25.0, 30.0, 30.0), (50.0, 30.0, 30.0),
+                    # y=50, 东→西
+                    (50.0, 50.0, 30.0), (25.0, 50.0, 30.0), (0.0, 50.0, 30.0), (-25.0, 50.0, 30.0), (-50.0, 50.0, 30.0),
+                ],
+            },
+            {
+                "skill_id": "uav0_return",
+                "skill_type": 103,
+                "priority": 100,
+                "cruise_speed": 8.0,
+                "task_speed": 8.0,
+                "arrive_path": [],
+                "skill_area_path": [
+                    (0.0, 0.0, 30.0),  # 返航到 home 上空
+                ],
+            },
+        ],
+    },
+
+    # ---------- 多机 2: 南北向蛇形搜索 30 点(uav0 旋转 90°,交集更多)----------
+    "multi_uav1_search": {
+        "flow_id": "multi_uav1_search_001",
+        "work_mode": 3,
+        "skills": [
+            {
+                "skill_id": "uav1_takeoff",
+                "skill_type": 106,
+                "takeoff_subtype": 0,
+                "takeoff_altitude": 30.0,
+                "priority": 100,
+                "cruise_speed": 8.0,
+                "task_speed": 8.0,
+                "arrive_path": [],
+                "skill_area_path": [],
+            },
+            {
+                "skill_id": "uav1_gather",
+                "skill_type": 101,
+                "priority": 100,
+                "cruise_speed": 5.0,
+                "task_speed": 4.0,
+                "arrive_path": [],
+                "skill_area_path": [(-20.0, 0.0, 30.0),  # 集结到 home 西侧 20m(与 uav0 错开方向)
+                ],
+            },
+            {
+                "skill_id": "uav1_search",
+                "skill_type": 102,
+                "priority": 100,
+                "cruise_speed": 8.0,
+                "task_speed": 5.0,
+                "arrive_path": [
+                    (-50.0, -50.0, 30.0),  # 搜索起点:同 uav0 西南角
+                ],
+                "skill_area_path": [
+                    # x=-50, 南→北
+                    (-50.0, -50.0, 30.0), (-50.0, -25.0, 30.0), (-50.0, 0.0, 30.0), (-50.0, 25.0, 30.0), (-50.0, 50.0, 30.0),
+                    # x=-30, 北→南
+                    (-30.0, 50.0, 30.0), (-30.0, 25.0, 30.0), (-30.0, 0.0, 30.0), (-30.0, -25.0, 30.0), (-30.0, -50.0, 30.0),
+                    # x=-10, 南→北
+                    (-10.0, -50.0, 30.0), (-10.0, -25.0, 30.0), (-10.0, 0.0, 30.0), (-10.0, 25.0, 30.0), (-10.0, 50.0, 30.0),
+                    # x=10, 北→南
+                    (10.0, 50.0, 30.0), (10.0, 25.0, 30.0), (10.0, 0.0, 30.0), (10.0, -25.0, 30.0), (10.0, -50.0, 30.0),
+                    # x=30, 南→北
+                    (30.0, -50.0, 30.0), (30.0, -25.0, 30.0), (30.0, 0.0, 30.0), (30.0, 25.0, 30.0), (30.0, 50.0, 30.0),
+                    # x=50, 北→南
+                    (50.0, 50.0, 30.0), (50.0, 25.0, 30.0), (50.0, 0.0, 30.0), (50.0, -25.0, 30.0), (50.0, -50.0, 30.0),
+                ],
+            },
+            {
+                "skill_id": "uav1_return",
+                "skill_type": 103,
+                "priority": 100,
+                "cruise_speed": 8.0,
+                "task_speed": 8.0,
+                "arrive_path": [],
+                "skill_area_path": [
+                    (0.0, 0.0, 30.0),
+                ],
+            },
+        ],
+    },
+
+    # ---------- 多机 3: 螺旋向外搜索 30 点(半径 5→50) ----------
+    # 5 圈 × 6 点 = 30 点;从 home 中心向外扩,与前两架搜索区中心重合
+    "multi_uav2_search": {
+        "flow_id": "multi_uav2_search_001",
+        "work_mode": 3,
+        "skills": [
+            {
+                "skill_id": "uav2_takeoff",
+                "skill_type": 106,
+                "takeoff_subtype": 0,
+                "takeoff_altitude": 30.0,
+                "priority": 100,
+                "cruise_speed": 8.0,
+                "task_speed": 8.0,
+                "arrive_path": [],
+                "skill_area_path": [],
+            },
+            {
+                "skill_id": "uav2_gather",
+                "skill_type": 101,
+                "priority": 100,
+                "cruise_speed": 5.0,
+                "task_speed": 4.0,
+                "arrive_path": [],
+                "skill_area_path": [
+                    (0.0, 20.0, 30.0),  # 集结到 home 北侧 20m
+                ],
+            },
+            {
+                "skill_id": "uav2_search",
+                "skill_type": 102,
+                "priority": 100,
+                "cruise_speed": 6.0,
+                "task_speed": 4.0,
+                "arrive_path": [
+                    (10.0, 0.0, 30.0),  # 搜索起点:东向 10m
+                ],
+                "skill_area_path": [
+                    # 圈1: r=10
+                    (10.0, 0.0, 30.0), (5.0, 8.66, 30.0), (-5.0, 8.66, 30.0), (-10.0, 0.0, 30.0), (-5.0, -8.66, 30.0), (5.0, -8.66, 30.0),
+                    # 圈2: r=20
+                    (20.0, 0.0, 30.0), (10.0, 17.32, 30.0), (-10.0, 17.32, 30.0), (-20.0, 0.0, 30.0), (-10.0, -17.32, 30.0), (10.0, -17.32, 30.0),
+                    # 圈3: r=30
+                    (30.0, 0.0, 30.0), (15.0, 25.98, 30.0), (-15.0, 25.98, 30.0), (-30.0, 0.0, 30.0), (-15.0, -25.98, 30.0), (15.0, -25.98, 30.0),
+                    # 圈4: r=40
+                    (40.0, 0.0, 30.0), (20.0, 34.64, 30.0), (-20.0, 34.64, 30.0), (-40.0, 0.0, 30.0), (-20.0, -34.64, 30.0), (20.0, -34.64, 30.0),
+                    # 圈5: r=50
+                    (50.0, 0.0, 30.0), (25.0, 43.30, 30.0), (-25.0, 43.30, 30.0), (-50.0, 0.0, 30.0), (-25.0, -43.30, 30.0), (25.0, -43.30, 30.0),
+                ],
+            },
+            {
+                "skill_id": "uav2_return",
+                "skill_type": 103,
+                "priority": 100,
+                "cruise_speed": 8.0,
+                "task_speed": 8.0,
+                "arrive_path": [],
+                "skill_area_path": [
+                    (0.0, 0.0, 30.0),
+                ],
+            },
+        ],
+    },
 }
 
 
 class GroundStationSimulator:
     def __init__(self, flow="", uav_ns="", device_id=0,
-                 ref_lat=0.0, ref_lon=0.0, ref_alt=0.0):
+                 ref_lat=0.0, ref_lon=0.0, ref_alt=0.0,
+                 gather_partners=""):
         self.flow = flow
         self.uav_ns = uav_ns
         self.device_id = device_id
+
+        # === 期望集结伙伴 SN 列表(逗号分隔,如 "uav0,uav1,uav2")===
+        # 仅对 skill_type=101 (Gather) 生效:会以 "devices_sn" 字段注入到 params_json,
+        # mission_manager 端 mission_manager 解析后用作多机同步门控。
+        # 单机/未设置 → 不注入,mission_manager 走 single_uav_arrived 老路径。
+        self.gather_partners = [s.strip() for s in gather_partners.split(',') if s.strip()]
+        if self.gather_partners:
+            rospy.loginfo("[GS_Simulator] Gather partners: %s", self.gather_partners)
 
         # 参考 GPS 点(NED 局部坐标系原点):PX4 home 的延迟加载
         # 默认 0/0/0 表示"等 PX4 推 home 过来",见 _home_position_callback
         self.ref_lat = ref_lat
         self.ref_lon = ref_lon
         self.ref_alt = ref_alt
+
+        # === 等待 PX4 home 真正到达(避免在 home 之前发布 TaskFlow 用错 ref 产生 ~km 级偏差)===
+        # 只要带 uav_ns(SITL / 真实机场景),就强制等 PX4 home 到位再发布。
+        # 注意:common.yaml 里有 ref_lat/lon 默认值(36.0588/114.557221),所以不能用
+        # "ref_lat==0.0 and ref_lon==0.0" 来判断"launch 没显式传 ref",那样 common.yaml 默认值
+        # 会让 wait_for_home_ = False → GS 用 common.yaml 的 fallback 发布 → waypoint 偏 730m。
+        # 真正"launch 注入绝对 ref"的场景只有 b47c_normal / groupb1bc 这两条 flow,
+        # 它们在 publish_demo_flow() 里会从 cfg["ref_lat"] 覆盖 self.ref_lat 再 rebuild,
+        # 所以即便先等到了 PX4 home,后续也会被 cfg 内的绝对 ref 顶替,不受影响。
+        self.wait_for_home_ = bool(uav_ns)
+        self.is_home_received_ = False
 
         # === 唯一发布者:typed TaskFlow(打到 /<uav_ns>/mission/task_flow)
         tf_topic = "mission/task_flow"
@@ -444,6 +664,7 @@ class GroundStationSimulator:
         self.ref_lat = lat
         self.ref_lon = lon
         self.ref_alt = alt
+        self.is_home_received_ = True
         rospy.logwarn("[GS_Simulator] >>>> PX4 home loaded: lat=%.7f lon=%.7f alt=%.2f",
                         self.ref_lat, self.ref_lon, self.ref_alt)
         rospy.loginfo("[GS_Simulator] Ref GPS: lat=%.6f, lon=%.6f, alt=%.1f",
@@ -494,7 +715,25 @@ class GroundStationSimulator:
             s.cruise_speed = float(skill_cfg.get("cruise_speed", 8.0))
             s.task_speed = float(skill_cfg.get("task_speed", 8.0))
             s.formation = skill_cfg.get("formation", 0)
-            s.params_json = skill_cfg.get("params_json", "")
+
+            # === 注入 devices_sn 到 gather skill 的 params_json ===
+            #   mission_manager 端 parseDevicesSnFromParamsJson() 解出来用作多机同步名单
+            #   单机/未设置时,跳过注入 → 老 single_uav_arrived 路径不受影响
+            raw_params = skill_cfg.get("params_json", "")
+            if self.gather_partners and s.skill_type == 101:
+                try:
+                    params = json.loads(raw_params) if raw_params else {}
+                except ValueError:
+                    rospy.logwarn("[GS_Simulator] Skill %s params_json not valid JSON, "
+                                  "overwriting with devices_sn only: %s",
+                                  s.skill_id, raw_params)
+                    params = {}
+                params["devices_sn"] = list(self.gather_partners)
+                s.params_json = json.dumps(params)
+                rospy.loginfo("[GS_Simulator] Injected devices_sn=%s into gather skill %s",
+                              self.gather_partners, s.skill_id)
+            else:
+                s.params_json = raw_params
 
             # arrive_path
             for north_m, east_m, up_m in skill_cfg.get("arrive_path", []):
@@ -572,8 +811,36 @@ class GroundStationSimulator:
             rospy.spin()
             return
 
-        rospy.loginfo("[GS_Simulator] Waiting 3s before publishing flow '%s'...", self.flow)
-        rospy.sleep(3.0)
+        # === 等待 PX4 home(launch 显式给了 ref_lat/lon 的 flow,例如 b47c/groupb1bc,跳过此步)===
+        # 之前这里只 sleep(3.0),若 PX4 home 在 3s 内没到,会用 launch 默认 ref_lat/lon(0/0),
+        # 后续 NED→GPS 转换基于经纬度 0,航点会被推到赤道附近,与 flight 端用的 PX4 home 错开几百~上千米。
+        # 解决:用 rospy.wait_for_message 同步等一帧有效 home,最多 15s,避免启动卡死。
+        if self.wait_for_home_:
+            home_topic = "/{}/mavros/home_position/home".format(self.uav_ns)
+            rospy.loginfo("[GS_Simulator] Waiting for PX4 home on %s (max 15s) before publishing...",
+                          home_topic)
+            try:
+                home_msg = rospy.wait_for_message(home_topic, mavros_msgs.msg.HomePosition, timeout=15.0)
+                if abs(home_msg.geo.latitude) > 1e-6 or abs(home_msg.geo.longitude) > 1e-6:
+                    self.ref_lat = home_msg.geo.latitude
+                    self.ref_lon = home_msg.geo.longitude
+                    self.ref_alt = home_msg.geo.altitude
+                    self.is_home_received_ = True
+                    rospy.logwarn("[GS_Simulator] >>>> PX4 home pre-loaded: lat=%.7f lon=%.7f alt=%.2f",
+                                  self.ref_lat, self.ref_lon, self.ref_alt)
+                else:
+                    rospy.logwarn("[GS_Simulator] PX4 home received but all zero, "
+                                  "will proceed anyway (ref=%s)",
+                                  (self.ref_lat, self.ref_lon, self.ref_alt))
+            except rospy.ROSException as e:
+                rospy.logwarn("[GS_Simulator] PX4 home wait timeout (%.1fs): %s. "
+                              "Proceeding with ref=(%s, %s) — route may be offset.",
+                              15.0, e, self.ref_lat, self.ref_lon)
+        else:
+            # 没有 uav_ns:GS 是哑节点,等外部 GS 推 TaskFlow,不需要 home
+            rospy.loginfo("[GS_Simulator] No uav_ns (idle node), skipping PX4 home wait.")
+            rospy.sleep(3.0)  # 保留原 sleep,让 subscriber 先到位
+
         self.publish_demo_flow(self.flow)
         rospy.loginfo("[GS_Simulator] Flow published, idle.")
 
@@ -584,7 +851,8 @@ def main():
     flow = rospy.get_param('~flow', '')             # demo flow 名称(空=等外部 GS)
     uav_ns = rospy.get_param('~uav_ns', '')         # UAV 命名空间(如 "uav0")
     device_id = rospy.get_param('~device_id', 0)    # 0=广播
-    
+    gather_partners = rospy.get_param('~gather_partners', '')  # 逗号分隔 SN,如 "uav0,uav1,uav2"
+
     ref_lat = rospy.get_param('~ref_lat', 0.0)
     ref_lon = rospy.get_param('~ref_lon', 0.0)
     ref_alt = rospy.get_param('~ref_alt', 0.0)
@@ -596,7 +864,8 @@ def main():
 
     simulator = GroundStationSimulator(
         flow=flow, uav_ns=uav_ns, device_id=device_id,
-        ref_lat=ref_lat, ref_lon=ref_lon, ref_alt=ref_alt)
+        ref_lat=ref_lat, ref_lon=ref_lon, ref_alt=ref_alt,
+        gather_partners=gather_partners)
     simulator.run()
 
 

@@ -72,13 +72,17 @@ public:
         std::vector<uint8_t> img_data;
         uint8_t              img_format = 0;  // 1 = JPEG(与 DetectTarget.img_format 对齐)
 
-        // === 2026-07-16: Plan A 像素空间 EMA (scale-invariant) ===
-        //   关键改动:UAV pose 抖动 → bbox 像素抖动 → 投影回世界时被距离 10-30m 放大成
-        //   米级跳动。改在像素空间先 EMA,再投影,1px 抖动不再被距离放大。
-        //   raw_cx/cy 与 ema_cx/cy 都在 [0, image_width/height] 范围。
-        double    ema_cx          = 0.0;     // 平滑后 bbox 中心 x (像素)
-        double    ema_cy          = 0.0;     // 平滑后 bbox 中心 y (像素)
-        bool      ema_pixel_valid = false;   // 首次检测时初始化为原始像素
+        // === 2026-07-16: 世界空间 EMA (Plan B) ===
+        //   关键改动: 把 EMA 从像素域换到世界域 (cand_tx/cand_ty),绕开"像素域 EMA
+        //   在相机机动时被甩" 的几何不一致 bug。
+        //   - 像素域 EMA 假设: 同一像素 → 同一世界点 — 但相机一转,旧像素投影到新相机姿态下
+        //     的世界点已经偏离真实目标,lag = (1-alpha)/alpha × camera_turn_rate,
+        //     10Hz ema_alpha=0.5 下仍能偏移数米至几十米。
+        //   - 世界域 EMA 直接对 cand_tx/cand_ty 做滤波 (像素仅用于跨帧匹配 cluster):
+        //     真实目标位置应稳定在原地,相机的任意机动都收敛到真值,无几何滞后。
+        //   - 代价: 1px 像素噪声 → ~9m@30m 距离 的世界噪声不再被像素域"吸收",
+        //     但 ema_alpha_=0.3 足以把噪声压到 1m 以下,且 UAV 机动期间零滞后。
+        bool      world_ema_valid = false;   // 首帧用 cand_* 直接初始化,之后做 EMA
 
         // === 2026-07-16: 多次命中才晋升为正式 cluster ===
         //   hit_count: 累计被 detection 命中的次数(含本次)
@@ -108,12 +112,14 @@ public:
         //          真目标在视野停留 3~5s 时稳定晋升。
         p.param<int>("min_hit_count", min_hit_count_, 20);
         p.param<double>("tentative_ttl_sec", tentative_ttl_sec_, 1.0);
-        // === 2026-07-16: Plan A — ema_alpha 改为像素空间平滑 ===
-        //   0.6 在 10Hz 下对低频噪声增益≈1,基本不滤波;0.2 ≈ 时间常数 0.4s,
-        //   1Hz bbox 抖动衰减 ~80%。注意这是像素域的 EMA,与距离无关,所以
-        //   0.2 对近/远目标的滞后是一致的(都是 0.4s 时间常数)。
-        //   如果目标是高速车辆,可调回 0.4~0.5;如果还看到残影,降到 0.10。
-        p.param<double>("ema_alpha",       ema_alpha_,       0.05);
+        // === 2026-07-16: Plan B — 世界空间 EMA ===
+        //   现在 EMA 直接作用于 cand_tx/cand_ty(米),不再有相机机动滞后问题。
+        //   - alpha=0.3 + 10Hz → 时间常数 ≈ 0.23s,稳态世界噪声衰减 ~70%
+        //     (像素噪声 2px @ 30m 距离 → ~18m 原始 → ~5m 平滑后,仍能容忍)
+        //   - alpha 越大 (0.5+) 越接近原始,平滑弱;越小 (0.1~0.2) 越平滑但响应慢。
+        //   - 静止相机基本无 alpha 影响(噪声=0 时 raw 和 EMA 同值);
+        //     真正起作用的是相机机动 / 目标快速移动 / 像素噪声三个场景。
+        p.param<double>("ema_alpha",       ema_alpha_,       0.3);
         p.param<double>("target_z_prior",  target_z_prior_,  0.0);
         // 发布周期
         p.param<double>("states_publish_freq", states_publish_freq_, 10.0);
@@ -149,6 +155,12 @@ public:
                                             &TargetClusterer::primaryTargetCallback, this);
 
         // 发布
+        // RViz 帧名:去掉命名空间前导 '/' 后拼 "/map"(如 /uav0 → uav0/map);无命名空间 → map
+        {
+            std::string vns = nh_.getNamespace();
+            if (!vns.empty() && vns[0] == '/') vns = vns.substr(1);
+            viz_frame_ = vns.empty() ? "map" : (vns + "/map");
+        }
         cluster_event_pub_      = nh_.advertise<multi_uav_strike::ClusterEvent>(
                                     "cluster_event", 10);
         cluster_states_pub_     = nh_.advertise<multi_uav_strike::ClusterState>(
@@ -157,6 +169,9 @@ public:
                                     "target_estimated_pose", 10);
         target_est_marker_pub_  = nh_.advertise<visualization_msgs::MarkerArray>(
                                     "target_estimated_marker", 10);
+        // === 2026-07-16: 原始单帧识别标记(红色小点,瞬时显示)===
+        raw_det_marker_pub_     = nh_.advertise<visualization_msgs::MarkerArray>(
+                                    "raw_detection_marker", 10);
         target_est_gps_pub_     = nh_.advertise<sensor_msgs::NavSatFix>(
                                     "target_estimated_gps", 10);
 
@@ -204,6 +219,11 @@ public:
         //       跟随单帧噪声漂移。
         double cand_tx = 0.0, cand_ty = 0.0, cand_tz = 0.0;
         const bool cand_valid = projectPixelToGround(raw_cx, raw_cy, cand_tx, cand_ty, cand_tz);
+        // === 2026-07-16: 原始单帧识别投影(红色点)===
+        //   不参与聚类/EMA,完全反映当帧探测器说的瞬时位置,0.3s 后自动消失
+        if (cand_valid) {
+            publishRawDetectionMarker(cand_tx, cand_ty, cand_tz, label);
+        }
         const double r2 = merge_radius_m_ * merge_radius_m_;
         uint64_t nearest_id = 0;
         double   best_dist_sq = r2;
@@ -221,25 +241,46 @@ public:
             }
         }
 
-        if (nearest_id != 0) {
-            // 命中已有 cluster:先在像素空间 EMA,再投影回世界
-            TargetCluster& c = clusters_[nearest_id];
-            if (!c.ema_pixel_valid) {
-                // 首帧 EMA 初始化
-                c.ema_cx = raw_cx;
-                c.ema_cy = raw_cy;
-                c.ema_pixel_valid = true;
-            } else {
-                c.ema_cx = ema_alpha_ * raw_cx + (1.0 - ema_alpha_) * c.ema_cx;
-                c.ema_cy = ema_alpha_ * raw_cy + (1.0 - ema_alpha_) * c.ema_cy;
+        // === 2026-07-16: 集群级反推诊断 ===
+        // 同 label 的已晋升 cluster 距离应该 << merge_radius_m_, 如果距离 > 2× radius
+        // (说明应该在合并但没合并) 或者距离 > 50m 但不与任何 cluster 匹配, 都非常可疑
+        if (cand_valid) {
+            double min_dist = 1e18;
+            uint64_t min_id = 0;
+            for (const auto& kv : clusters_) {
+                const TargetCluster& c = kv.second;
+                if (c.label != label) continue;
+                double d = std::hypot(cand_tx - c.ned_x, cand_ty - c.ned_y);
+                if (d < min_dist) { min_dist = d; min_id = c.id; }
             }
-            // 投影平滑后的像素 → 世界
-            double tx = 0.0, ty = 0.0, tz = target_z_prior_;
-            if (!projectPixelToGround(c.ema_cx, c.ema_cy, tx, ty, tz)) return;
-            // 平滑后的像素投影已经稳定,直接赋值(不再做世界坐标 EMA,避免双重平滑引入滞后)
-            c.ned_x = tx;
-            c.ned_y = ty;
-            c.ned_alt = tz;
+            if (min_id != 0 && min_dist > std::max(50.0, merge_radius_m_ * 2.0)) {
+                ROS_ERROR_THROTTLE(2.0,
+                    "[ProjDiag] STEP6 raw 投影远离同 label cluster (%.1fm, 阈值 %.1fm) | "
+                    "label=%s cand=(%.1f,%.1f) nearest_cluster_id=%lu pos=(%.1f,%.1f) | "
+                    "可能: R/target_z_prior_/cam_pos 之一有问题, 但每步几何自洽 -> 偏差来自累积",
+                    min_dist, std::max(50.0, merge_radius_m_ * 2.0),
+                    label.c_str(), cand_tx, cand_ty, min_id,
+                    clusters_[min_id].ned_x, clusters_[min_id].ned_y);
+            }
+        }
+
+        // 投影失败 (射线水平 / 朝后) — 既无法匹配已有 cluster 也无法新建,直接丢弃该 detection
+        if (!cand_valid) return;
+
+        if (nearest_id != 0) {
+            // 命中已有 cluster:在世界空间做 EMA (Plan B)
+            //   用 cand_tx/cand_ty (本帧原始投影) 作为输入 — 真实目标位置就稳定在那里,
+            //   与相机如何转动无关,直接收敛到真值,无几何滞后。
+            TargetCluster& c = clusters_[nearest_id];
+            if (!c.world_ema_valid) {
+                c.ned_x = cand_tx;
+                c.ned_y = cand_ty;
+                c.world_ema_valid = true;
+            } else {
+                c.ned_x = ema_alpha_ * cand_tx + (1.0 - ema_alpha_) * c.ned_x;
+                c.ned_y = ema_alpha_ * cand_ty + (1.0 - ema_alpha_) * c.ned_y;
+            }
+            c.ned_alt = cand_tz;
             c.best_confidence = std::max(c.best_confidence, det.confidence);
             c.last_seen_us = det.stamp_us;
             // === 2026-07-16: 命中计数 + 晋升门禁 ===
@@ -255,17 +296,15 @@ public:
             return;
         }
 
-        // 新建 cluster:首帧像素直接作为 EMA 初值,但暂不晋升、不发 event
+        // 新建 cluster:cand 是同一帧的原始投影,已经有效,直接用
         TargetCluster nc;
         nc.id              = ++next_cluster_id_;
         nc.label           = label;
         nc.label_hash      = hashLabel(label);
-        nc.ema_cx          = raw_cx;
-        nc.ema_cy          = raw_cy;
-        nc.ema_pixel_valid = true;
-        if (!projectPixelToGround(nc.ema_cx, nc.ema_cy, nc.ned_x, nc.ned_y, nc.ned_alt)) {
-            return;  // 投影失败(射线水平或朝后)就不建 cluster
-        }
+        nc.ned_x           = cand_tx;
+        nc.ned_y           = cand_ty;
+        nc.ned_alt         = cand_tz;
+        nc.world_ema_valid = true;
         nc.best_confidence = det.confidence;
         nc.first_seen_us   = det.stamp_us;
         nc.last_seen_us    = det.stamp_us;
@@ -391,37 +430,43 @@ public:
     // 10Hz:publish 所有 alive cluster 快照 + 可视化 + primary GPS / pose
     void statesTimerCb(const ros::TimerEvent&) {
         std::lock_guard<std::mutex> g(clusters_mtx_);
-        // === 2026-07-16: 仅展示已晋升的 cluster ===
-        //   tentative 在晋升前不出现在 snapshot / marker 里,避免污染 RViz
-        size_t promoted_count = 0;
-        for (const auto& kv : clusters_) if (kv.second.is_promoted) ++promoted_count;
-        if (promoted_count == 0) {
+        if (clusters_.empty()) {
             publishEmptyGps();
             return;
         }
 
         multi_uav_strike::ClusterState state;
         visualization_msgs::MarkerArray markers;
-        state.targets.reserve(promoted_count);
-        markers.markers.reserve(promoted_count);
+        state.targets.reserve(clusters_.size());
+        markers.markers.reserve(clusters_.size());
 
+        // === 2026-07-16: state.targets 仍只发 promoted (下游 API) ===
+        //   markers 同时画 promoted + tentative (RViz 可视化区分)
         for (const auto& kv : clusters_) {
             const TargetCluster& c = kv.second;
-            if (!c.is_promoted) continue;  // 未晋升的 tentative 不外发
-            multi_uav_strike::ClusterTarget t;
-            t.cluster_id    = c.id;
-            t.label         = c.label;
-            t.label_hash    = c.label_hash;
-            t.ned_x         = c.ned_x;
-            t.ned_y         = c.ned_y;
-            t.ned_alt       = c.ned_alt;
-            t.confidence    = c.best_confidence;
-            t.last_seen_us  = c.last_seen_us;
-            t.img_data      = c.img_data;
-            t.img_format    = c.img_format;
-            state.targets.push_back(t);
 
+            if (c.is_promoted) {
+                multi_uav_strike::ClusterTarget t;
+                t.cluster_id    = c.id;
+                t.label         = c.label;
+                t.label_hash    = c.label_hash;
+                t.ned_x         = c.ned_x;
+                t.ned_y         = c.ned_y;
+                t.ned_alt       = c.ned_alt;
+                t.confidence    = c.best_confidence;
+                t.last_seen_us  = c.last_seen_us;
+                t.img_data      = c.img_data;
+                t.img_format    = c.img_format;
+                state.targets.push_back(t);
+            }
+
+            // 标记: tentative (黄色扁环) + promoted (绿色实心球) 都画
             markers.markers.push_back(buildMarker(c));
+
+            // promoted 额外画一根 5m 立柱(ns 不同, id 同 c.id),任何视角都显眼
+            if (c.is_promoted) {
+                markers.markers.push_back(buildPillar(c));
+            }
         }
         cluster_states_pub_.publish(state);
         target_est_marker_pub_.publish(markers);
@@ -511,7 +556,9 @@ private:
     ros::Publisher cluster_states_pub_;
     ros::Publisher target_est_pose_pub_;
     ros::Publisher target_est_marker_pub_;
+    ros::Publisher raw_det_marker_pub_;          // 单帧识别 (红色点)
     ros::Publisher target_est_gps_pub_;
+    std::string viz_frame_;                      // RViz 帧名 "<ns>/map"(多机分离由 static TF 偏移)
     ros::Timer states_timer_;
     ros::Timer cleanup_timer_;
 
@@ -530,6 +577,7 @@ private:
     std::mutex clusters_mtx_;
     std::unordered_map<uint64_t, TargetCluster> clusters_;
     uint64_t next_cluster_id_ = 0;
+    int     raw_marker_seq_    = 0;   // raw_detection_marker id 计数器, MarkerArray 同 ns 不能重复
 
     // ============ 工具 ============
 
@@ -569,54 +617,234 @@ private:
     //   几何部分与 projectBboxToGround 完全相同,只是输入换成已平滑的像素。
     bool projectPixelToGround(double cx, double cy,
                               double& tx, double& ty, double& tz) {
+        // ---- Step 1: 像素 → 相机帧射线 ----
         double u_ndc = (cx - image_width_  / 2.0) / focal_x_;
         double v_ndc = (cy - image_height_ / 2.0) / focal_y_;
-
         Eigen::Vector3d cam_ray(-v_ndc, u_ndc, 1.0);
         cam_ray.normalize();
 
-        // === 2026-07-16: 直接使用 gimbal 算好的稳像世界 quat (camera/pose) ===
-        // 不再在 estimator 这边自己重建 R_world_cam,消除前/反投影用不同 uav_quat 时的漂移。
+        // ---- Step 2: 相机射线 → 世界射线 (用稳像 camera/pose) ----
         Eigen::Matrix3d R_world_cam = current_camera_world_quat_.toRotationMatrix();
-        Eigen::Vector3d world_ray  = R_world_cam * cam_ray;
+        Eigen::Vector3d opt_axis = R_world_cam.col(2);  // 光轴 (cam +z) 世界方向
+        Eigen::Vector3d world_ray = R_world_cam * cam_ray;
 
+        // ---- Step 3: 与地面平面求交 ----
         Eigen::Vector3d cam_pos(
             current_uav_pose_.pose.position.x,
             current_uav_pose_.pose.position.y,
             current_uav_pose_.pose.position.z);
-
         double dz = target_z_prior_ - cam_pos.z();
-        if (std::fabs(world_ray.z()) < 1e-3) return false;  // 射线几乎水平
-        double t = dz / world_ray.z();
-        if (t < 0.0) return false;  // 射线指向远离地面 (目标在 UAV "背后")
 
-        Eigen::Vector3d target_world = cam_pos + t * world_ray;
-        tx = target_world.x();
-        ty = target_world.y();
-        tz = target_z_prior_;
-        return true;
+        bool proj_ok = true;
+        double t = 0.0;
+        Eigen::Vector3d target_world = cam_pos;  // 失败时用 cam_pos 兜底,避免未初始化
+        if (std::fabs(world_ray.z()) < 1e-3) {
+            proj_ok = false;  // 射线几乎水平, 求交退化
+        } else {
+            t = dz / world_ray.z();
+            if (t < 0.0) {
+                proj_ok = false;  // 射线指向远离地面
+            } else {
+                target_world = cam_pos + t * world_ray;
+            }
+        }
+
+        if (proj_ok) {
+            tx = target_world.x();
+            ty = target_world.y();
+            tz = target_z_prior_;
+        } else {
+            tx = ty = tz = 0.0;
+        }
+
+        // ---- Step 4: 反推诊断 ----
+        // 沿投影链路按顺序检查, 第一个失败即定位错误环节 + 打印全链路中间值
+        diagnoseProjection(cx, cy, u_ndc, v_ndc, cam_ray,
+                           R_world_cam, opt_axis, world_ray,
+                           cam_pos, dz, t, target_world, proj_ok);
+
+        return proj_ok;
+    }
+
+    // === 2026-07-16: 投影反推诊断 ===
+    // 检查顺序与投影链路一致: 像素→cam_ray→光轴→world_ray→cam_pos→target
+    // 任一步骤几何不自洽就 ROS_ERROR_THROTTLE (1Hz) 打印, 红色字体终端可见。
+    void diagnoseProjection(double cx, double cy,
+                            double u_ndc, double v_ndc,
+                            const Eigen::Vector3d& cam_ray,
+                            const Eigen::Matrix3d& R_world_cam,
+                            const Eigen::Vector3d& opt_axis,
+                            const Eigen::Vector3d& world_ray,
+                            const Eigen::Vector3d& cam_pos,
+                            double dz, double t,
+                            const Eigen::Vector3d& target_world,
+                            bool proj_ok) {
+        // (1) cam_ray.z 应 > 0.4: 射线方向接近光轴, 不然像素严重偏离或 u_ndc/v_ndc 量级错
+        if (cam_ray.z() < 0.4) {
+            ROS_ERROR_THROTTLE(1.0,
+                "[ProjDiag] STEP1 cam_ray.z=%.3f (<0.4) | "
+                "cx=%.0f cy=%.0f u_ndc=%.3f v_ndc=%.3f | "
+                "可能: 像素离光轴太远, 或 u_ndc/v_ndc 没归一化到 tan(FOV/2)≈%.3f",
+                cam_ray.z(), cx, cy, u_ndc, v_ndc,
+                std::tan(fov_h_rad_ / 2.0));
+            return;
+        }
+
+        // (2) 光轴方向: 目标在下方时光轴 z 必须 < 0
+        if (opt_axis.z() > -0.05) {
+            ROS_ERROR_THROTTLE(1.0,
+                "[ProjDiag] STEP2 光轴 opt.z=%.3f (>=0) | "
+                "光轴朝上! 检查 uav_yaw 提取 / gimbal_pitch 符号 / R 构造 | "
+                "cam quat (wxyz)=(%.3f,%.3f,%.3f,%.3f) | "
+                "R.col(2)=(%.3f,%.3f,%.3f)",
+                opt_axis.z(),
+                current_camera_world_quat_.w(), current_camera_world_quat_.x(),
+                current_camera_world_quat_.y(), current_camera_world_quat_.z(),
+                opt_axis.x(), opt_axis.y(), opt_axis.z());
+            return;
+        }
+
+        // (3) world_ray.z 应 < 0 (射线打地面)
+        if (world_ray.z() > 0.0) {
+            ROS_ERROR_THROTTLE(1.0,
+                "[ProjDiag] STEP3 world_ray.z=%.3f > 0 (射线朝上) | "
+                "光轴朝下但射线朝上, cam_ray.x 或 v_ndc 符号可能反了 | "
+                "cam_ray=(%.3f,%.3f,%.3f) R=\n"
+                "[%.3f %.3f %.3f\n %.3f %.3f %.3f\n %.3f %.3f %.3f]",
+                world_ray.z(),
+                cam_ray.x(), cam_ray.y(), cam_ray.z(),
+                R_world_cam(0,0), R_world_cam(0,1), R_world_cam(0,2),
+                R_world_cam(1,0), R_world_cam(1,1), R_world_cam(1,2),
+                R_world_cam(2,0), R_world_cam(2,1), R_world_cam(2,2));
+            return;
+        }
+
+        if (!proj_ok) {
+            // world_ray.z 接近 0 或 t < 0 已经让上面拦截, 这里 proj_ok=false 但射线向下 -> 极端几何
+            ROS_ERROR_THROTTLE(1.0,
+                "[ProjDiag] STEP3b 投影退化 (proj_ok=false) | "
+                "world_ray.z=%.3f dz=%.2f cam_z=%.2f tgt_z_prior=%.2f",
+                world_ray.z(), dz, cam_pos.z(), target_z_prior_);
+            return;
+        }
+
+        // (4) 水平投影距离合理性: 对向下看的相机, 水平距离应 < cam_z * 20 (≈ 偏角 87°)
+        double horiz = std::hypot(target_world.x() - cam_pos.x(),
+                                  target_world.y() - cam_pos.y());
+        if (horiz > cam_pos.z() * 20.0 && cam_pos.z() > 5.0) {
+            ROS_ERROR_THROTTLE(1.0,
+                "[ProjDiag] STEP4 水平投影 %.1fm 异常大 (cam_z=%.1fm 上限 ≈%.0fm) | "
+                "cam=(%.1f,%.1f,%.1f) tgt=(%.1f,%.1f,%.1f) | "
+                "t=%.1f dz=%.1f u_ndc=%.3f v_ndc=%.3f | "
+                "可能: target_z_prior_/cam_pos/world_ray 三者之一错",
+                horiz, cam_pos.z(), cam_pos.z() * 20.0,
+                cam_pos.x(), cam_pos.y(), cam_pos.z(),
+                target_world.x(), target_world.y(), target_world.z(),
+                t, dz, u_ndc, v_ndc);
+            return;
+        }
+
+        // (5) 中心像素一致性: cx/cy ≈ image 中心时, target 应在 cam 正下方的 bearing 上
+        //   |u_ndc| < 0.05 且 |v_ndc| < 0.05 时, 检查水平距离与 cam_z 的比值是否合理
+        if (std::fabs(u_ndc) < 0.05 && std::fabs(v_ndc) < 0.05 && cam_pos.z() > 5.0) {
+            // 中心像素射线 ≈ 光轴方向, 水平距离应 ≈ cam_z * tan(elevation)
+            // elevation = asin(-opt_axis.z()), 对于向下看: tan(elev) = -opt_axis.z / sqrt(1-opt_axis.z^2)
+            double horiz_z = std::sqrt(std::max(0.0, 1.0 - opt_axis.z() * opt_axis.z()));
+            double expected_horiz = cam_pos.z() * horiz_z / (-opt_axis.z());
+            // 容差 50%
+            if (horiz > expected_horiz * 1.5 + 5.0) {
+                ROS_ERROR_THROTTLE(2.0,
+                    "[ProjDiag] STEP5 中心像素一致性 | "
+                    "实际水平 %.1fm vs 期望 %.1fm (差距 %.1fm) | "
+                    "cam=(%.1f,%.1f,%.1f) tgt=(%.1f,%.1f,%.1f) opt.z=%.3f",
+                    horiz, expected_horiz, horiz - expected_horiz,
+                    cam_pos.x(), cam_pos.y(), cam_pos.z(),
+                    target_world.x(), target_world.y(), target_world.z(),
+                    opt_axis.z());
+                return;
+            }
+        }
+        // 全部检查通过 -> 不打印
     }
 
     visualization_msgs::Marker buildMarker(const TargetCluster& c) {
+        // === 2026-07-16: 三层可视化,样式区分 promoted vs tentative ===
+        //   promoted (正式目标): 大号绿色实心球 + 立柱(任何角度都显眼)
+        //   tentative (聚类中): 黄色扁圆柱(地面上的圆环),半透明
+        // 两者用同一个 ns "clusters" + 同一个 id (c.id),状态切换时下一帧自动覆盖。
         visualization_msgs::Marker m;
-        m.header.frame_id = "map";
+        m.header.frame_id = viz_frame_;
         m.header.stamp    = ros::Time::now();
-        m.ns   = "clustered_targets";
+        m.ns   = "clusters";
         m.id   = static_cast<int>(c.id);
-        m.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
         m.action = visualization_msgs::Marker::ADD;
         m.pose.position.x = c.ned_x;
         m.pose.position.y = c.ned_y;
-        m.pose.position.z = c.ned_alt;
+        m.pose.position.z = c.ned_alt + 0.3;  // 抬一点避免压在地里
         m.pose.orientation.w = 1.0;
-        m.scale.z = 1.0;  // text height
-        m.color.r = std::max(0.f, std::min(1.f, (float)est_marker_r_));
-        m.color.g = std::max(0.f, std::min(1.f, (float)est_marker_g_));
-        m.color.b = std::max(0.f, std::min(1.f, (float)est_marker_b_));
-        m.color.a = std::max(0.f, std::min(1.f, (float)est_marker_a_));
-        m.lifetime = ros::Duration(0.5);
-        m.text = c.label;
+        m.lifetime = ros::Duration(0.5);  // statesTimerCb 10Hz 续期,稳定可见
+
+        if (c.is_promoted) {
+            m.type = visualization_msgs::Marker::SPHERE;
+            m.scale.x = 3.5; m.scale.y = 3.5; m.scale.z = 3.5;  // === 改大到 3.5m ===
+            m.color.r = 0.0f; m.color.g = 1.0f; m.color.b = 0.0f; m.color.a = 0.95f;
+        } else {
+            // tentative: 黄色扁盘 (CYLINDER + 小高度 = 地面上的圆环),半透明
+            m.type = visualization_msgs::Marker::CYLINDER;
+            m.scale.x = 2.5;  // 直径 (1.8 → 2.5)
+            m.scale.y = 0.2;  // 高度(扁平)
+            m.scale.z = 2.5;  // 直径
+            m.color.r = 1.0f; m.color.g = 1.0f; m.color.b = 0.0f; m.color.a = 0.55f;
+        }
         return m;
+    }
+
+    // === 2026-07-16: promoted 立柱 (id = c.id + 1000000 区分)===
+    //   5m 高、0.5m 直径的实心绿色圆柱,从地面垂直立起。
+    //   顶视/侧视都能一眼看到,跟红色 raw 点对比清楚。
+    visualization_msgs::Marker buildPillar(const TargetCluster& c) {
+        visualization_msgs::Marker m;
+        m.header.frame_id = viz_frame_;
+        m.header.stamp    = ros::Time::now();
+        m.ns   = "cluster_pillars";
+        m.id   = static_cast<int>(c.id);
+        m.type = visualization_msgs::Marker::CYLINDER;
+        m.action = visualization_msgs::Marker::ADD;
+        m.pose.position.x = c.ned_x;
+        m.pose.position.y = c.ned_y;
+        m.pose.position.z = c.ned_alt + 2.5;  // 中心 = 地面 + 2.5m
+        m.pose.orientation.w = 1.0;
+        m.scale.x = 0.5;   // 直径
+        m.scale.y = 5.0;   // 高度
+        m.scale.z = 0.5;   // 直径
+        m.color.r = 0.0f; m.color.g = 0.8f; m.color.b = 0.0f; m.color.a = 0.85f;
+        m.lifetime = ros::Duration(0.5);
+        return m;
+    }
+
+    // === 2026-07-16: 单帧识别投影标记 (红色小点,瞬时闪现)===
+    //   每条 YoloDetection 都发一个,0.3s 后自动消失。
+    //   直接拿原始像素反投影(cand_tx/ty),不参与 EMA/聚类,完全反映
+    //   当帧探测器说"这里有个东西"的瞬时位置。
+    void publishRawDetectionMarker(double x, double y, double z, const std::string& label) {
+        visualization_msgs::MarkerArray arr;
+        visualization_msgs::Marker m;
+        m.header.frame_id = viz_frame_;
+        m.header.stamp    = ros::Time::now();
+        m.ns   = "raw_detections";
+        m.id   = ++raw_marker_seq_;     // 全局唯一,MarkerArray 同 ns 下不能重复
+        m.type = visualization_msgs::Marker::SPHERE;
+        m.action = visualization_msgs::Marker::ADD;
+        m.pose.position.x = x;
+        m.pose.position.y = y;
+        m.pose.position.z = z;
+        m.pose.orientation.w = 1.0;
+        m.scale.x = 10; m.scale.y = 10; m.scale.z = 10;  // 红色原始识别点(放大到 0.6m,跟 3.5m 球/5m 柱更搭)
+        m.color.r = 1.0f; m.color.g = 0.0f; m.color.b = 0.0f; m.color.a = 0.9f;  // 红
+        m.lifetime = ros::Duration(0.3);
+        m.text = label;
+        arr.markers.push_back(m);
+        raw_det_marker_pub_.publish(arr);
     }
 
     void publishEmptyGps() {
@@ -658,11 +886,13 @@ private:
     /**
      * Publish primary cluster 位置作为 geometry_msgs::PoseStamped (NWU, 米)
      * guidance_control_node 订阅 target_estimated_pose 用此驱动 UAV 飞向目标
+     * 注:guidance 只用 position.x/y/z + orientation 做运算,frame_id 仅给 RViz 显示用,
+     * 因此改为本机 viz_frame_(uav0/map / uav1/map / ...),多机 RViz 各自能解析。
      */
     void publishPrimaryPose(const TargetCluster& c) {
         geometry_msgs::PoseStamped msg;
         msg.header.stamp = ros::Time::now();
-        msg.header.frame_id = "world";  // NWU 世界系
+        msg.header.frame_id = viz_frame_;  // 本机 local 帧,由 static TF 偏移到世界 map
         msg.pose.position.x = c.ned_x;
         msg.pose.position.y = c.ned_y;
         msg.pose.position.z = c.ned_alt;

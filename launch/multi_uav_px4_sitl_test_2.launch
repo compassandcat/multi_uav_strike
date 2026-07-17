@@ -1,0 +1,102 @@
+<?xml version="1.0"?>
+<!--
+  multi_uav_px4_sitl_test_2.launch
+  ============================================================
+  双机 PX4 SITL 测试 launch
+  ============================================================
+  启动 2 架仿真 UAV,各自独立 PX4 SITL 实例 + 独立任务流,
+  共享 target_motion_simulator_node (即所有 UAV 看到同一组仿真目标)。
+
+  使用方法:
+    1. 先启动 2 个 PX4 SITL 实例:
+       ~/src/PX4_Firmware/Tools/sitl_dual_run.sh
+       (实例1: PX4_HOME_LAT=36.05801135 LON=114.5491114, 默认 14580 端口)
+       (实例2: PX4_HOME_LAT=36.05826582 LON=114.54906363, 14581 端口)
+    2. 再启动本 launch:
+       roslaunch multi_uav_strike multi_uav_px4_sitl_test_2.launch
+
+  端口分配 (PX4 SITL 多实例默认约定):
+    uav0: fcu_url=udp://:14540@127.0.0.1:14580  tgt_system=1
+    uav1: fcu_url=udp://:14541@127.0.0.1:14581  tgt_system=2
+
+  任务流 (各自独立, 默认两机同流程便于机间防撞测试):
+    uav0: ground_search_track (起飞 + 搜索跟踪)
+    uav1: ground_search_track (起飞 + 搜索跟踪)
+  可通过 launch arg 覆盖: roslaunch ... _uav0_flow:=ground_search_strike
+
+  架构:
+    共享节点:
+      - target_motion_simulator_node (目标池, 全局唯一)
+      - rviz                        (可视化)
+    per-UAV (通过 <include file="per_uav_sitl_group.launch"> 复用):
+      - uav0: 8 个 SITL 节点 + gs_simulator (uav_ns=uav0, flow=uav0_flow)
+      - uav1: 8 个 SITL 节点 + gs_simulator (uav_ns=uav1, flow=uav1_flow)
+-->
+<launch>
+  <!-- ============================================================ -->
+  <!-- 命令行可覆盖参数 (每个 UAV 都有独立 flow, 默认同流程)            -->
+  <!-- ============================================================ -->
+  <arg name="uav0_flow" default="multi_uav0_search" />
+  <arg name="uav1_flow" default="multi_uav1_search" />
+
+  <!-- 共享世界参考点(= uav0 home GPS):多机 RViz 分离靠 static TF map-><ns>/map。 -->
+  <!-- world_ref_auto=false → 各机据此共享参考点算自己的偏移;uav0=identity 在原点。 -->
+  <!-- world_ref_alt 不参与 TF(平移 z 固定 0),仅占位。 -->
+  <arg name="world_ref_lat" default="36.05801135" />
+  <arg name="world_ref_lon" default="114.5491114" />
+  <arg name="world_ref_alt" default="0.0" />
+
+  <!-- Set GeographicLib data path (PX4 GPS 转换) -->
+  <env name="GEOGRAPHICLIB_DATA" value="$(env HOME)/.GeographicLib" />
+
+  <!-- ============================================================ -->
+  <!-- 共享节点:目标运动模拟 (所有 UAV 共用同一组仿真目标)             -->
+  <!-- ============================================================ -->
+  <node name="target_motion_simulator_node"
+        pkg="multi_uav_strike"
+        type="target_motion_simulator_node"
+        output="screen"
+        respawn="false">
+    <rosparam command="load"
+              file="$(find multi_uav_strike)/config/target_motion_simulator.yaml" />
+  </node>
+
+  <!-- ============================================================ -->
+  <!-- UAV0 (PX4 SITL 实例 1)                                        -->
+  <!-- ============================================================ -->
+  <include file="$(find multi_uav_strike)/launch/per_uav_sitl_group.launch">
+    <arg name="uav_name"   value="uav0" />
+    <arg name="fcu_url"    value="udp://:14540@127.0.0.1:14580" />
+    <arg name="tgt_system" value="1" />
+    <arg name="flow"       value="$(arg uav0_flow)" />
+    <arg name="device_id"  value="0" />
+    <arg name="gather_partners" value="uav0,uav1" />
+    <arg name="world_ref_auto" value="false" />
+    <arg name="world_ref_lat"  value="$(arg world_ref_lat)" />
+    <arg name="world_ref_lon"  value="$(arg world_ref_lon)" />
+    <arg name="world_ref_alt"  value="$(arg world_ref_alt)" />
+  </include>
+
+  <!-- ============================================================ -->
+  <!-- UAV1 (PX4 SITL 实例 2)                                        -->
+  <!-- ============================================================ -->
+  <include file="$(find multi_uav_strike)/launch/per_uav_sitl_group.launch">
+    <arg name="uav_name"   value="uav1" />
+    <arg name="fcu_url"    value="udp://:14541@127.0.0.1:14581" />
+    <arg name="tgt_system" value="2" />
+    <arg name="flow"       value="$(arg uav1_flow)" />
+    <arg name="device_id"  value="1" />
+    <arg name="gather_partners" value="uav0,uav1" />
+    <arg name="world_ref_auto" value="false" />
+    <arg name="world_ref_lat"  value="$(arg world_ref_lat)" />
+    <arg name="world_ref_lon"  value="$(arg world_ref_lon)" />
+    <arg name="world_ref_alt"  value="$(arg world_ref_alt)" />
+  </include>
+
+  <!-- ============================================================ -->
+  <!-- RViz (双机版, 已有 view_strike_dual.rviz)                      -->
+  <!-- ============================================================ -->
+  <node name="rviz" pkg="rviz" type="rviz"
+        args="-d $(find multi_uav_strike)/rviz/view_strike_dual.rviz" />
+
+</launch>
