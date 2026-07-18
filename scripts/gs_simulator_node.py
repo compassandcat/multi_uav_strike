@@ -591,6 +591,200 @@ DEMO_FLOWS = {
             },
         ],
     },
+
+    # ============================================================================
+    # 多机避障压测:三条轨迹都收敛到 **同一个 GPS 区域**(以 uav0_home 为共享原点),
+    # 强制触发 proximity_threshold (15m)。
+    #
+    # 重要前提 — sitl_triple_run.sh 的 home 间距:
+    #   uav0_home = (36.05801135, 114.5491114)
+    #   uav1_home = (36.05813582, 114.54906363)   — uav0 北 13.82m,西 4.29m
+    #   uav2_home = (36.05826582, 114.54908363)   — uav0 北 28.36m,西 2.49m
+    #   共享 GPS 原点 = uav0_home
+    #
+    # 每机 NED 转换:本机 NED(x,y) 在 GPS 空间 = 本机_home + (x m 北, y m 东)
+    # 要让 uav1/uav2 飞到 uav0_home,需要把它们各自的 NED 减去 home 偏移:
+    #   uav1 飞到共享 (x, y) → uav1_NED = (x - 13.82, y + 4.29)
+    #   uav2 飞到共享 (x, y) → uav2_NED = (x - 28.36, y + 2.49)
+    # (第一版用各自 NED 偏移,导致 uav0/uav1 在 GPS 空间还差 14m,根本触发不到 threshold,已修正)
+    #
+    # 设计: 全部 8m × 8m 小方块,共享中心 = uav0_home,三机速度一致 → 同时刻在 12m 内
+    # ============================================================================
+
+    # ---------- 避障压测 uav0:uav0_home 本机 NED 即共享坐标 ----------
+    # 本机 NED(x,y) = 共享 (x, y) — uav0_home 在共享原点
+    "avoid_test_uav0": {
+        "flow_id": "avoid_test_uav0_001",
+        "work_mode": 3,
+        "skills": [
+            {
+                "skill_id": "uav0_takeoff",
+                "skill_type": 106,
+                "takeoff_subtype": 0,
+                "takeoff_altitude": 30.0,
+                "priority": 100,
+                "cruise_speed": 5.0,
+                "task_speed": 5.0,
+                "arrive_path": [],
+                "skill_area_path": [],
+            },
+            {
+                # 集结点直接 = 共享原点 = uav0_home 上空 30m
+                "skill_id": "uav0_gather",
+                "skill_type": 101,
+                "priority": 100,
+                "cruise_speed": 5.0,
+                "task_speed": 4.0,
+                "arrive_path": [],
+                "skill_area_path": [(0.0, 0.0, 30.0)],
+            },
+            {
+                # 顺时针方块 8m × 8m,中心 = uav0_home
+                "skill_id": "uav0_search",
+                "skill_type": 102,
+                "priority": 100,
+                "cruise_speed": 5.0,
+                "task_speed": 4.0,
+                "arrive_path": [],
+                "skill_area_path": [
+                    (4.0, 0.0, 30.0),    # E
+                    (4.0, 4.0, 30.0),    # NE
+                    (0.0, 4.0, 30.0),    # N
+                    (-4.0, 4.0, 30.0),   # NW
+                    (-4.0, 0.0, 30.0),   # W
+                    (-4.0, -4.0, 30.0),  # SW
+                    (0.0, -4.0, 30.0),   # S
+                    (4.0, -4.0, 30.0),   # SE
+                    (4.0, 0.0, 30.0),    # 回 E
+                ],
+            },
+            {
+                "skill_id": "uav0_return",
+                "skill_type": 103,
+                "priority": 100,
+                "cruise_speed": 5.0,
+                "task_speed": 5.0,
+                "arrive_path": [],
+                "skill_area_path": [(0.0, 0.0, 30.0)],
+            },
+        ],
+    },
+
+    # ---------- 避障压测 uav1:uav1_NED = 共享 (x - 13.82, y + 4.29) ----------
+    "avoid_test_uav1": {
+        "flow_id": "avoid_test_uav1_001",
+        "work_mode": 3,
+        "skills": [
+            {
+                "skill_id": "uav1_takeoff",
+                "skill_type": 106,
+                "takeoff_subtype": 0,
+                "takeoff_altitude": 30.0,
+                "priority": 100,
+                "cruise_speed": 5.0,
+                "task_speed": 5.0,
+                "arrive_path": [],
+                "skill_area_path": [],
+            },
+            {
+                # 集结点:共享 (0, 0) → uav1_NED = (0 - 13.82, 0 + 4.29) = (-13.82, 4.29, 30)
+                "skill_id": "uav1_gather",
+                "skill_type": 101,
+                "priority": 100,
+                "cruise_speed": 5.0,
+                "task_speed": 4.0,
+                "arrive_path": [],
+                "skill_area_path": [(-13.82, 4.29, 30.0)],
+            },
+            {
+                # 逆时针方块 8m × 8m,中心 = uav0_home(共享原点)
+                "skill_id": "uav1_search",
+                "skill_type": 102,
+                "priority": 100,
+                "cruise_speed": 5.0,
+                "task_speed": 4.0,
+                "arrive_path": [],
+                "skill_area_path": [
+                    (-9.82, 4.29, 30.0),    # 共享 (4, 0)   E
+                    (-9.82, 8.29, 30.0),    # 共享 (4, 4)   NE
+                    (-13.82, 8.29, 30.0),   # 共享 (0, 4)   N
+                    (-17.82, 8.29, 30.0),   # 共享 (-4, 4)  NW
+                    (-17.82, 4.29, 30.0),   # 共享 (-4, 0)  W
+                    (-17.82, 0.29, 30.0),   # 共享 (-4, -4) SW
+                    (-13.82, 0.29, 30.0),   # 共享 (0, -4)  S
+                    (-9.82, 0.29, 30.0),    # 共享 (4, -4)  SE
+                    (-9.82, 4.29, 30.0),    # 回 E
+                ],
+            },
+            {
+                "skill_id": "uav1_return",
+                "skill_type": 103,
+                "priority": 100,
+                "cruise_speed": 5.0,
+                "task_speed": 5.0,
+                "arrive_path": [],
+                "skill_area_path": [(-13.82, 4.29, 30.0)],
+            },
+        ],
+    },
+
+    # ---------- 避障压测 uav2:uav2_NED = 共享 (x - 28.36, y + 2.49) ----------
+    "avoid_test_uav2": {
+        "flow_id": "avoid_test_uav2_001",
+        "work_mode": 3,
+        "skills": [
+            {
+                "skill_id": "uav2_takeoff",
+                "skill_type": 106,
+                "takeoff_subtype": 0,
+                "takeoff_altitude": 30.0,
+                "priority": 100,
+                "cruise_speed": 5.0,
+                "task_speed": 5.0,
+                "arrive_path": [],
+                "skill_area_path": [],
+            },
+            {
+                # 集结点:共享 (0, 0) → uav2_NED = (0 - 28.36, 0 + 2.49) = (-28.36, 2.49, 30)
+                "skill_id": "uav2_gather",
+                "skill_type": 101,
+                "priority": 100,
+                "cruise_speed": 5.0,
+                "task_speed": 4.0,
+                "arrive_path": [],
+                "skill_area_path": [(-28.36, 2.49, 30.0)],
+            },
+            {
+                # 对角方块 8m × 8m,中心 = uav0_home,起点错开(从 SW 开始)
+                "skill_id": "uav2_search",
+                "skill_type": 102,
+                "priority": 100,
+                "cruise_speed": 5.0,
+                "task_speed": 4.0,
+                "arrive_path": [],
+                "skill_area_path": [
+                    (-32.36, -1.51, 30.0),   # 共享 (-4, -4) SW  (起点)
+                    (-28.36, -1.51, 30.0),   # 共享 (0, -4)  S
+                    (-24.36, -1.51, 30.0),   # 共享 (4, -4)  SE
+                    (-24.36, 2.49, 30.0),    # 共享 (4, 0)   E
+                    (-24.36, 6.49, 30.0),    # 共享 (4, 4)   NE
+                    (-28.36, 6.49, 30.0),    # 共享 (0, 4)   N
+                    (-32.36, 6.49, 30.0),    # 共享 (-4, 4)  NW
+                    (-32.36, 2.49, 30.0),    # 共享 (-4, 0)  W
+                    (-32.36, -1.51, 30.0),   # 回 SW
+                ],
+            },
+            {
+                "skill_id": "uav2_return",
+                "skill_type": 103,
+                "priority": 100,
+                "cruise_speed": 5.0,
+                "task_speed": 5.0,
+                "arrive_path": [],
+                "skill_area_path": [(-28.36, 2.49, 30.0)],
+            },
+        ],
+    },
 }
 
 
@@ -851,7 +1045,7 @@ def main():
     flow = rospy.get_param('~flow', '')             # demo flow 名称(空=等外部 GS)
     uav_ns = rospy.get_param('~uav_ns', '')         # UAV 命名空间(如 "uav0")
     device_id = rospy.get_param('~device_id', 0)    # 0=广播
-    gather_partners = rospy.get_param('~gather_partners', '')  # 逗号分隔 SN,如 "uav0,uav1,uav2"
+    gather_partners = rospy.get_param('~gather_partners', '')  # 逗号分隔 SN,如 "1-1,1-2,1-3"
 
     ref_lat = rospy.get_param('~ref_lat', 0.0)
     ref_lon = rospy.get_param('~ref_lon', 0.0)

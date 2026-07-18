@@ -39,6 +39,9 @@
   <arg name="tgt_system" default="1" />
   <arg name="flow"       default="ground_search_track" />
   <arg name="device_id"  default="0" />
+  <!-- UAV 硬件序列号(命名约定 "<group>-<plane>",如 "1-1"、"1-2"...) -->
+  <!-- 空 → comm_node/uav_avoidance 回落到 uav_name (uav0/uav1/uav2),gs_simulator 同 -->
+  <arg name="device_sn"  default="" />
   <!-- 多机集结伙伴名单(逗号分隔,如 "uav0,uav1,uav2")。空 = 单机路径 -->
   <arg name="gather_partners" default="" />
   <!-- RViz 世界参考点:单机 auto=true → world_ref=本机 home,永在原点。 -->
@@ -137,6 +140,7 @@
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <param name="uav_name" value="$(arg uav_name)" />
+      <param name="uav_device_sn" value="$(arg device_sn)" />
     </node>
   </group>
 
@@ -150,6 +154,7 @@
           output="screen"
           respawn="false">
       <param name="device_id" value="$(arg device_id)" />
+      <param name="uav_device_sn" value="$(arg device_sn)" />
       <param name="world_ref_auto" value="$(arg world_ref_auto)" />
       <param name="world_ref_lat"  value="$(arg world_ref_lat)" />
       <param name="world_ref_lon"  value="$(arg world_ref_lon)" />
@@ -174,6 +179,8 @@
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/uav_avoidance.yaml" />
+      <param name="uav_id" value="$(arg uav_name)" />
+      <param name="uav_device_sn" value="$(arg device_sn)" />
     </node>
   </group>
 

@@ -480,6 +480,10 @@ private:
     bool has_task_flow_;                     // 是否有有效任务流(true 时不接收入参覆盖)
     std::string current_flow_id_;            // 当前任务流的 flow_id(上报 MissionState 用)
     int self_device_id_;                    // 本机 device_id(任务流的 device_id,默认自身)
+    // UAV 硬件序列号(命名约定 "<group>-<plane>",如 "1-1"),由 launch/env 注入。
+    // 实机上由 starling_bridge 同样参数 / env 持有,本节点保留以备跨节点一致性诊断;
+    // 当前 mission_manager 任务流过滤仍用 device_id(数值)。
+    std::string self_uav_device_sn_;
     // 各 skill_type 的超时设置(秒,0=无限)
     double entry_gate_timeout_;   // ENTRY_PENDING 默认 30s
     double in_task_timeout_;      // IN_TASK 默认 0(无限)
@@ -615,12 +619,15 @@ public:
         initTimers();
         initTargetState();
 
-        ROS_INFO("[MissionManager] Initialized. Low speed threshold: %.1f m/s, use_sim: %s",
+        ROS_INFO("[MissionManager] Initialized. device_id=%d uav_device_sn=%s, low speed threshold: %.1f m/s, use_sim: %s",
+                 self_device_id_, (self_uav_device_sn_.empty() ? "(unset)" : self_uav_device_sn_.c_str()),
                  low_speed_threshold_, use_sim_ ? "true" : "false");
     }
 
     void initParams() {
         nh_private_.param<int>("device_id", self_device_id_, 0);
+        // uav_device_sn:与 comm_node / uav_avoidance 同名参数,空 → 回落 device_id 字符串("0")
+        nh_private_.param<std::string>("uav_device_sn", self_uav_device_sn_, "");
         nh_private_.param<double>("avoidance_safe_distance", avoidance_safe_distance_, 10.0);
         nh_private_.param<double>("low_speed_threshold", low_speed_threshold_, 12.0);
         nh_private_.param<double>("strike_distance_threshold", strike_distance_threshold_, 2.0);

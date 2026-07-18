@@ -126,6 +126,9 @@ private:
 
     // 参数
     std::string uav_name_;
+    // UAV 序列号(命名约定 "<group>-<plane>" 如 "1-1");心跳 sn 用这个值,避免暴露 ROS namespace
+    // 默认回落到 uav_name,保持向后兼容
+    std::string uav_device_sn_;
     bool use_sim_;        // 仿真/真机切换
 
     // GPS 参考点（NED <-> GPS 转换用）。默认初始化为 0/0/0:
@@ -146,11 +149,14 @@ public:
         initPublishers();
         initTimers();
 
-        ROS_INFO("[Comm] CommNode initialized for UAV: %s", uav_name_.c_str());
+        ROS_INFO("[Comm] CommNode initialized for UAV: %s (device_sn=%s)",
+                 uav_name_.c_str(), uav_device_sn_.c_str());
     }
 
     void initParams() {
         nh_private_.param<std::string>("uav_name", uav_name_, "uav0");
+        // device_sn 是心跳实际发的 sn;空 → 回落 uav_name,避免改了 launch 之后还得改所有地方
+        nh_private_.param<std::string>("uav_device_sn", uav_device_sn_, uav_name_);
         nh_private_.param<double>("neighbor_timeout", neighbor_timeout_, 5.0);
         nh_private_.param<double>("target_share_interval", target_share_interval_, 1.0);
         nh_private_.param<bool>("use_sim", use_sim_, true);
@@ -419,7 +425,8 @@ public:
      * 收到其他 UAV 的心跳 — 缓存 + 用于自适应调频
      */
     void interUavStatusCallback(const multi_uav_strike::InterUavStatus::ConstPtr& msg) {
-        if (msg->sn == uav_name_) {
+        // 自环过滤:心跳 sn 已切到 device_sn("1-1"格式),不能再用 ROS namespace 比
+        if (msg->sn == uav_device_sn_) {
             return;  // 忽略自己的
         }
         bool found = false;
@@ -449,7 +456,9 @@ public:
 
         // 1. 发本机心跳
         multi_uav_strike::InterUavStatus hs;
-        hs.sn            = uav_name_;
+        // 心跳 sn 用 device_sn("1-1" 格式)而不是 ROS namespace,保证 uav_avoidance
+        // 在仿真/实机下拿到的都是同一种 id,uav_avoidance 可以靠字典序仲裁优先级。
+        hs.sn            = uav_device_sn_;
         hs.work_mode     = current_typed_work_mode_;
         hs.skill_type    = current_skill_type_;
         hs.skill_id      = current_skill_id_;

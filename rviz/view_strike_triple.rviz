@@ -7,15 +7,8 @@ Panels:
         - /Global Options1
         - /Status1
         - /Grid1
-        - /Pose5
-        - /Pose5/Status1
-        - /MarkerArray3/Status1
-        - /MarkerArray4
-        - /MarkerArray4/Status1
         - /Pose8
-        - /Pose8/Status1
         - /MarkerArray6
-        - /MarkerArray6/Status1
       Splitter Ratio: 0.5365853905677795
     Tree Height: 677
   - Class: rviz/Selection
@@ -92,8 +85,7 @@ Visualization Manager:
       Marker Topic: /uav0/target_estimated_marker
       Name: Marker
       Namespaces:
-        cluster_pillars: true
-        clusters: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -113,8 +105,8 @@ Visualization Manager:
       Queue Size: 100
       Value: true
     - Alpha: 1
-      Axes Length: 1
-      Axes Radius: 0.10000000149011612
+      Axes Length: 2
+      Axes Radius: 1
       Class: rviz/Pose
       Color: 255; 25; 0
       Enabled: true
@@ -177,8 +169,8 @@ Visualization Manager:
       Unreliable: false
       Value: true
     - Alpha: 1
-      Axes Length: 1
-      Axes Radius: 0.10000000149011612
+      Axes Length: 2
+      Axes Radius: 1
       Class: rviz/Pose
       Color: 255; 25; 0
       Enabled: true
@@ -205,8 +197,7 @@ Visualization Manager:
       Marker Topic: /uav1/target_estimated_marker
       Name: Marker
       Namespaces:
-        cluster_pillars: true
-        clusters: true
+        {}
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -308,8 +299,8 @@ Visualization Manager:
       Unreliable: false
       Value: true
     - Alpha: 1
-      Axes Length: 1
-      Axes Radius: 0.10000000149011612
+      Axes Length: 2
+      Axes Radius: 1
       Class: rviz/Pose
       Color: 255; 200; 0
       Enabled: true
@@ -336,8 +327,7 @@ Visualization Manager:
       Marker Topic: /uav2/target_estimated_marker
       Name: Marker
       Namespaces:
-        cluster_pillars: true
-        clusters: true
+        {}
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -417,7 +407,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 42.87678909301758
+      Distance: 78.49779510498047
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -425,17 +415,17 @@ Visualization Manager:
         Value: false
       Field of View: 1
       Focal Point:
-        X: 5.590329170227051
-        Y: -1.345798134803772
-        Z: 10.045670509338379
+        X: 11.016327857971191
+        Y: -3.579479932785034
+        Z: 20.167510986328125
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.4497971534729004
+      Pitch: 0.6397969722747803
       Target Frame: <Fixed Frame>
-      Yaw: 3.172334909439087
+      Yaw: 2.9473297595977783
     Saved: ~
 Window Geometry:
   Displays:

@@ -70,6 +70,7 @@
     <arg name="tgt_system" value="1" />
     <arg name="flow"       value="$(arg uav0_flow)" />
     <arg name="device_id"  value="0" />
+    <arg name="device_sn"  value="1-1" />
     <arg name="gather_partners" value="uav0,uav1" />
     <arg name="world_ref_auto" value="false" />
     <arg name="world_ref_lat"  value="$(arg world_ref_lat)" />
@@ -86,6 +87,7 @@
     <arg name="tgt_system" value="2" />
     <arg name="flow"       value="$(arg uav1_flow)" />
     <arg name="device_id"  value="1" />
+    <arg name="device_sn"  value="1-2" />
     <arg name="gather_partners" value="uav0,uav1" />
     <arg name="world_ref_auto" value="false" />
     <arg name="world_ref_lat"  value="$(arg world_ref_lat)" />
