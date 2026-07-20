@@ -8,11 +8,16 @@
 #include <std_msgs/Float32.h>
 #include <std_msgs/Bool.h>
 #include <std_msgs/String.h>
+#include <mavros_msgs/Thrust.h>
+#include <mavros_msgs/HomePosition.h>
 #include <visualization_msgs/Marker.h>
 #include <limits>
+#include <cmath>
 #include <Eigen/Eigen>
 
 #include "multi_uav_strike/guidance_strategies.h"
+#include "multi_uav_strike/TargetFilterDebug.h"  // 滤波前后对比 debug msg (2026-07-16)
+#include "multi_uav_strike/one_euro_filter.h"  // 速度指令平滑(2026-07-16),消除聚类抖动→PD→UAV 晃
 
 class GuidanceControlNode {
 private:
@@ -28,7 +33,9 @@ private:
     ros::Subscriber real_target_sub_;  // 真实目标位置用于评估
     ros::Subscriber enable_sub_;       // 使能控制（来自 mission_manager）
     ros::Subscriber mode_sub_;        // 模式控制："strike" 或 "track"
+    ros::Subscriber uav_speed_sub_;   // 拦截速度(来自 mission_manager, 下发到 InterceptGuidance)
     ros::Subscriber other_uav_poses_sub_;  // 邻居无人机位置
+    ros::Subscriber home_position_sub_;    // PX4 home,锁一次用于 GPS→NED 转换
 
     // Publishers
     ros::Publisher vel_cmd_pub_;          // setpoint_velocity/cmd_vel_unstamped
@@ -38,9 +45,10 @@ private:
     ros::Publisher flight_mode_pub_;      // flight_mode
     ros::Publisher strike_eval_pub_;      // 打击评估结果
     ros::Publisher thrust_dir_pub_;       // 推力方向可视化
-    ros::Publisher uav_pose_nwu_pub_;     // NWU姿态发布(RViz用)
     ros::Publisher intercept_point_pub_; // 拦截点可视化
     ros::Publisher debug_pub_;           // 调试信息
+    ros::Publisher target_filter_debug_pub_;  // 2026-07-16: 速度滤波前后对比 debug topic
+    std::string viz_frame_;              // RViz 帧名 "<ns>/map"(多机分离由 static TF 偏移)
 
     // Timer for guidance computation
     ros::Timer guidance_timer_;
@@ -79,10 +87,11 @@ private:
     std::string attitude_rates_topic_;
     std::string thrust_cmd_topic_;
 
-    // GPS 参考点（GPS -> NED 转换用）
+    // GPS 参考点（GPS -> NED 转换用，由 PX4 /mavros/home_position/home 首次锁定）
     double ref_lat_;
     double ref_lon_;
     double ref_alt_;
+    bool ref_initialized_ = false;  // 是否已收到 PX4 home(锁一次,后续 PX4 home 变化不更新)
 
     // 跟踪约束参数
     double min_altitude_;            // 最小高度限制
@@ -91,7 +100,7 @@ private:
 
     // TRACK模式专用参数
     double track_altitude_;          // 固定跟踪高度（m）
-    double track_horiz_dist_;        // 水平安全距离（m，stand-off距离，到此距离速度降为0）
+    double track_horiz_dist_;        // 水平安全距离（m，stand-off距离，仅作为低空 fallback）
     double track_P_;                 // P控制增益
     double track_I_;                 // I控制增益
     double track_max_speed_;         // 最大速度限制（m/s）
@@ -99,9 +108,37 @@ private:
     double track_integral_x_;        // PI积分项 x
     double track_integral_y_;        // PI积分项 y
 
+    // ===== 新增跟踪几何参数（基于视线角俯仰角跟踪） =====
+    // 思路：固定跟踪高度下，根据期望的 LOS 俯仰角自动算出 stand-off 水平距离：
+    //       tan(pitch) = alt_diff / horiz_dist  →  horiz_dist = alt_diff / tan(pitch)
+    // 这样目标始终出现在云台视野的上半部分（45° 云台默认指向，30° 目标 = 视野上方 15°），
+    // 既保证相机持续看到目标，又留出俯冲空间给后续 strike。
+    double desired_los_pitch_deg_;   // 期望 LOS 俯仰角（目标在水平线下方角度），默认 30°
+    double min_horiz_dist_;          // stand-off 水平距离下限（避免目标几乎在脚下）
+    double max_horiz_dist_;          // stand-off 水平距离上限（避免离得太远看不到）
+    double yaw_los_threshold_deg_;   // 偏航 LOS 角阈值（target 偏离航向超过此值时优先转向不前进），默认 45°
+
     // 偏航角速度控制参数（PX4 SITL 用）
     double los_kp_yaw_;              // 偏航 P 控制增益
     double los_max_rate_;            // 偏航角速度限幅（rad/s）
+
+    // === 2026-07-16: 速度指令平滑(One Euro Filter) ===
+    // 背景:即使 mission_manager 已经平滑了 target_estimated_pose,这里 P 控制
+    //   v = K_p * (tgt - uav) 还是会把任何位置残留抖动乘以增益变成速度抖动,
+    //   PX4 高刚度控制下就让 UAV 上下左右晃。本节点再过一次 One Euro Filter
+    //   压平速度指令,从根本上消除"速度量调"造成的视觉抖动。
+    multi_uav_strike::OneEuroFilter1D vel_filter_x_;
+    multi_uav_strike::OneEuroFilter1D vel_filter_y_;
+    multi_uav_strike::OneEuroFilter1D vel_filter_z_;
+    multi_uav_strike::OneEuroFilter1D vel_filter_yaw_;
+    ros::Time                    vel_filter_last_time_;
+    // 目标切换检测:目标位置突变(>5m)→ 视为不同物理目标 → reset filter,
+    //   否则旧目标的 x_prev 会污染新目标的初值,造成瞬时偏飞。
+    double last_target_pos_x_ = 0.0;
+    double last_target_pos_y_ = 0.0;
+    double last_target_pos_z_ = 0.0;
+    bool   last_target_pos_valid_ = false;
+    static constexpr double kTargetSwitchJumpM = 5.0;
 
     // STRIKE模式参数
     double strike_min_altitude_;      // 开始下降的最小高度阈值
@@ -136,6 +173,10 @@ public:
         track_integral_y_(0.0),
         strike_min_altitude_(20.0),
         track_k_approach_(0.5),
+        desired_los_pitch_deg_(30.0),
+        min_horiz_dist_(5.0),
+        max_horiz_dist_(100.0),
+        yaw_los_threshold_deg_(45.0),
         use_sim_(true) {
         initParams();
         initSubscribers();
@@ -156,10 +197,8 @@ public:
         // 仿真/真机切换
         nh_private_.param<bool>("use_sim", use_sim_, true);
 
-        // GPS 参考点（仿真时所有 UAV 共享，PX4 SITL 时各 UAV 用各自的 home）
-        nh_private_.param<double>("ref_lat", ref_lat_, 36.096);
-        nh_private_.param<double>("ref_lon", ref_lon_, 114.392);
-        nh_private_.param<double>("ref_alt", ref_alt_, 100.0);
+        // GPS 参考点不再从 yaml 硬编码,而由 homePositionCallback() 从 PX4 /mavros/home_position/home 首次锁定
+        // (yaml 里仍可配 ref_lat/lon/alt 作为节点启动到 home 到达之间的临时 fallback,但实际 GPS→NED 在 ref_initialized_ 后才生效)
 
         // 根据 use_sim 设置 topic 名称
         if (use_sim_) {
@@ -201,16 +240,40 @@ public:
 
         // TRACK模式专用参数
         nh_private_.param<double>("track_altitude", track_altitude_, 30.0);       // 固定跟踪高度
-        nh_private_.param<double>("track_horiz_dist", track_horiz_dist_, 8.0);    // 水平安全距离
+        nh_private_.param<double>("track_horiz_dist", track_horiz_dist_, 8.0);    // 水平安全距离（仅低空 fallback）
         nh_private_.param<double>("track_P", track_P_, 1.0);                     // P控制增益
         nh_private_.param<double>("track_I", track_I_, 0.1);                     // I控制增益
         nh_private_.param<double>("uav_speed", track_max_speed_, 5.0);     // 最大速度限制
         // 距离→速度的连续斜率（消除内/外边界的硬切换：每超出 stand-off 1m 速度增加多少 m/s）
         nh_private_.param<double>("track_k_approach", track_k_approach_, 0.5);
 
+        // ===== 新增跟踪几何参数（视线角跟踪） =====
+        // 摄像头默认 45° 向下，30° 目标 = 视野上方 15°，方便切换 strike 时下俯
+        nh_private_.param<double>("desired_los_pitch_deg", desired_los_pitch_deg_, 30.0);
+        nh_private_.param<double>("min_horiz_dist", min_horiz_dist_, 5.0);
+        nh_private_.param<double>("max_horiz_dist", max_horiz_dist_, 100.0);
+        // 目标偏离航向 > 45° 时只转向不前进（避免大角度侧向/后退冲撞障碍）
+        nh_private_.param<double>("yaw_los_threshold_deg", yaw_los_threshold_deg_, 45.0);
+
         // 偏航角速度控制（PX4 SITL）
         nh_private_.param<double>("los_kp_yaw", los_kp_yaw_, 1.5);
         nh_private_.param<double>("los_max_rate", los_max_rate_, 1.2);
+
+        // === 2026-07-16: 速度指令 One Euro Filter 参数 ===
+        //   调参经验:还看着 UAV 抖 → 把 vel_min_cutoff_hz 降(0.5~1.0);
+        //            UAV 反应迟钝跟不上目标 → 升 vel_beta(0.02~0.05)
+        //   速度通道比位置通道可以略激进(响应要快),所以默认 beta 比位置稍大。
+        double vel_min_cutoff, vel_beta, vel_d_cutoff;
+        nh_private_.param<double>("vel_smooth_min_cutoff_hz", vel_min_cutoff, 1.5);
+        nh_private_.param<double>("vel_smooth_beta",          vel_beta,       0.015);
+        nh_private_.param<double>("vel_smooth_d_cutoff_hz",   vel_d_cutoff,   1.0);
+        vel_filter_x_   = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
+        vel_filter_y_   = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
+        vel_filter_z_   = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
+        vel_filter_yaw_ = multi_uav_strike::OneEuroFilter1D(vel_min_cutoff, vel_beta, vel_d_cutoff);
+        vel_filter_last_time_ = ros::Time();
+        ROS_INFO("[Guidance] Vel cmd OneEuro: min_cutoff=%.2fHz beta=%.3f d_cutoff=%.2fHz",
+                 vel_min_cutoff, vel_beta, vel_d_cutoff);
 
         // STRIKE模式专用参数
         nh_private_.param<double>("strike_min_altitude", strike_min_altitude_, 20.0);  // 开始下降的最小高度阈值
@@ -250,13 +313,30 @@ public:
             "guidance/mode", 10,
             &GuidanceControlNode::modeCallback, this);
 
+        // 拦截速度(来自 mission_manager,转发给 InterceptGuidance)
+        uav_speed_sub_ = nh_.subscribe(
+            "guidance/guidance_speed", 10,
+            &GuidanceControlNode::uavSpeedCallback, this);
+
         // 邻居无人机位置订阅（机间避障用）
         other_uav_poses_sub_ = nh_.subscribe(
             "inter_uav/other_uav_poses", 10,
             &GuidanceControlNode::otherUavPosesCallback, this);
+
+        // PX4 home 订阅（仅用于 GPS→NED 转换的参考原点）
+        home_position_sub_ = nh_.subscribe(
+            "mavros/home_position/home", 10,
+            &GuidanceControlNode::homePositionCallback, this);
     }
 
     void initPublishers() {
+        // RViz 帧名:去掉命名空间前导 '/' 后拼 "/map"(如 /uav0 → uav0/map);无命名空间 → map
+        {
+            std::string vns = nh_.getNamespace();
+            if (!vns.empty() && vns[0] == '/') vns = vns.substr(1);
+            viz_frame_ = vns.empty() ? "map" : (vns + "/map");
+        }
+
         vel_cmd_pub_ = nh_.advertise<geometry_msgs::Twist>(
             vel_cmd_topic_, 10);
 
@@ -266,7 +346,7 @@ public:
         attitude_rates_pub_ = nh_.advertise<geometry_msgs::TwistStamped>(
             attitude_rates_topic_, 10);
 
-        thrust_cmd_pub_ = nh_.advertise<std_msgs::Float32>(
+        thrust_cmd_pub_ = nh_.advertise<mavros_msgs::Thrust>(
             thrust_cmd_topic_, 10);
 
         // flight_mode_pub_ 在仿真模式使用 quad/flight_mode，PX4 模式不使用（通过 mavros/set_mode 切换）
@@ -281,11 +361,11 @@ public:
         thrust_dir_pub_ = nh_.advertise<visualization_msgs::Marker>(
             "thrust_direction", 10);  // 发布推力方向可视化
 
-        uav_pose_nwu_pub_ = nh_.advertise<geometry_msgs::PoseStamped>(
-            "quad/pose_nwu", 10);  // NWU姿态发布(RViz用)
-
         intercept_point_pub_ = nh_.advertise<visualization_msgs::Marker>(
             "intercept_point", 10);  // 拦截点可视化
+
+        target_filter_debug_pub_ = nh_.advertise<multi_uav_strike::TargetFilterDebug>(
+            "guidance/target_filter_debug", 10);  // 2026-07-16: 速度滤波前后对比
     }
 
     void initGuidanceStrategy() {
@@ -314,27 +394,35 @@ public:
             current_uav_pose_.pose.position.y = -msg->pose.position.y;
             current_uav_pose_.pose.position.z = -msg->pose.position.z;
 
-            // 四元数：w,x不变, y,z取反 (等价于绕X轴旋转180度)
-            current_uav_pose_.pose.orientation.w = msg->pose.orientation.w;
-            current_uav_pose_.pose.orientation.x = msg->pose.orientation.x;
-            current_uav_pose_.pose.orientation.y = -msg->pose.orientation.y;
-            current_uav_pose_.pose.orientation.z = -msg->pose.orientation.z;
+            // 四元数：q_nwu = q_frame * q_ned, q_frame = (0,1,0,0) 表示绕X轴180°
+            // 展开后: w' = -x, x' = w, y' = -z, z' = y
+            {
+                const auto& q = msg->pose.orientation;
+                current_uav_pose_.pose.orientation.w = -q.x;
+                current_uav_pose_.pose.orientation.x =  q.w;
+                current_uav_pose_.pose.orientation.y = -q.z;
+                current_uav_pose_.pose.orientation.z =  q.y;
+            }
         } else {
-            // ===== ENU → NED → NWU =====
+            // ===== ENU → NWU 坐标转换 =====
             // Mavros 输入是 ENU: X=East, Y=North, Z=Up
-            // ENU -> NED: x_ned = y_enu, y_ned = x_enu, z_ned = -z_enu
-            // NED -> NWU: x_nwu = x_ned, y_nwu = -y_ned, z_nwu = -z_ned
-            // 合成 ENU -> NWU: x = y_enu, y = -x_enu, z = z_enu
+            // NWU: X=North, Y=West, Z=Up
+            // 帧旋转 R_frame: 绕Z轴 -90° (ENU X→NWU -Y, ENU Y→NWU X, ENU Z→NWU Z)
+            // 位置：x = y_enu, y = -x_enu, z = z_enu
             current_uav_pose_.pose.position.x = msg->pose.position.y;
             current_uav_pose_.pose.position.y = -msg->pose.position.x;
             current_uav_pose_.pose.position.z = msg->pose.position.z;
 
-            // 四元数: ENU->NED (180°绕X) + NED->NWU (180°绕X) = 恒等
-            // 但实际上两个180°旋转的合成仍是180°旋转，等价于只做一次
-            current_uav_pose_.pose.orientation.w = msg->pose.orientation.w;
-            current_uav_pose_.pose.orientation.x = msg->pose.orientation.x;
-            current_uav_pose_.pose.orientation.y = -msg->pose.orientation.y;
-            current_uav_pose_.pose.orientation.z = -msg->pose.orientation.z;
+            // 四元数：q_nwu = q_frame * q_enu, q_frame = (√2/2, 0, 0, -√2/2)
+            // 展开后: w'=(w+z)/√2, x'=(x+y)/√2, y'=(y-x)/√2, z'=(z-w)/√2
+            {
+                const auto& q = msg->pose.orientation;
+                const double s = 0.70710678118654752440;  // sqrt(2)/2
+                current_uav_pose_.pose.orientation.w = s * (q.w + q.z);
+                current_uav_pose_.pose.orientation.x = s * (q.x + q.y);
+                current_uav_pose_.pose.orientation.y = s * (q.y - q.x);
+                current_uav_pose_.pose.orientation.z = s * (q.z - q.w);
+            }
         }
 
         current_uav_pose_.header.stamp = msg->header.stamp;
@@ -366,6 +454,21 @@ public:
         ROS_WARN_THROTTLE(5.0, "[Guidance] Mode changed to: %s", current_mode_.c_str());
     }
 
+    void uavSpeedCallback(const std_msgs::Float32::ConstPtr& msg) {
+        const double speed = static_cast<double>(msg->data);
+        if (speed <= 0.0) {
+            ROS_WARN_THROTTLE(5.0, "[Guidance] Ignoring non-positive uav_speed: %.2f", speed);
+            return;
+        }
+        // 更新本节点的速度上限(用于 applyInterUavAvoidance 和 vel cmd 限速)
+        track_max_speed_ = speed;
+        // 下发到当前激活的策略(目前只有 Intercept 用到)
+        if (guidance_strategy_) {
+            guidance_strategy_->setUavSpeed(speed);
+        }
+        ROS_INFO("[Guidance] uav_speed updated to %.2f m/s", speed);
+    }
+
     // 邻居无人机位置回调（机间避障用）
     void otherUavPosesCallback(const geometry_msgs::PoseArray::ConstPtr& msg) {
         neighbors_.clear();
@@ -381,6 +484,26 @@ public:
             neighbor.ned_z = ned_z;
             neighbors_.push_back(neighbor);
         }
+    }
+
+    /**
+     * PX4 home 回调 — 锁一次
+     * PX4 的 LOCAL_POSITION_NED 参考系由 EKF2 在启动时锁定,
+     * 后续 home 更新(MAV_CMD_DO_SET_HOME / disarm)不会重置 EKF2 origin,
+     * 也不让 local_position 跳变。如果跟着 home 更新去重算 NED,
+     * 反而让 setpoint 与 UAV 当前 local_position 不在同一 frame → 偏飞。
+     */
+    void homePositionCallback(const mavros_msgs::HomePosition::ConstPtr& msg) {
+        if (ref_initialized_) return;  // 锁一次
+        if (msg->geo.latitude == 0.0 && msg->geo.longitude == 0.0) {
+            return;  // PX4 home 未稳定前发 0/0,忽略
+        }
+        ROS_WARN("[Guidance] >>>> PX4 home locked: (%.7f, %.7f, %.2f)",
+                 msg->geo.latitude, msg->geo.longitude, msg->geo.altitude);
+        ref_lat_ = msg->geo.latitude;
+        ref_lon_ = msg->geo.longitude;
+        ref_alt_ = msg->geo.altitude;
+        ref_initialized_ = true;
     }
 
     /**
@@ -464,14 +587,10 @@ public:
                 eval_msg.data = (min_strike_distance_ < strike_distance_threshold_);
                 strike_eval_pub_.publish(eval_msg);
 
-                ROS_WARN("[STRIKE EVAL] ===== First Strike Evaluation =====");
-                ROS_WARN("[STRIKE EVAL] Min distance: %.2f m", min_strike_distance_);
-                ROS_WARN("[STRIKE EVAL] Strike altitude: %.2f m", strike_altitude_);
-                ROS_WARN("[STRIKE EVAL] Strike time: %.2f s", strike_time_);
-                ROS_WARN("[STRIKE EVAL] Success threshold: %.2f m", strike_distance_threshold_);
-                ROS_WARN("[STRIKE EVAL] Strike result: %s",
-                         (min_strike_distance_ < strike_distance_threshold_) ? "Success" : "Failure");
-                ROS_WARN("[STRIKE EVAL] ============================");
+                ROS_WARN("[STRIKE EVAL] %s: min_dist=%.2f m (threshold=%.2f), alt=%.2f m, t=%.2f s",
+                         (min_strike_distance_ < strike_distance_threshold_) ? "SUCCESS" : "FAILURE",
+                         min_strike_distance_, strike_distance_threshold_,
+                         strike_altitude_, strike_time_);
 
                 first_strike_evaluated_ = true;
             }
@@ -485,7 +604,7 @@ public:
         }
 
         if (!is_uav_pose_received_ || !is_target_pose_received_) {
-            ROS_WARN_THROTTLE(1.0, "[Guidance] Waiting for UAV pose or target data...");
+            ROS_WARN_THROTTLE(5.0, "[Guidance] Waiting for UAV pose or target data...");
             // ===== 关键：即使没收到目标，也要持续发零速度维持 PX4 OFFBOARD 心跳 =====
             // PX4 OFFBOARD 模式要求 setpoint 频率 > 2Hz，否则触发 failsafe 自动降落。
             // 起飞后切到 SEARCH_TRACK/STRIKE 时，目标通常还没出现，此时若 guidance
@@ -507,24 +626,10 @@ public:
             return;
         }
 
-        // Check if target twist is available (required for intercept)
-        if (!is_target_twist_received_ &&
-            current_strategy_type_ == multi_uav_strike::GuidanceStrategyType::INTERCEPT) {
-            ROS_WARN_THROTTLE(1.0, "[Guidance] Target velocity not available for intercept guidance");
-            // 同样的 OFFBOARD 保活：悬停等待 twist
-            geometry_msgs::Twist hover_cmd;
-            hover_cmd.linear.x = 0.0;
-            hover_cmd.linear.y = 0.0;
-            hover_cmd.linear.z = 0.0;
-            hover_cmd.angular.x = 0.0;
-            hover_cmd.angular.y = 0.0;
-            hover_cmd.angular.z = 0.0;
-            if (!use_sim_) {
-                convertVelNedToEnu(hover_cmd);
-            }
-            vel_cmd_pub_.publish(hover_cmd);
-            return;
-        }
+        // 注:INTERCEPT 制导为纯追踪(定速飞向目标当前位置),不使用 target_twist。
+        // 聚类只产生 2D 位置、无速度,故此处不再门槛拦截 twist。
+        // 若将来对动目标启用提前量拦截(见 InterceptGuidance::computeInterceptPoint 的
+        // target_vel 预测项),需恢复对 target_estimated_twist 的依赖并在此重新加门槛。
 
         // Compute guidance command based on strategy type
         switch (current_strategy_type_) {
@@ -545,6 +650,8 @@ public:
                     if (!use_sim_) {
                         convertVelNedToEnu(vel_cmd);
                     }
+                    // === 2026-07-16: 速度指令过 One Euro,消除"速度量调"造成的 UAV 视觉晃 ===
+                    filterVelocityCmd(vel_cmd);
                     vel_cmd_pub_.publish(vel_cmd);
                 } else {
                     // STRIKE模式
@@ -570,22 +677,24 @@ public:
                     // 基于视场角pitch的高度控制
                     // pitch大（绝对值）= 俯冲阶段 = 允许下降
                     // pitch小 = 接近阶段 = 限制下降
-                    double pitch = current_los_angle_.y;  // 来自LOS（NED下俯仰角）
-                    double pitch_threshold = 0.5f;  // ~0.5rad，小于此值限制下降
-                    double current_alt = current_uav_pose_.pose.position.z;
+                    //
+                    // 原来用硬 if/else 在 pitch_threshold=0.5rad 边界,|pitch| 跨阈值时
+                    //   vz 会从"完整 desired_z"瞬间跳到"被钳到 0",rqt_plot 上能看到
+                    //   单帧 vz 跳 0 → vel_cmd 视觉抖。
+                    // 改为:在阈值附近做平滑过渡(tanh),避免硬开关颠簸。
+                    double pitch = current_los_angle_.y;                         // NED 下俯仰角
+                    const double pitch_threshold = 0.5;                          // rad,跨此值允许全速下降
+                    const double transition_width = 0.1;                         // rad,过渡带宽
+                    const double max_descent_when_level = 0.0;                   // 接近阶段最大下沉速度 (m/s,NED D+)
 
-                    if (fabs(pitch) > pitch_threshold) {
-                        // pitch大或高度已低，正常下降
-                        vel_cmd.linear.z = -cmd.velocity.z();
-                    } else {
-                        // pitch小且高度还高，限制下沉
-                        double down_limit = -0.0;  // 最大下沉 0.1 m/s
-                        double desired_z = -cmd.velocity.z();
-                        if (desired_z > down_limit) {
-                            desired_z = down_limit;
-                        }
-                        vel_cmd.linear.z = desired_z;
-                    }
+                    // smooth_weight ∈ [0, 1]:
+                    //   |pitch| >> pitch_threshold → ≈1 (放行 desired_z)
+                    //   |pitch| << pitch_threshold → ≈0 (夹到 max_descent_when_level)
+                    double smooth_weight = 0.5 * (std::tanh(
+                        (std::fabs(pitch) - pitch_threshold) / transition_width) + 1.0);
+                    double desired_z = -cmd.velocity.z();  // >0 = 下沉(NED)
+                    if (desired_z < max_descent_when_level) desired_z = max_descent_when_level;
+                    vel_cmd.linear.z = smooth_weight * desired_z;
 
                     vel_cmd.angular.x = 0.0;
                     vel_cmd.angular.y = 0.0;
@@ -594,6 +703,8 @@ public:
                     if (!use_sim_) {
                         convertVelNedToEnu(vel_cmd);
                     }
+                    // STRIKE 模式也喂一次 One Euro,纯追踪对位置抖动更敏感
+                    filterVelocityCmd(vel_cmd);
                     vel_cmd_pub_.publish(vel_cmd);
                     publishInterceptPointMarker(cmd.intercept_point);
                 }
@@ -613,7 +724,7 @@ public:
 
             case multi_uav_strike::GuidanceStrategyType::LOS: {
                 if (!is_los_received_) {
-                    ROS_WARN_THROTTLE(1.0, "[Guidance] LOS angle not available for LOS guidance");
+                    ROS_WARN_THROTTLE(5.0, "[Guidance] LOS angle not available for LOS guidance");
                     return;
                 }
                 auto* strategy = static_cast<multi_uav_strike::LosGuidance*>(guidance_strategy_.get());
@@ -629,140 +740,375 @@ public:
         }
     }
 
-    // TRACK模式专用：PI控制速度计算
+    // === 2026-07-16: 速度指令 One Euro Filter 统一入口 ===
+    //   TRACK/STRIKE 两个分支在 publish 前都过这里一次,共用 dt / target-switch 检测。
+    //   目标位置突变(>5m)→ reset 所有 filter,丢弃旧目标的 x_prev;
+    //   这样切换目标瞬间,速度不会先跳一段旧值的"残影"再跟上。
+    //   注意:这里读的是 publish 前的 vel_cmd(NED 系),但滤波状态本身与坐标无关,
+    //   同 dt 同样的物理量,坐标转换不影响平滑效果。
+    void filterVelocityCmd(geometry_msgs::Twist& vel_cmd) {
+        // ---- 1) dt + target-switch 检测 ----
+        ros::Time now = ros::Time::now();
+        double te = vel_filter_last_time_.isZero()
+                        ? (1.0 / 50.0)
+                        : (now - vel_filter_last_time_).toSec();
+        vel_filter_last_time_ = now;
+        if (te <= 0.0) te = 1e-3;
+        if (te > 1.0)  te = 1.0;  // 长时间没调用(断流/暂停)→ 限幅,避免 filter 一帧暴走
+
+        const double tx = current_target_pose_.pose.position.x;
+        const double ty = current_target_pose_.pose.position.y;
+        const double tz = current_target_pose_.pose.position.z;
+        if (last_target_pos_valid_) {
+            const double dx = tx - last_target_pos_x_;
+            const double dy = ty - last_target_pos_y_;
+            const double dz = tz - last_target_pos_z_;
+            if (std::sqrt(dx*dx + dy*dy + dz*dz) > kTargetSwitchJumpM) {
+                // 目标切换 → reset 所有 channel,丢掉旧目标的速度平滑状态
+                vel_filter_x_.reset();
+                vel_filter_y_.reset();
+                vel_filter_z_.reset();
+                vel_filter_yaw_.reset();
+                ROS_WARN_THROTTLE(1.0,
+                    "[Guidance] Target switched (jump=%.1fm), reset velocity OneEuro filters",
+                    std::sqrt(dx*dx + dy*dy + dz*dz));
+            }
+        }
+        last_target_pos_x_ = tx;
+        last_target_pos_y_ = ty;
+        last_target_pos_z_ = tz;
+        last_target_pos_valid_ = true;
+
+        // ---- 2) 四通道 One Euro ----
+        // 先 snapshot raw(NED),filter 之后再 publish 一起发到 debug topic
+        const double raw_vx = vel_cmd.linear.x;
+        const double raw_vy = vel_cmd.linear.y;
+        const double raw_vz = vel_cmd.linear.z;
+        const double raw_wz = vel_cmd.angular.z;
+        vel_cmd.linear.x  = vel_filter_x_.filter(vel_cmd.linear.x,  te);
+        vel_cmd.linear.y  = vel_filter_y_.filter(vel_cmd.linear.y,  te);
+        vel_cmd.linear.z  = vel_filter_z_.filter(vel_cmd.linear.z,  te);
+        vel_cmd.angular.z = vel_filter_yaw_.filter(vel_cmd.angular.z, te);
+
+        // === 2026-07-16: Debug — raw vs filtered 速度 ===
+        //   用 rqt_plot 看 vel_raw - vel_filtered 的 residual,
+        //   若 residual 平稳但 UAV 还抖 → 不是 filter 的问题,可能是 PX4 控制环增益
+        //   若 residual 跟 UAV 抖同步 → One Euro 不够强,降 min_cutoff 或升 beta
+        multi_uav_strike::TargetFilterDebug dbg;
+        dbg.header.stamp    = now;
+        dbg.header.frame_id = "map";
+        // 位置维度本节点不直接产生(由 mission_manager 计算),填 0
+        dbg.pos_raw = dbg.pos_filtered = dbg.pos_delta = geometry_msgs::Point();
+        // 注:raw 是 NED 系(进入 filterVelocityCmd 之前),filtered 同 NED;
+        //   想跟 PX4 期望对比就直接 echo /guidance/target_filter_debug
+        dbg.vel_raw.x = raw_vx;  dbg.vel_raw.y = raw_vy;  dbg.vel_raw.z = raw_vz;
+        dbg.vel_filtered.x = vel_cmd.linear.x;
+        dbg.vel_filtered.y = vel_cmd.linear.y;
+        dbg.vel_filtered.z = vel_cmd.linear.z;
+        dbg.vel_delta.x = raw_vx - vel_cmd.linear.x;
+        dbg.vel_delta.y = raw_vy - vel_cmd.linear.y;
+        dbg.vel_delta.z = raw_vz - vel_cmd.linear.z;
+        // yaw_rate 走的是 angular.z(TRACK 模式才非 0),塞到 vel_delta.z 不合适,
+        //   直接把 raw_wz / filtered wz 也保留在 vel_* 里(overwrite 上面):
+        dbg.vel_raw.z    = raw_wz;       // 把 angular.z 也展示一下,用户看 rqt_plot 自己辨认
+        dbg.vel_filtered.z = vel_cmd.angular.z;
+        dbg.vel_delta.z  = raw_wz - vel_cmd.angular.z;
+        dbg.cluster_id = 0;  // 本节点不感知 cluster_id,留给 mission_manager 的 msg
+        dbg.is_locked  = is_target_pose_received_;
+        dbg.source     = "velocity";
+        target_filter_debug_pub_.publish(dbg);
+    }
+
+    // TRACK模式专用：基于视线角俯仰角的 stand-off 跟踪
+    //
+    // 设计目标（替代旧的 PI 飞向目标）：
+    //   1) 识别到目标后保持在 stand-off 圆周上，使目标 LOS 俯仰角稳定在 desired_los_pitch_deg_
+    //      （默认 30°）。这样摄像头（默认 45° 向下）持续看到目标，且为后续 strike 留出俯冲空间。
+    //   2) 航向始终指向目标（target_bearing）。
+    //   3) 不允许后退飞行：任何会让机体坐标系前向速度 < 0 的指令都归零。
+    //      若目标偏离航向 > yaw_los_threshold_deg_（默认 45°），优先转向，前进速度大幅衰减，
+    //      避免大角度侧冲或后退撞障碍物。
+    //
+    // 几何关系：
+    //   tan(pitch) = alt_diff / horiz_dist  →  horiz_dist = alt_diff / tan(pitch)
+    //   alt_diff 为 UAV 相对目标的高度差（正值 = UAV 高于目标）。
     void computeTrackVelocity(geometry_msgs::Twist& vel_cmd) {
-        double dx = current_target_pose_.pose.position.x - current_uav_pose_.pose.position.x;
-        double dy = current_target_pose_.pose.position.y - current_uav_pose_.pose.position.y;
-        double dz = current_target_pose_.pose.position.z - current_uav_pose_.pose.position.z;
+        // ====== 调试节流计数器：每 DBG_PERIOD 次循环打一次（约 10Hz @ 50Hz 主循环） ======
+        // static int dbg_tick = 0;
+        // const int DBG_PERIOD = 5;
+        // const bool dbg_this = (++dbg_tick % DBG_PERIOD) == 0;
 
-        double horiz_dist = sqrt(dx*dx + dy*dy);
+        const double uav_x = current_uav_pose_.pose.position.x;
+        const double uav_y = current_uav_pose_.pose.position.y;
+        const double uav_z = current_uav_pose_.pose.position.z;
 
-        // 偏航角：让机头朝向目标
-        // current_yaw 这里计算出是 NWU 坐标系的（左转正，从上方看是逆时针，0=North, -π/2=East）
-        double current_yaw = atan2(2.0 * (current_uav_pose_.pose.orientation.w * current_uav_pose_.pose.orientation.z +
-                                          current_uav_pose_.pose.orientation.x * current_uav_pose_.pose.orientation.y),
-                                   1.0 - 2.0 * (current_uav_pose_.pose.orientation.y * current_uav_pose_.pose.orientation.y +
-                                                current_uav_pose_.pose.orientation.z * current_uav_pose_.pose.orientation.z));
-        // target_bearing 在 NWU 下计算：atan2(dy_west, dx_north)
-        // 0=North, +π/2=West, π/-π=South, -π/2=East
-        double target_bearing = atan2(dy, dx);
+        const double tgt_x = current_target_pose_.pose.position.x;
+        const double tgt_y = current_target_pose_.pose.position.y;
+        const double tgt_z = current_target_pose_.pose.position.z;
+
+        // 目标相对 UAV（NWU）
+        const double dx = tgt_x - uav_x;
+        const double dy = tgt_y - uav_y;
+        const double dz = tgt_z - uav_z;
+
+        const double horiz_dist = std::sqrt(dx*dx + dy*dy);
+        const double alt_diff = uav_z - tgt_z;  // > 0 表示 UAV 高于目标
+
+        // 当前航向（NWU：左转为正，从上方看是 CCW，0=North）
+        const double current_yaw = atan2(
+            2.0 * (current_uav_pose_.pose.orientation.w * current_uav_pose_.pose.orientation.z +
+                   current_uav_pose_.pose.orientation.x * current_uav_pose_.pose.orientation.y),
+            1.0 - 2.0 * (current_uav_pose_.pose.orientation.y * current_uav_pose_.pose.orientation.y +
+                         current_uav_pose_.pose.orientation.z * current_uav_pose_.pose.orientation.z));
+
+        // 目标方位角（NWU：0=North, +π/2=West）
+        const double target_bearing = std::atan2(dy, dx);
+
+        // 航向偏差：航向 → 目标（归一化到 [-π, π]）
         double yaw_error = target_bearing - current_yaw;
-        yaw_error = atan2(sin(yaw_error), cos(yaw_error));
+        yaw_error = std::atan2(std::sin(yaw_error), std::cos(yaw_error));
+        const double yaw_error_abs_deg = std::fabs(yaw_error) * 180.0 / M_PI;
 
-        // 偏航角控制：LOS 角度来自 gimbal_simulator（NED 坐标系：从上方看顺时针，0=North, +π/2=East）
-        // 与 NWU 系的 current_yaw 符号相反（NED:北偏东为正, NWU:北偏西为正），
-        // 需转换：yaw_nwu = -yaw_ned，统一使用 NWU 约定避免 180° 误转。
-        double desired_yaw;
-        if (is_los_received_) {
-            desired_yaw = -current_los_angle_.x;  // NED → NWU
+        // ====== 原始 LOS 输入 + 几何对照 ======
+        // gimbal 发的是 NED 系: los.x = -desired_yaw, los.y = -desired_pitch
+        const double los_pitch_in_ned = is_los_received_ ? current_los_angle_.y : 0.0;  // NED, 通常为负(看向下)
+        const double los_pitch_in_nwu_deg = -los_pitch_in_ned * 180.0 / M_PI;             // NWU, 正=在水平线下
+        const double los_yaw_in_nwu_deg   = (is_los_received_ ? -current_los_angle_.x : 0.0) * 180.0 / M_PI;
+        // 我们自己几何算出的实际俯仰角（NED 系，对照 gimbal 的 los.y）
+        const double geom_pitch_ned_rad = (horiz_dist > 1e-3) ? std::atan2(alt_diff, horiz_dist) : 0.0;
+        // 两者越接近 = LOS 越可信、估计的位置和云台视野一致
+        const double los_geom_pitch_diff_deg = (los_pitch_in_ned - geom_pitch_ned_rad) * 180.0 / M_PI;
+
+        // =====================================================================
+        // 1) 计算期望 stand-off 水平距离（基于期望 LOS 俯仰角）
+        // =====================================================================
+        const double desired_los_pitch_rad = desired_los_pitch_deg_ * M_PI / 180.0;
+        double desired_horiz_dist;
+        if (alt_diff > 1.0) {
+            desired_horiz_dist = alt_diff / std::tan(desired_los_pitch_rad);
         } else {
-            desired_yaw = target_bearing;
+            // UAV 太低 / 与目标同高度，几何退化：用固定安全距离兜底
+            desired_horiz_dist = track_horiz_dist_;
+        }
+        // 限幅，避免距离过近（目标在脚下）或过远（脱离跟踪）
+        desired_horiz_dist = std::max(min_horiz_dist_, std::min(max_horiz_dist_, desired_horiz_dist));
+
+        // =====================================================================
+        // 2) 径向 P 控制：水平方向只关心 stand-off 距离，不让 UAV 飞到目标正上方
+        //    horiz_dist > desired → 朝目标径向运动（径向速度为负 = 内移）
+        //    horiz_dist < desired → 远离目标径向运动（径向速度为正 = 外移）
+        // =====================================================================
+        const double horiz_dist_error = horiz_dist - desired_horiz_dist;
+        const double radial_speed_raw = track_k_approach_ * horiz_dist_error;  // P 控制（未限幅）
+        double radial_speed = radial_speed_raw;
+        // 限幅到 ±track_max_speed_
+        const bool radial_speed_clamped = (radial_speed_raw != std::max(-track_max_speed_, std::min(track_max_speed_, radial_speed_raw)));
+        radial_speed = std::max(-track_max_speed_, std::min(track_max_speed_, radial_speed));
+
+        // 径向单位向量（UAV → target 在水平面上的投影）
+        const double radial_x = (horiz_dist > 1e-3) ? (dx / horiz_dist) : 1.0;
+        const double radial_y = (horiz_dist > 1e-3) ? (dy / horiz_dist) : 0.0;
+
+        // 世界坐标系下的期望水平速度（NWU）-- 还未转机体
+        double cmd_x = radial_x * radial_speed;
+        double cmd_y = radial_y * radial_speed;
+        const double cmd_world_pre_norm = std::sqrt(cmd_x*cmd_x + cmd_y*cmd_y);
+
+        // =====================================================================
+        // 3) 转机体坐标系，应用"不后退"约束
+        //    NWU heading 向量 = (cos(yaw), sin(yaw))
+        //    左向量 = (-sin(yaw), cos(yaw)) （CCW 旋转 90°）
+        // =====================================================================
+        const double cos_yaw = std::cos(current_yaw);
+        const double sin_yaw = std::sin(current_yaw);
+        const double cmd_fwd_pre  =  cmd_x * cos_yaw + cmd_y * sin_yaw;   // 前向（机头方向，转机体前）
+        const double cmd_left_pre = -cmd_x * sin_yaw + cmd_y * cos_yaw;   // 左向（转机体前）
+        double cmd_fwd  = cmd_fwd_pre;
+        double cmd_left = cmd_left_pre;
+
+        // 硬约束：不允许任何后退（cmd_fwd < 0 全部归零）
+        const bool clamped_no_backward = (cmd_fwd_pre < 0.0);
+        if (cmd_fwd < 0.0) {
+            cmd_fwd = 0.0;
         }
 
-        // PI控制：水平速度根据位置偏差计算
-        double cmd_x = track_P_ * dx + track_I_ * track_integral_x_;
-        double cmd_y = track_P_ * dy + track_I_ * track_integral_y_;
+        // 横向速度限幅（避免大角度侧冲）
+        const double max_lat_speed = track_max_speed_ * 0.5;
+        const bool clamped_lat = (std::fabs(cmd_left_pre) > max_lat_speed);
+        cmd_left = std::max(-max_lat_speed, std::min(max_lat_speed, cmd_left));
 
-        // 速度限幅
-        double speed = sqrt(cmd_x*cmd_x + cmd_y*cmd_y);
-        if (speed > track_max_speed_) {
-            cmd_x = cmd_x / speed * track_max_speed_;
-            cmd_y = cmd_y / speed * track_max_speed_;
+        // 目标偏离航向 > 阈值时优先转向：前进大幅衰减，让 yaw rate 把机头先转过来
+        const bool yaw_threshold_active = (yaw_error_abs_deg > yaw_los_threshold_deg_);
+        if (yaw_threshold_active) {
+            cmd_fwd *= 0.2;    // 大幅降低前进
+            cmd_left *= 0.3;   // 横向也收紧
         }
 
-        // 距离→速度的连续映射（消除内/外边界的硬切换）：
-        //   - 距离 > stand-off：按 track_k_approach_ * (horiz_dist - stand-off) 给速度
-        //   - 距离 <= stand-off：速度按相同斜率线性降到 0
-        //   - 上限为 track_max_speed_
-        // 这样靠近目标时速度自然收敛到 0，远离时单调增大，没有突变，姿态变化平滑。
-        double approach_speed = std::max(0.0, track_k_approach_ * (horiz_dist - track_horiz_dist_));
-        double track_speed_cap = std::min(approach_speed, track_max_speed_);
-
-        // 用连续限幅替换原来的硬限幅，保证靠近时速度真正降到 0
-        double speed_xy = sqrt(cmd_x*cmd_x + cmd_y*cmd_y);
-        if (speed_xy > track_speed_cap) {
-            cmd_x = cmd_x / speed_xy * track_speed_cap;
-            cmd_y = cmd_y / speed_xy * track_speed_cap;
-        } else if (horiz_dist <= track_horiz_dist_) {
-            // 进入 stand-off 范围：PI 输出按当前速度限幅比例线性衰减，避免姿态突变
-            double scale = (speed_xy > 1e-3) ? (track_speed_cap / speed_xy) : 0.0;
-            cmd_x *= scale;
-            cmd_y *= scale;
+        // 速度限幅（防数值问题）
+        double speed_xy = std::sqrt(cmd_fwd*cmd_fwd + cmd_left*cmd_left);
+        const bool body_speed_clamped = (speed_xy > track_max_speed_);
+        if (speed_xy > track_max_speed_) {
+            double s = track_max_speed_ / speed_xy;
+            cmd_fwd *= s;
+            cmd_left *= s;
         }
 
-        // 积分项：远离目标时累加，进入 stand-off 后清零
-        if (horiz_dist > track_horiz_dist_) {
-            track_integral_x_ += dx * 0.02;
-            track_integral_y_ += dy * 0.02;
-        } else {
-            track_integral_x_ = 0.0;
-            track_integral_y_ = 0.0;
-        }
-        track_integral_x_ = std::max(-5.0, std::min(5.0, track_integral_x_));
-        track_integral_y_ = std::max(-5.0, std::min(5.0, track_integral_y_));
+        // 转回世界坐标系
+        cmd_x = cmd_fwd * cos_yaw - cmd_left * sin_yaw;
+        cmd_y = cmd_fwd * sin_yaw + cmd_left * cos_yaw;
+        const double cmd_world_post_norm = std::sqrt(cmd_x*cmd_x + cmd_y*cmd_y);
 
-        // 航向：进入 stand-off 时不再强制保持 current_yaw，让 LOS 角度平滑过渡
-        // （之前在 inner_threshold 内强制 desired_yaw = current_yaw 会导致出/入 stand-off
-        //  时航向角速度突然反向，是姿态大角度跳变的另一个来源）
-        if (horiz_dist <= track_horiz_dist_) {
-            // 缓出：把航向也向 LOS 方向拉一点点，避免悬停时一直锁住航向
-            double los_yaw_nwu = -current_los_angle_.x;
-            double blend = 0.2 * (horiz_dist / std::max(track_horiz_dist_, 1e-3));
-            desired_yaw = current_yaw * (1.0 - blend) + los_yaw_nwu * blend;
-        }
+        // =====================================================================
+        // 4) 高度控制：固定 track_altitude_（P 控制）
+        // =====================================================================
+        const double alt_error = uav_z - track_altitude_;
+        double cmd_z = std::max(-1.0, std::min(1.0, -0.5 * alt_error));  // NED: z<0=上升
+        const double alt_clamped = (alt_error > 2.0 || alt_error < -2.0);
 
-        // 高度控制：固定高度 track_altitude_
-        // NED: z>0向下，z<0向上
-        double alt_error = current_uav_pose_.pose.position.z - track_altitude_;
-        double cmd_z = std::max(-1.0, std::min(1.0, -0.5 * alt_error));  // P控制，高度低了向上(z<0)
-
-        // 机间避障
+        // =====================================================================
+        // 5) 机间避障（在世界系叠加斥力）
+        // =====================================================================
+        const double cmd_x_pre_avoid = cmd_x;
+        const double cmd_y_pre_avoid = cmd_y;
+        const double cmd_z_pre_avoid = cmd_z;
         applyInterUavAvoidance(cmd_x, cmd_y, cmd_z);
 
+        // =====================================================================
+        // 6) 输出（NWU → NED 转换）
+        // =====================================================================
         vel_cmd.linear.x = cmd_x;
         vel_cmd.linear.y = -cmd_y;  // NED E = -NWU W
         vel_cmd.linear.z = -cmd_z;   // NED D (z<0=up)
-
-        // 偏航角速度控制：PX4 SITL 通过 mavros 的 angular.z 是角速度（rad/s），不是角度
-        // desired_yaw/current_yaw 在 NWU 坐标系下（左转为正）
-        // 计算角度误差并归一化到 [-pi, pi]
-        double yaw_err_ctrl = desired_yaw - current_yaw;
-        yaw_err_ctrl = atan2(sin(yaw_err_ctrl), cos(yaw_err_ctrl));
-
-        // P 控制：角速度 = Kp * 角度误差
-        double yaw_rate = los_kp_yaw_ * yaw_err_ctrl;
-
-        // 角速度限幅
-        yaw_rate = std::max(-los_max_rate_, std::min(los_max_rate_, yaw_rate));
-
         vel_cmd.angular.x = 0.0;
         vel_cmd.angular.y = 0.0;
-        // ===========================================================================
-        // 偏航角速度符号约定（避免再出现 +los_max_rate / -los_max_rate 跳变）：
-        //
-        //   内部约定 (NWU):    yaw_rate > 0  → 左转 (CCW from above)
-        //   mavros 约定 (FRD): angular.z > 0 → 右转 (CW  from above)
-        //   → 两者符号相反，需要在送 mavros 前取反。
-        //
-        //   这个取反操作由调用本函数后紧接着执行的 convertVelNedToEnu() 完成
-        //   （见 line ~719: vel_cmd.angular.z = -ned_yaw;），所以这里必须直接
-        //   写入 NWU 约定的 yaw_rate，绝不能再取反。
-        //
-        // 历史 bug：原代码写的是 vel_cmd.angular.z = -yaw_rate;，与 convertVelNedToEnu
-        //   中的 -ned_yaw 形成双重取反，最终送到 mavros 的是 +yaw_rate。mavros 按 FRD
-        //   约定解释为"右转"，但我们的内部逻辑是"需要左转"，于是 PX4 持续向错误方向
-        //   打舵，yaw_error 累积至 ±π，los_kp_yaw_ * yaw_err 被限幅到 ±los_max_rate_
-        //   之间反复跳变，外观就是航向在最大角速度处来回抖。
-        //
-        // 修正：去掉这里的负号，让 convertVelNedToEnu 单独完成 NWU→FRD 转换。
-        // 验证：去掉负号后目标在北方时航向不再进入 ±max_rate 跳变，跟踪稳定。
-        // ===========================================================================
-        vel_cmd.angular.z = yaw_rate;
 
-        // ROS_WARN_THROTTLE(0.5, "[Guidance-TRACK] dx=%.1f dy=%.1f horiz=%.1f alt=%.1f des_alt=%.1f vel(%.2f,%.2f,%.2f) yaw=%.0f",
-        //                  dx, dy, horiz_dist, current_uav_pose_.pose.position.z, track_altitude_,
-        //                  vel_cmd.linear.x, vel_cmd.linear.y, vel_cmd.linear.z,
-        //                  desired_yaw * 180.0 / M_PI);
+        // =====================================================================
+        // 7) 偏航角速度控制：航向始终指向目标（target_bearing）
+        //    当目标偏离航向 > yaw_los_threshold_deg_ 时，yaw_rate 会迅速把机头转过去，
+        //    一旦目标进入前方扇区，前向速度恢复，全速接近 stand-off。
+        // =====================================================================
+        const double yaw_err_ctrl = std::atan2(std::sin(target_bearing - current_yaw),
+                                                std::cos(target_bearing - current_yaw));
+        const double yaw_rate_raw = los_kp_yaw_ * yaw_err_ctrl;
+        double yaw_rate = yaw_rate_raw;
+        const bool yaw_rate_clamped = (std::fabs(yaw_rate_raw) > los_max_rate_);
+        yaw_rate = std::max(-los_max_rate_, std::min(los_max_rate_, yaw_rate));
+        // NWU -> NED
+        vel_cmd.angular.z = -yaw_rate;
+
+        // =====================================================================
+        // 8) 综合调试打印：每 DBG_PERIOD 次循环打一次（约 10Hz）
+        //    一次性把每一步的中间量都列出来，方便定位"为何没追上 / 姿态乱跳"
+        // =====================================================================
+        // if (dbg_this) {
+        //     ROS_WARN(
+        //         "\n========== [TRACK DEBUG tick=%d] =========="
+        //         "\n[INPUT]"
+        //         "\n  uav_pos[NWU]   = (%.2f, %.2f, %.2f)   alt_asl=%.2f"
+        //         "\n  tgt_pos[NWU]   = (%.2f, %.2f, %.2f)"
+        //         "\n  uav_quat(wxyz) = (%.3f, %.3f, %.3f, %.3f)"
+        //         "\n  los_received  = %d"
+        //         "\n  los_in[NED]   (yaw,pitch,conf) = (%.3f rad, %.3f rad, %.3f)"
+        //         "\n  los_in[NWU deg] (yaw,pitch)   = (%.1f, %.1f)   <-- gimbal 直接发出来的"
+        //         "\n[GEOMETRY]"
+        //         "\n  rel_pos (dx,dy,dz) = (%.2f, %.2f, %.2f)   (target - uav in NWU)"
+        //         "\n  horiz_dist      = %.2f m"
+        //         "\n  alt_diff (uav-tgt) = %.2f m"
+        //         "\n  geom_pitch[nwu deg] = %.1f   (= atan2(alt_diff, horiz_dist))"
+        //         "\n  los_pitch[nwu deg]  = %.1f   (来自 los_angle.y)"
+        //         "\n  diff(los - geom) = %+.1f deg   <-- 偏离 0 = LOS 与几何一致，越大说明 LOS 已经不指向真目标"
+        //         "\n[YAW]"
+        //         "\n  current_yaw   = %.1f deg   (NWU: 0=N, +π/2=W)"
+        //         "\n  target_bearing= %.1f deg   (NWU)"
+        //         "\n  yaw_error     = %+.1f deg (|err|=%.1f, threshold=%.1f, attenuation_active=%s)"
+        //         "\n  los_yaw_in    = %.1f deg   (gimbal 发的，对照 current_yaw 看 gimbal 实际转向)"
+        //         "\n[DESIRED STAND-OFF]"
+        //         "\n  desired_los_pitch_deg = %.1f   (rad=%.3f, tan=%.3f)"
+        //         "\n  desired_horiz_dist    = %.2f  (raw=horiz_pitch+clamp [%.1f, %.1f], fallback_for_low_alt=%.2f)"
+        //         "\n[RADIAL P CONTROL]"
+        //         "\n  horiz_dist_error       = horiz - desired = %.2f"
+        //         "\n  radial_speed raw       = -k * err = -%.2f * %.2f = %.3f"
+        //         "\n  radial_speed after cap = %.3f   (clamped_by_max_speed=%s, max=%.2f)"
+        //         "\n  radial_unit (radial_x, radial_y) = (%.3f, %.3f)"
+        //         "\n[WORLD VEL BEFORE BODY CONVERSION]"
+        //         "\n  cmd_world_pre = (%.3f, %.3f)   |.|= %.3f"
+        //         "\n[BODY CONVERSION  (cos=%.3f, sin=%.3f of current_yaw)]"
+        //         "\n  pre-clamp : cmd_fwd_pre = %.3f   cmd_left_pre = %.3f   |body_pre|=%.3f"
+        //         "\n  step1 no-backward clamp active=%s   (would have sent fwd=%.3f backward, now 0)"
+        //         "\n  step2 lat-lim active=%s   (cap=±%.3f)"
+        //         "\n  step3 yaw-threshold attenuation active=%s   (fwd x0.2, left x0.3)"
+        //         "\n  step4 body-norm cap active=%s"
+        //         "\n  post-clamp: cmd_fwd_final = %.3f   cmd_left_final = %.3f   |body_final|=%.3f"
+        //         "\n[WORLD VEL AFTER BODY->WORLD  (before avoidance)]"
+        //         "\n  cmd_world_pre_avoid = (%.3f, %.3f)   |.|= %.3f"
+        //         "\n[ALTITUDE]"
+        //         "\n  uav_z=%.2f  track_altitude=%.2f  err=%.2f  -> cmd_z=%.3f (NED: <0=up)  saturated=%s"
+        //         "\n[INTER-UAV AVOIDANCE]"
+        //         "\n  neighbors=%lu"
+        //         "\n  pre  avoid: (%.3f, %.3f, %.3f)"
+        //         "\n  post avoid: (%.3f, %.3f, %.3f)"
+        //         "\n  delta      : (%.3f, %.3f, %.3f)"
+        //         "\n[YAW RATE]"
+        //         "\n  yaw_err_ctrl    = %.3f rad  (= %+.1f deg)"
+        //         "\n  yaw_rate raw    = kp*err = %.2f * %.3f = %.3f"
+        //         "\n  yaw_rate after clamp to ±%.2f  =>  %.3f   (clamped=%s)"
+        //         "\n[PARAMS]"
+        //         "\n  track_k_approach=%.2f  track_max_speed=%.2f  max_lat_speed=track_max*0.5=%.3f"
+        //         "\n  los_kp_yaw=%.2f  los_max_rate=%.2f  yaw_los_threshold=%.1f"
+        //         "\n[FINAL OUTPUT  (NED, 发送给飞控)]"
+        //         "\n  vel_cmd.linear  = (%.3f, %.3f, %.3f)"
+        //         "\n  vel_cmd.angular.z (yaw_rate, NED) = %.3f"
+        //         "\n==========",
+        //         dbg_tick,
+        //         uav_x, uav_y, uav_z, uav_z,
+        //         tgt_x, tgt_y, tgt_z,
+        //         current_uav_pose_.pose.orientation.w, current_uav_pose_.pose.orientation.x,
+        //         current_uav_pose_.pose.orientation.y, current_uav_pose_.pose.orientation.z,
+        //         is_los_received_ ? 1 : 0,
+        //         current_los_angle_.x, current_los_angle_.y, current_los_angle_.z,
+        //         los_yaw_in_nwu_deg, los_pitch_in_nwu_deg,
+        //         dx, dy, dz,
+        //         horiz_dist,
+        //         alt_diff,
+        //         -geom_pitch_ned_rad * 180.0 / M_PI,
+        //         los_pitch_in_nwu_deg,
+        //         los_geom_pitch_diff_deg,
+        //         current_yaw * 180.0 / M_PI,
+        //         target_bearing * 180.0 / M_PI,
+        //         yaw_error * 180.0 / M_PI, yaw_error_abs_deg, yaw_los_threshold_deg_,
+        //         yaw_threshold_active ? "YES" : "no",
+        //         los_yaw_in_nwu_deg,
+        //         desired_los_pitch_deg_, desired_los_pitch_rad, std::tan(desired_los_pitch_rad),
+        //         desired_horiz_dist, min_horiz_dist_, max_horiz_dist_, track_horiz_dist_,
+        //         horiz_dist_error,
+        //         track_k_approach_, horiz_dist_error, radial_speed_raw,
+        //         radial_speed,
+        //         radial_speed_clamped ? "YES" : "no", track_max_speed_,
+        //         radial_x, radial_y,
+        //         cmd_x, cmd_y, cmd_world_pre_norm,
+        //         cos_yaw, sin_yaw,
+        //         cmd_fwd_pre, cmd_left_pre,
+        //         std::sqrt(cmd_fwd_pre*cmd_fwd_pre + cmd_left_pre*cmd_left_pre),
+        //         clamped_no_backward ? "YES" : "no", cmd_fwd_pre,
+        //         clamped_lat ? "YES" : "no", max_lat_speed,
+        //         yaw_threshold_active ? "YES" : "no",
+        //         body_speed_clamped ? "YES" : "no",
+        //         cmd_fwd, cmd_left, std::sqrt(cmd_fwd*cmd_fwd + cmd_left*cmd_left),
+        //         cmd_x_pre_avoid, cmd_y_pre_avoid, cmd_world_post_norm,
+        //         uav_z, track_altitude_, alt_error, cmd_z, alt_clamped ? "YES" : "no",
+        //         neighbors_.size(),
+        //         cmd_x_pre_avoid, cmd_y_pre_avoid, cmd_z_pre_avoid,
+        //         cmd_x, cmd_y, cmd_z,
+        //         cmd_x - cmd_x_pre_avoid, cmd_y - cmd_y_pre_avoid, cmd_z - cmd_z_pre_avoid,
+        //         yaw_err_ctrl, yaw_err_ctrl * 180.0 / M_PI,
+        //         los_kp_yaw_, yaw_err_ctrl, yaw_rate_raw,
+        //         los_max_rate_, yaw_rate, yaw_rate_clamped ? "YES" : "no",
+        //         track_k_approach_, track_max_speed_, max_lat_speed,
+        //         los_kp_yaw_, los_max_rate_, yaw_los_threshold_deg_,
+        //         vel_cmd.linear.x, vel_cmd.linear.y, vel_cmd.linear.z,
+        //         vel_cmd.angular.z
+        //     );
+        // }
     }
 
     /**
@@ -802,9 +1148,10 @@ public:
         att_cmd.pose.orientation.z = -cmd.attitude.z();  // NWU -> NED
         attitude_cmd_pub_.publish(att_cmd);
 
-        // Publish thrust
-        std_msgs::Float32 thrust_cmd;
-        thrust_cmd.data = cmd.thrust;
+        // Publish thrust(mavros setpoint_attitude/thrust 要求 mavros_msgs::Thrust)
+        mavros_msgs::Thrust thrust_cmd;
+        thrust_cmd.header.stamp = ros::Time::now();
+        thrust_cmd.thrust = cmd.thrust;
         thrust_cmd_pub_.publish(thrust_cmd);
 
         // Set flight mode to attitude (仅仿真模式发布；PX4 SITL 由 mission_manager 通过 mavros/set_mode 切换)
@@ -834,7 +1181,7 @@ public:
     void publishThrustDirectionMarker(const multi_uav_strike::AttitudeThrustCommand& cmd) {
         visualization_msgs::Marker marker;
         marker.header.stamp = ros::Time::now();
-        marker.header.frame_id = "map";
+        marker.header.frame_id = viz_frame_;
         marker.ns = "thrust_direction";
         marker.id = 0;
         marker.type = visualization_msgs::Marker::ARROW;
@@ -873,7 +1220,7 @@ public:
     void publishInterceptPointMarker(const Eigen::Vector3d& intercept_point) {
         visualization_msgs::Marker marker;
         marker.header.stamp = ros::Time::now();
-        marker.header.frame_id = "map";
+        marker.header.frame_id = viz_frame_;
         marker.ns = "intercept_point";
         marker.id = 0;
         marker.type = visualization_msgs::Marker::SPHERE;

@@ -24,12 +24,19 @@
   <!-- 命令行可覆盖参数                                                         -->
   <!-- ====================================================================== -->
   <!-- 默认 IDLE：飞机在地面等待，不会自动起飞。
-       切换流程示例：
-         rostopic pub -1 /gs/mode_cmd std_msgs/String "TAKEOFF"     # 起飞
-         rostopic pub -1 /gs/mode_cmd std_msgs/String "SEARCH_ONLY"  # 起飞后开始航点飞行
+       flow 选定后由 gs_simulator_node.py 发布 typed TaskFlow 到 /<ns>/mission/task_flow,
+       mission_manager 根据首发 skill 自动切 work_mode。
+       可选 flow:
+         - ground_search_strike  (地面起飞 + 搜索 + 打击)
+         - ground_search_track   (地面起飞 + 搜索跟踪)
+         - ground_gather_search  (地面起飞 + 集结 + 搜索)
+         - catapult_search_return(弹射起飞 + 搜索 + 返航)
+         - ground_search         (地面起飞 + 搜索)
+         - b47c_normal / groupb1bc  (真实任务数据,内置 ref_lat/lon 覆盖)
+
   -->
-  <arg name="mode" default="IDLE" />
   <arg name="uav_name" default="uav0" />
+  <arg name="flow" default="ground_search_track" />
 
   <!-- Set GeographicLib data path -->
   <env name="GEOGRAPHICLIB_DATA" value="$(env HOME)/.GeographicLib" />
@@ -40,7 +47,7 @@
   <group ns="$(arg uav_name)">
     <include file="$(find mavros)/launch/px4.launch">
       <arg name="fcu_url" value="udp://:14540@127.0.0.1:14580" />
-      <arg name="tgt_system" value="1" />
+      <arg name="tgt_system" value="$(optenv TZS_FCU_ID 1)" />
     </include>
   </group>
 
@@ -144,10 +151,28 @@
           type="mission_manager_node"
           output="screen"
           respawn="false">
+      <param name="device_id" value="0" />
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/mission_manager.yaml" />
+    </node>
+  </group>
+
+  <!-- ====================================================================== -->
+  <!-- 8b. 机间避障决策节点(基于优先级,横向严禁 + 高度 bias + 速度 scale)        -->
+  <!--    注: 检测功能已合并到 gimbal_simulator_node(FOV 由当前云台角度决定)   -->
+  <!-- ====================================================================== -->
+  <group ns="$(arg uav_name)">
+    <node name="uav_avoidance_node"
+          pkg="multi_uav_strike"
+          type="uav_avoidance_node"
+          output="screen"
+          respawn="false">
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/common.yaml" />
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/uav_avoidance.yaml" />
     </node>
   </group>
 
@@ -160,25 +185,12 @@
         output="screen"
         respawn="false"
         args=""
-        launch-prefix="bash -c 'sleep 2; $@' --" > 
-    <param name="mode" value="$(arg mode)" />
-    <param name="auto_pub" value="true" />
+        launch-prefix="bash -c 'sleep 2; $@' --" >
+    <param name="flow" value="$(arg flow)" />
+    <param name="uav_ns" value="$(arg uav_name)" />
     <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
   </node>
- 
-  <!--group ns="$(arg uav_name)"-->
-    <node pkg="starling_bridge" type="starling_bridge" name="starling_bridge" output="screen">
-      <!-- 地面站 IP 和端口 -->
-      <param name="gcs_ip" value="192.168.43.17" />
-      <param name="gcs_udp_port" value="14550" />
-      <param name="gcs_kcp_port" value="18990" />
-      <param name="device_name" value="uav2" />
-      <param name="device_sn" value="5678" />
-      <!--param name="uav_id" value="2" />
-      <param name="device_sn" value="MAVLink_2_1" /-->
-    </node>
-  <!--/group-->
 
   <!-- ====================================================================== -->
   <!-- 10. RViz 可视化                                                          -->

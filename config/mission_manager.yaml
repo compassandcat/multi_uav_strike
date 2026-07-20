@@ -10,6 +10,14 @@ low_speed_threshold: 12.0
 target_lock_confidence: 0.7
 spiral_approach_duration: 10.0
 spiral_approach_radius: 20.0
+# 拦截速度(下发到 InterceptGuidance 替代 guidance_control.yaml 里的 uav_speed)
+max_speed: 10.0
 # 起飞高度达标后的等待时间（缩短起飞流程用）
 takeoff_stable_time: 1.0     # 高度达标后稳定时间（秒）
 takeoff_hover_time: 0.5      # 悬停等待时间（秒）
+# === Phase 7: 多机集结同步 ===
+# 伙伴心跳超时(秒):超过此时长未刷新视为失联,失联 SN 从 arrived 集合中剔除
+partner_heartbeat_timeout: 3.0
+# 集结门限:到达伙伴数 / 期望伙伴数(去本机) ≥ 此值 → 推进下一条 skill
+# 1.0 = 全部到齐才推进;0.7 = 70% 到齐即可(降级兼容掉队 UAV)
+gather_threshold: 1.0

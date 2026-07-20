@@ -24,12 +24,16 @@
   <!-- 命令行可覆盖参数                                                         -->
   <!-- ====================================================================== -->
   <!-- 默认 IDLE：飞机在地面等待，不会自动起飞。
-       切换流程示例：
-         rostopic pub -1 /gs/mode_cmd std_msgs/String "TAKEOFF"     # 起飞
-         rostopic pub -1 /gs/mode_cmd std_msgs/String "SEARCH_ONLY"  # 起飞后开始航点飞行
+       flow 选定后由 gs_simulator_node.py 发布 typed TaskFlow 到 /<ns>/mission/task_flow,
+       mission_manager 根据首发 skill 自动切 work_mode。
+       可选 flow:
+         - ground_search_strike  (地面起飞 + 搜索 + 打击)
+         - ground_search_track   (地面起飞 + 搜索跟踪)
+         - ground_gather_search  (地面起飞 + 集结 + 搜索)
+         - catapult_search_return(弹射起飞 + 搜索 + 返航)
   -->
-  <arg name="mode" default="IDLE" />
   <arg name="uav_name" default="uav0" />
+  <arg name="flow" default="" />
 
   <!-- Set GeographicLib data path -->
   <!-- <env name="GEOGRAPHICLIB_DATA" value="$(env HOME)/.GeographicLib" /> -->
@@ -40,7 +44,7 @@
   <group ns="$(arg uav_name)">
     <include file="$(find mavros)/launch/px4.launch">
       <arg name="fcu_url" value="/dev/ttyAMA0:921600" />
-      <arg name="tgt_system" value="1" />
+      <arg name="tgt_system" value="$(optenv TZS_FCU_ID 1)" />
     </include>
   </group>
 
@@ -151,6 +155,22 @@
     </node>
   </group>
 
+  <!-- 8b. 已移除 detection_simulator_node: 检测功能已合并到 gimbal_simulator_node -->
+
+  <!-- 8c. 机间避障决策节点 -->
+  <group ns="$(arg uav_name)">
+    <node name="uav_avoidance_node"
+          pkg="multi_uav_strike"
+          type="uav_avoidance_node"
+          output="screen"
+          respawn="false">
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/common.yaml" />
+      <rosparam command="load"
+                file="$(find multi_uav_strike)/config/uav_avoidance.yaml" />
+    </node>
+  </group>
+
   <!-- ====================================================================== -->
   <!-- 9. 地面站模拟器（仿真测试用）                                            -->
   <!-- ====================================================================== -->
@@ -161,8 +181,9 @@
         respawn="false"
         args=""
         launch-prefix="bash -c 'sleep 2; $@' --" >
-    <param name="mode" value="$(arg mode)" />
-    <param name="auto_pub" value="true" />
+    <param name="flow" value="$(arg flow)" />
+    <param name="flow" value="$(arg flow)" />
+    <param name="uav_ns" value="$(arg uav_name)" />
     <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
   </node>

@@ -1,216 +1,276 @@
 #include <ros/ros.h>
 #include <geometry_msgs/Point.h>
-#include <visualization_msgs/Marker.h> // 新增：RViz可视化消息头文件
+#include <visualization_msgs/Marker.h>
+#include <visualization_msgs/MarkerArray.h>
+#include <multi_uav_strike/SimTarget.h>
+#include <multi_uav_strike/SimTargets.h>
+#include <XmlRpcValue.h>
 #include <cmath>
 #include <random>
 #include <chrono>
+#include <vector>
+#include <string>
 
-// 目标运动模拟器类（封装状态和逻辑，更易维护）
+// ============================================================================
+// target_motion_simulator_node — 多目标地面运动模拟器
+//
+// 2026-07 多目标改造:
+//   - 支持 YAML 配置目标列表(不同类别 + 同类别多实例),每个目标独立 2D 随机运动模型。
+//   - 发布 /sim_targets (SimTargets):全部目标的 label + NWU 位置,供 gimbal_simulator。
+//   - 保留 /target_position (Point):主目标(primary_index,默认 0)位置,兼容
+//     guidance_control_node 的 real_target_sub_ 与 rviz echo。
+//   - target_marker 改为 MarkerArray,每目标一个 marker(按 label 上色)。
+//
+// 目标运动模型与单目标版本一致(切向/法向随机加速度),只是复制成 N 份。
+// ============================================================================
+
 class TargetMotionSimulator {
 private:
-    // ROS核心组件
     ros::NodeHandle nh_;
-    ros::Publisher target_pub_;
-    ros::Publisher target_marker_pub_; // 新增：RViz Marker发布者
-    ros::Timer sim_timer_;       // 100Hz主仿真定时器
-    ros::Timer acc_trigger_timer_;  // 0.1Hz加减速触发定时器
+    ros::Publisher sim_targets_pub_;      // 全部目标 (SimTargets)
+    ros::Publisher target_pub_;           // 主目标 (Point,兼容)
+    ros::Publisher target_marker_pub_;    // MarkerArray (RViz)
+    ros::Timer sim_timer_;
+    ros::Timer acc_trigger_timer_;
 
-    // 车辆状态变量
-    double x_;          // x坐标 (m)
-    double y_;          // y坐标 (m)
-    double vx_;         // x方向速度 (m/s)
-    double vy_;         // y方向速度 (m/s)
-    double theta_;      // 运动方向角（与x轴夹角，rad）
-    double omega_;      // 角速度（rad/s）
+    // 单个目标的完整状态 + 运动参数
+    struct Target {
+        uint32_t    id = 0;
+        std::string label = "general_target";
+        // 运动状态
+        double x = 0.0, y = 0.0;
+        double vx = 0.0, vy = 0.0;
+        double theta = 0.0, omega = 0.0;
+        // 运动参数(每目标独立)
+        double max_speed = 10.0;
+        double min_speed = 1.0;
+        double max_tangential_acc = 2.0;
+        double max_normal_acc = 1.0;
+        // 当前随机加速度
+        double cur_tang_acc = 0.0;
+        double cur_norm_acc = 0.0;
+    };
+    std::vector<Target> targets_;
 
-    // 配置参数（通过ROS param获取）
-    double x_init_;             // 初始x坐标 (m)
-    double y_init_;             // 初始y坐标 (m)
-    double max_speed_;          // 最大标量速度 (m/s)
-    double min_speed_;          // 最小标量速度 (m/s)
-    double max_tangential_acc_; // 最大切向加速度 (m/s²)
-    double max_normal_acc_;     // 最大法向加速度 (m/s²)
-    double sim_freq_;           // 仿真频率 (Hz)，默认100
-    double trigger_freq_;       // 加减速触发频率 (Hz)，默认0.1
+    // 全局默认(YAML 目标项缺省字段回落到这里,保持"删一行不炸"惯例)
+    double def_max_speed_, def_min_speed_, def_max_tang_acc_, def_max_norm_acc_;
+    double sim_freq_;
+    double trigger_freq_;
+    int    primary_index_;   // /target_position 取哪个目标(默认 0)
 
-    // 新增：RViz Marker配置参数（可通过param调整）
-    double marker_size_;        // 目标Marker大小 (m)
-    std::string marker_frame_;  // Marker的参考坐标系（默认map）
-    std_msgs::ColorRGBA marker_color_; // Marker颜色
+    // Marker
+    double marker_size_;
+    std::string marker_frame_;
 
-    // 临时变量：当前切向/法向加速度（由低频触发更新）
-    double current_tangential_acc_;
-    double current_normal_acc_;
-
-    // 随机数生成器（用于生成随机加速度）
     std::default_random_engine random_engine_;
-    std::uniform_real_distribution<double> tangential_acc_dist_;
-    std::uniform_real_distribution<double> normal_acc_dist_;
 
 public:
-    // 构造函数：初始化参数、状态、定时器
     TargetMotionSimulator() {
-        // 1. 初始化随机数生成器（基于时间种子）
         unsigned int seed = std::chrono::system_clock::now().time_since_epoch().count();
         random_engine_.seed(seed);
         ros::NodeHandle n("~");
-        // 2. 从ROS参数服务器读取配置（带默认值）
-        // 核心运动参数
-        n.param<double>("x_init", x_init_, 0.0);
-        n.param<double>("y_init", y_init_, 0.0);
-        n.param<double>("max_speed", max_speed_, 10.0);
-        n.param<double>("min_speed", min_speed_, 1.0);
-        n.param<double>("max_tangential_acc", max_tangential_acc_, 2.0);
-        n.param<double>("max_normal_acc", max_normal_acc_, 1.0);
+
+        // 全局默认运动参数
+        n.param<double>("max_speed", def_max_speed_, 10.0);
+        n.param<double>("min_speed", def_min_speed_, 1.0);
+        n.param<double>("max_tangential_acc", def_max_tang_acc_, 2.0);
+        n.param<double>("max_normal_acc", def_max_norm_acc_, 1.0);
         n.param<double>("sim_freq", sim_freq_, 100.0);
         n.param<double>("trigger_freq", trigger_freq_, 0.1);
+        n.param<int>("primary_index", primary_index_, 0);
 
-        // 新增：RViz Marker参数
-        n.param<double>("marker_size", marker_size_, 1.0);       // 默认Marker大小1.0m
-        n.param<std::string>("marker_frame", marker_frame_, "map"); // 默认参考坐标系map
-        // Marker颜色（默认红色，RGBA：红、绿、蓝、透明度）
-        marker_color_.r = 1.0;
-        marker_color_.g = 0.0;
-        marker_color_.b = 0.0;
-        marker_color_.a = 1.0;
+        n.param<double>("marker_size", marker_size_, 1.0);
+        n.param<std::string>("marker_frame", marker_frame_, "map");
 
-        // 3. 初始化随机加速度分布（范围[-max, max]）
-        tangential_acc_dist_ = std::uniform_real_distribution<double>(-max_tangential_acc_, max_tangential_acc_);
-        normal_acc_dist_ = std::uniform_real_distribution<double>(-max_normal_acc_, max_normal_acc_);
+        loadTargets(n);
 
-        // 4. 初始化车辆初始状态（静止在原点，初始方向沿x轴）
-        x_ = x_init_;
-        y_ = y_init_;
-        vx_ = min_speed_;  
-        vy_ = 0.0;
-        theta_ = 0.0;      
-        omega_ = 0.0;
-        current_tangential_acc_ = 0.0;
-        current_normal_acc_ = 0.0;
+        sim_targets_pub_   = nh_.advertise<multi_uav_strike::SimTargets>("sim_targets", 10);
+        target_pub_        = nh_.advertise<geometry_msgs::Point>("target_position", 10);
+        target_marker_pub_ = nh_.advertise<visualization_msgs::MarkerArray>("target_marker", 10);
 
-        // 5. 创建发布者
-        target_pub_ = nh_.advertise<geometry_msgs::Point>("target_position", 10);
-        target_marker_pub_ = nh_.advertise<visualization_msgs::Marker>("target_marker", 10); // 新增：RViz Marker话题
+        sim_timer_ = nh_.createTimer(ros::Duration(1.0/sim_freq_),
+                                     &TargetMotionSimulator::simTimerCallback, this);
+        acc_trigger_timer_ = nh_.createTimer(ros::Duration(1.0/trigger_freq_),
+                                             &TargetMotionSimulator::accTriggerCallback, this);
 
-        // 6. 创建定时器：主仿真循环（100Hz）、加减速触发（0.1Hz）
-        sim_timer_ = nh_.createTimer(ros::Duration(1.0/sim_freq_), &TargetMotionSimulator::simTimerCallback, this);
-        acc_trigger_timer_ = nh_.createTimer(ros::Duration(1.0/trigger_freq_), &TargetMotionSimulator::accTriggerCallback, this);
-
-        ROS_INFO("Target Motion Simulator initialized!");
-        ROS_INFO("Motion Params: max_speed=%.2f m/s, min_speed=%.2f m/s, max_tang_acc=%.2f m/s2, max_norm_acc=%.2f m/s2",
-                 max_speed_, min_speed_, max_tangential_acc_, max_normal_acc_);
-        ROS_INFO("RViz Marker Params: size=%.2f m, frame=%s, color=red (RGBA: 1,0,0,1)",
-                 marker_size_, marker_frame_.c_str());
+        ROS_INFO("[TargetMotionSim] initialized with %zu target(s), primary_index=%d",
+                 targets_.size(), primary_index_);
+        for (const auto& t : targets_) {
+            ROS_INFO("  target[%u] label=%s init=(%.1f,%.1f) max_speed=%.2f",
+                     t.id, t.label.c_str(), t.x, t.y, t.max_speed);
+        }
     }
 
-    // 低频触发回调：0.1Hz随机生成切向/法向加速度
+    // 从 ~targets 数组读取目标列表;若未配置则退化为单个默认目标(读旧的 x_init/y_init)
+    void loadTargets(ros::NodeHandle& n) {
+        XmlRpc::XmlRpcValue arr;
+        if (n.getParam("targets", arr) && arr.getType() == XmlRpc::XmlRpcValue::TypeArray) {
+            for (int i = 0; i < arr.size(); ++i) {
+                XmlRpc::XmlRpcValue& item = arr[i];
+                Target t;
+                t.id = static_cast<uint32_t>(i);
+                t.label              = getStr(item, "label", "general_target");
+                t.x                  = getNum(item, "x_init", 0.0);
+                t.y                  = getNum(item, "y_init", 0.0);
+                t.max_speed          = getNum(item, "max_speed", def_max_speed_);
+                t.min_speed          = getNum(item, "min_speed", def_min_speed_);
+                t.max_tangential_acc = getNum(item, "max_tangential_acc", def_max_tang_acc_);
+                t.max_normal_acc     = getNum(item, "max_normal_acc", def_max_norm_acc_);
+                t.vx = t.min_speed;
+                t.vy = 0.0;
+                targets_.push_back(t);
+            }
+        }
+        if (targets_.empty()) {
+            // 兼容旧单目标配置
+            Target t;
+            t.id = 0;
+            n.param<std::string>("label", t.label, "general_target");
+            n.param<double>("x_init", t.x, 0.0);
+            n.param<double>("y_init", t.y, 0.0);
+            t.max_speed = def_max_speed_;
+            t.min_speed = def_min_speed_;
+            t.max_tangential_acc = def_max_tang_acc_;
+            t.max_normal_acc = def_max_norm_acc_;
+            t.vx = t.min_speed;
+            targets_.push_back(t);
+            ROS_WARN("[TargetMotionSim] no ~targets list found, fell back to single target");
+        }
+        if (primary_index_ < 0 || primary_index_ >= (int)targets_.size()) {
+            primary_index_ = 0;
+        }
+    }
+
+    static double getNum(XmlRpc::XmlRpcValue& item, const std::string& key, double def) {
+        if (!item.hasMember(key)) return def;
+        XmlRpc::XmlRpcValue& v = item[key];
+        if (v.getType() == XmlRpc::XmlRpcValue::TypeDouble) return static_cast<double>(v);
+        if (v.getType() == XmlRpc::XmlRpcValue::TypeInt)    return static_cast<int>(v);
+        return def;
+    }
+    static std::string getStr(XmlRpc::XmlRpcValue& item, const std::string& key, const std::string& def) {
+        if (!item.hasMember(key)) return def;
+        XmlRpc::XmlRpcValue& v = item[key];
+        if (v.getType() == XmlRpc::XmlRpcValue::TypeString) return static_cast<std::string>(v);
+        return def;
+    }
+
+    // 低频触发:为每个目标重新随机切向/法向加速度
     void accTriggerCallback(const ros::TimerEvent&) {
-        current_tangential_acc_ = tangential_acc_dist_(random_engine_);
-        current_normal_acc_ = normal_acc_dist_(random_engine_);
-
-        ROS_DEBUG("Triggered new acceleration: tangential=%.2f m/s2, normal=%.2f m/s2",
-                  current_tangential_acc_, current_normal_acc_);
+        for (auto& t : targets_) {
+            std::uniform_real_distribution<double> td(-t.max_tangential_acc, t.max_tangential_acc);
+            std::uniform_real_distribution<double> nd(-t.max_normal_acc, t.max_normal_acc);
+            t.cur_tang_acc = td(random_engine_);
+            t.cur_norm_acc = nd(random_engine_);
+        }
     }
 
-    // 主仿真回调：100Hz更新车辆运动状态并发布
+    // 主仿真:更新所有目标并发布
     void simTimerCallback(const ros::TimerEvent&) {
-        // 计算时间步长（s）
         double dt = 1.0 / sim_freq_;
+        for (auto& t : targets_) updateMotion(t, dt);
 
-        // 1. 更新运动状态
-        updateMotion(dt);
+        // 1. 全部目标 (SimTargets)
+        multi_uav_strike::SimTargets msg;
+        msg.targets.reserve(targets_.size());
+        for (const auto& t : targets_) {
+            multi_uav_strike::SimTarget st;
+            st.id = t.id;
+            st.label = t.label;
+            st.position.x = t.x;
+            st.position.y = t.y;
+            st.position.z = 0.0;
+            msg.targets.push_back(st);
+        }
+        sim_targets_pub_.publish(msg);
 
-        // 2. 发布原始目标位置（geometry_msgs/Point）
-        geometry_msgs::Point target_msg;
-        target_msg.x = x_;
-        target_msg.y = y_;
-        target_msg.z = 0; //theta_;
-        target_pub_.publish(target_msg);
-
-        // 新增：3. 发布RViz可视化Marker
-        publishTargetMarker();
-
-        // 调试输出（可选）
-        ROS_DEBUG_THROTTLE(1.0, "Target state: x=%.2f, y=%.2f, theta=%.2f rad, speed=%.2f m/s",
-                           x_, y_, theta_, sqrt(vx_*vx_ + vy_*vy_));
-    }
-
-    // 新增：发布RViz Marker的核心函数
-    void publishTargetMarker() {
-        visualization_msgs::Marker marker;
-        // 1. 基础配置
-        marker.header.frame_id = marker_frame_; // 参考坐标系
-        marker.header.stamp = ros::Time::now(); // 时间戳
-        marker.ns = "target_marker";            // 命名空间（避免Marker冲突）
-        marker.id = 0;                          // Marker ID（唯一标识）
-        marker.type = visualization_msgs::Marker::SPHERE; // 形状：球体（适合表示目标）
-        marker.action = visualization_msgs::Marker::ADD;  // 动作：添加/更新Marker
-
-        // 2. 设置Marker位置和姿态
-        marker.pose.position.x = x_;
-        marker.pose.position.y = y_;
-        marker.pose.position.z = 0.0; // 二维运动，z轴设为0
-        // 姿态（无旋转，默认即可）
-        marker.pose.orientation.x = 0.0;
-        marker.pose.orientation.y = 0.0;
-        marker.pose.orientation.z = 0.0;
-        marker.pose.orientation.w = 1.0;
-
-        // 3. 设置Marker大小
-        marker.scale.x = marker_size_;
-        marker.scale.y = marker_size_;
-        marker.scale.z = marker_size_;
-
-        // 4. 设置Marker颜色
-        marker.color = marker_color_;
-
-        // 5. 设置Marker生命周期（0表示永久，直到节点退出）
-        marker.lifetime = ros::Duration(0);
-
-        // 6. 发布Marker
-        target_marker_pub_.publish(marker);
-    }
-
-    // 核心运动模型：更新位置、速度、方向角
-    void updateMotion(double dt) {
-        // 1. 计算当前标量速度
-        double current_speed = sqrt(vx_*vx_ + vy_*vy_);
-        if (current_speed < 1e-6) { // 避免除以0
-            current_speed = 1e-6;
+        // 2. 主目标 (Point,兼容)
+        if (!targets_.empty()) {
+            const Target& p = targets_[primary_index_];
+            geometry_msgs::Point pt;
+            pt.x = p.x; pt.y = p.y; pt.z = 0.0;
+            target_pub_.publish(pt);
         }
 
-        // 2. 切向加速度更新速度大小
-        double new_speed = current_speed + current_tangential_acc_ * dt;
-        // 速度限幅（不超过最大/最小速度）
-        new_speed = std::max(min_speed_, std::min(max_speed_, new_speed));
+        // 3. MarkerArray
+        publishTargetMarkers();
+    }
 
-        // 3. 法向加速度更新角速度（法向加速度a_n = v*omega → omega = a_n / v）
-        omega_ = current_normal_acc_ / current_speed;
-        // 更新方向角
-        theta_ += omega_ * dt;
-        // 角度归一化到[-π, π]
-        theta_ = atan2(sin(theta_), cos(theta_));
+    void publishTargetMarkers() {
+        visualization_msgs::MarkerArray arr;
+        for (const auto& t : targets_) {
+            visualization_msgs::Marker m;
+            m.header.frame_id = marker_frame_;
+            m.header.stamp = ros::Time::now();
+            m.ns = "target_marker";
+            m.id = static_cast<int>(t.id);
+            m.type = visualization_msgs::Marker::SPHERE;
+            m.action = visualization_msgs::Marker::ADD;
+            m.pose.position.x = t.x;
+            m.pose.position.y = t.y;
+            m.pose.position.z = 0.0;
+            m.pose.orientation.w = 1.0;
+            m.scale.x = m.scale.y = m.scale.z = marker_size_;
+            colorForLabel(t.label, m.color);
+            m.lifetime = ros::Duration(0);
+            arr.markers.push_back(m);
 
-        // 4. 更新速度分量（基于新速度和方向角）
-        vx_ = new_speed * cos(theta_);
-        vy_ = new_speed * sin(theta_);
+            // 类别文字标签
+            visualization_msgs::Marker txt;
+            txt.header = m.header;
+            txt.ns = "target_label";
+            txt.id = static_cast<int>(t.id);
+            txt.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+            txt.action = visualization_msgs::Marker::ADD;
+            txt.pose.position.x = t.x;
+            txt.pose.position.y = t.y;
+            txt.pose.position.z = marker_size_ + 0.5;
+            txt.pose.orientation.w = 1.0;
+            txt.scale.z = 1.0;
+            txt.color.r = txt.color.g = txt.color.b = 1.0;
+            txt.color.a = 1.0;
+            txt.text = t.label;
+            txt.lifetime = ros::Duration(0);
+            arr.markers.push_back(txt);
+        }
+        target_marker_pub_.publish(arr);
+    }
 
-        // 5. 更新位置
-        x_ += vx_ * dt;
-        y_ += vy_ * dt;
+    // 简单的按 label 上色(人=红,车=蓝,其他=绿)
+    static void colorForLabel(const std::string& label, std_msgs::ColorRGBA& c) {
+        c.a = 1.0;
+        if (label == "person" || label == "people" || label == "human") {
+            c.r = 1.0; c.g = 0.0; c.b = 0.0;
+        } else if (label == "car" || label == "vehicle" || label == "truck" || label == "bus") {
+            c.r = 0.0; c.g = 0.3; c.b = 1.0;
+        } else {
+            c.r = 0.0; c.g = 1.0; c.b = 0.0;
+        }
+    }
+
+    // 单目标运动模型(与原单目标版本一致)
+    void updateMotion(Target& t, double dt) {
+        double speed = std::sqrt(t.vx*t.vx + t.vy*t.vy);
+        if (speed < 1e-6) speed = 1e-6;
+
+        double new_speed = speed + t.cur_tang_acc * dt;
+        new_speed = std::max(t.min_speed, std::min(t.max_speed, new_speed));
+
+        t.omega = t.cur_norm_acc / speed;
+        t.theta += t.omega * dt;
+        t.theta = std::atan2(std::sin(t.theta), std::cos(t.theta));
+
+        t.vx = new_speed * std::cos(t.theta);
+        t.vy = new_speed * std::sin(t.theta);
+
+        t.x += t.vx * dt;
+        t.y += t.vy * dt;
     }
 };
 
-// 主函数
 int main(int argc, char** argv) {
-    // 初始化ROS节点：target_motion_simulator_node
     ros::init(argc, argv, "target_motion_simulator_node");
-
-    // 创建模拟器实例
     TargetMotionSimulator simulator;
-
-    // 自旋等待回调
     ros::spin();
-
     return 0;
 }

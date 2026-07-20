@@ -1,39 +1,24 @@
 <?xml version="1.0"?>
 <!--
   gs_simulator.launch
-  地面站模拟器 - 用于仿真测试
 
-  功能：
-  - 发布初始工作模式（SEARCH_ONLY / SEARCH_TRACK / SEARCH_STRIKE）
-  - 发布测试航点列表
+  已被 typed TaskFlow 取代,见 scripts/gs_simulator_node.py。
+  本 launch 只保留入口,内部是 no-op(便于老 launch 文件不报错)。
 
-  使用方法：
-  $ roslaunch multi_uav_strike gs_simulator.launch mode:=SEARCH_STRIKE
+  使用方法:
+  $ roslaunch multi_uav_strike gs_simulator.launch \
+        flow:=ground_search_strike uav_name:=uav0
 -->
 <launch>
-  <!-- 默认参数 -->
-  <arg name="mode" default="SEARCH_ONLY" />
+  <arg name="flow" default="" />
   <arg name="uav_name" default="uav0" />
 
-  <!-- ============================================================ -->
-  <!-- 工作模式发布器 -->
-  <!-- ============================================================ -->
-  <node name="gs_mode_publisher"
-        pkg="rostopic"
-        type="rostopic"
-        args="pub /gs/mode_cmd std_msgs/String '{data: $(arg mode)}' -r 1"
-        output="screen"
-        respawn="true" />
-
-  <!-- ============================================================ -->
-  <!-- 测试航点列表发布器 -->
-  <!-- 发布一个简单的方形航线 -->
-  <!-- ============================================================ -->
-  <node name="gs_waypoint_publisher"
-        pkg="rostopic"
-        type="rostopic"
-        args="pub /gs/waypoint_upload nav_msgs/Path '{header: {stamp: now, frame_id: map}, poses: []}' -r 1"
-        output="screen"
-        respawn="true" />
-
+  <!-- typed TaskFlow 由 gs_simulator_node.py 直接发布到 /<uav_ns>/mission/task_flow -->
+  <node name="gs_simulator_node"
+        pkg="multi_uav_strike"
+        type="gs_simulator_node.py"
+        output="screen">
+    <param name="flow" value="$(arg flow)" />
+    <param name="uav_ns" value="$(arg uav_name)" />
+  </node>
 </launch>

@@ -1,12 +1,36 @@
 # ============================================================================
 # gimbal_simulator_node 专属参数
 # 共享参数（use_sim）在 common.yaml 中定义，由 launch 加载。
+#
+# 云台模型 (2026-07-07 改造):
+#   - 仅控制俯仰, 偏航固定为 0
+#   - 俯仰约定: 0 = 水平, -90 = 垂直下视
+#   - 目标丢失时回退到 default_pitch_deg (默认 -45, 即 45° 俯角)
 # ============================================================================
 image_width: 1920          # 图像宽度（像素）
 image_height: 1080         # 图像高度（像素）
-fov_deg: 45.0              # 视场角（度）
-gimbal_p_gain: 0.8         # 云台 P 控制增益
-max_yaw_rate: 1.2          # 最大偏航角速度（rad/s）
+
+# === 视场角 ===
+# 相机一般是**非方形像素**: 同一物理角度映射到不同像素数
+#   focal_x = (W/2) / tan(fov_h/2)
+#   focal_y = (H/2) / tan(fov_v/2)
+# 设 fov_v_deg=0 表示按方形像素假设 (fov_v 从 fov_h + image aspect 推导)
+fov_h_deg: 66.0           # 水平 FOV（度）
+fov_v_deg: 52.0           # 垂直 FOV（度），0 = 按方形像素推导
+
+gimbal_p_gain: 1.0         # 云台 P 控制增益
 max_pitch_rate: 1.2        # 最大俯仰角速度（rad/s）
 loop_freq: 100.0           # 控制循环频率（Hz）
+# === yolo 仿真发布频率 (与 loop_freq 解耦) ===
+#   真实 YOLO 一般 10~30Hz。云台控制 100Hz 是为了让姿态跟踪稳定,但
+#   yolo_results 也按 100Hz 发会让 target_estimator 的 hit_count 语义错位
+#   (20 hits @ 100Hz = 0.2s)。这里独立节流到 10Hz,保持现实频率。
+#   yolo_pub_freq 必须 ≤ loop_freq。
+yolo_pub_freq: 10.0         # yolo_results / 单条 YoloDetection 发布频率(Hz)
 image_noise_std_dev: 0.0   # 图像噪声标准差
+
+# === 新约定下的默认回退角 ===
+#   0    = 水平
+#   45  = 45° 俯角 (目标丢失默认)
+#   90  = 垂直下视
+default_pitch_deg: 45.0  # 目标从 FOV 中丢失时,云台回退到此角度

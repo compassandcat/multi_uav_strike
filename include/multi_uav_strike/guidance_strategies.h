@@ -44,6 +44,9 @@ public:
     // Get strategy type
     virtual GuidanceStrategyType getType() const = 0;
 
+    // 允许 mission_manager 运行时下发拦截速度(目前仅 Intercept 关心,默认 no-op)
+    virtual void setUavSpeed(double /*speed*/) {}
+
 protected:
     GuidanceStrategy(ros::NodeHandle& nh, const std::string& name)
         : nh_(nh), name_(name) {}
@@ -58,6 +61,9 @@ public:
     InterceptGuidance(ros::NodeHandle& nh);
 
     GuidanceStrategyType getType() const override { return GuidanceStrategyType::INTERCEPT; }
+
+    // mission_manager 运行时下发拦截速度
+    void setUavSpeed(double speed) override { uav_speed_ = speed; }
 
     VelocityCommand computeCommand(
         const geometry_msgs::PoseStamped& uav_pose,

@@ -31,28 +31,22 @@
          - ground_search_track   (地面起飞 + 搜索跟踪)
          - ground_gather_search  (地面起飞 + 集结 + 搜索)
          - catapult_search_return(弹射起飞 + 搜索 + 返航)
+         - ground_search         (地面起飞 + 搜索)
   -->
   <arg name="uav_name" default="uav0" />
-  <arg name="flow" default="" />
+  <arg name="flow" default="ground_search_strike" />
 
   <!-- Set GeographicLib data path -->
-  <!-- <env name="GEOGRAPHICLIB_DATA" value="$(env HOME)/.GeographicLib" /> -->
+  <env name="GEOGRAPHICLIB_DATA" value="$(env HOME)/.GeographicLib" />
 
   <!-- ====================================================================== -->
   <!-- 1. MAVROS + PX4 SITL                                                  -->
   <!-- ====================================================================== -->
   <group ns="$(arg uav_name)">
     <include file="$(find mavros)/launch/px4.launch">
-      <arg name="fcu_url" value="serial:///dev/ttyS1:921600" />
-      <!--arg name="fcu_url" value="/dev/ttyS1:57600" /-->
-      <arg name="tgt_system" value="$(optenv TZS_FCU_ID 1)" />
-      <!--arg name="gcs_ip" value="192.168.1.2"/>
-	  <arg name="gcs_port" value="14550"/-->
-      <!--arg name="gcs_url" value="udp://:14551@192.168.1.10:14550"/-->
-      <arg name="gcs_url" value="udp://:14551@192.168.1.10:14550"/>
+      <arg name="fcu_url" value="udp://:14540@127.0.0.1:14580" />
+      <arg name="tgt_system" value="1" />
     </include>
-    <rosparam param="/uav0/mavros/plugin_blacklist">[]</rosparam>
-    <rosparam param="/uav0/mavros/plugin_whitelist">['sys_status', 'sys_time', 'global_position', 'local_position', 'setpoint_position', 'setpoint_velocity', 'setpoint_raw', 'setpoint_trajectory', 'setpoint_attitude', 'home_position', 'imu', 'param', 'waypoint', 'command', 'gps_status']</rosparam>
   </group>
 
   <!-- ====================================================================== -->
@@ -107,7 +101,7 @@
           pkg="multi_uav_strike"
           type="guidance_control_node"
           output="screen"
-          respawn="true">
+          respawn="false">
       <rosparam command="load"
                 file="$(find multi_uav_strike)/config/common.yaml" />
       <rosparam command="load"
@@ -163,9 +157,13 @@
     </node>
   </group>
 
+  <!-- ====================================================================== -->
   <!-- 8b. 已移除 detection_simulator_node: 检测功能已合并到 gimbal_simulator_node -->
+  <!-- ====================================================================== -->
 
-  <!-- 8c. 机间避障决策节点 -->
+  <!-- ====================================================================== -->
+  <!-- 8c. 机间避障决策节点(基于优先级,横向严禁 + 高度 bias + 速度 scale)        -->
+  <!-- ====================================================================== -->
   <group ns="$(arg uav_name)">
     <node name="uav_avoidance_node"
           pkg="multi_uav_strike"
@@ -182,32 +180,25 @@
   <!-- ====================================================================== -->
   <!-- 9. 地面站模拟器（仿真测试用）                                            -->
   <!-- ====================================================================== -->
-   
-  <group ns="$(arg uav_name)">
+
+ 
+  <!--group ns="$(arg uav_name)"-->
     <node pkg="starling_bridge" type="starling_bridge" name="starling_bridge" output="screen">
       <!-- 地面站 IP 和端口 -->
-      <param name="gcs_ip" value="192.168.1.1" />
+      <param name="gcs_ip" value="192.168.43.17" />
       <param name="gcs_udp_port" value="14550" />
       <param name="gcs_kcp_port" value="18990" />
-      <param name="device_name" value="$(optenv TZS_DEVICE_SN 1-0)" />
-      <param name="device_sn" value="$(optenv TZS_DEVICE_SN 1-0)" />
+      <param name="device_name" value="$(arg uav_name)" />
+      <param name="device_sn" value="$(arg uav_name)" />
       <!--param name="uav_id" value="2" />
       <param name="device_sn" value="MAVLink_2_1" /-->
     </node>
-  </group>
+  <!--/group-->
 
   <!-- ====================================================================== -->
-  <!-- 10. 电源信息板通信节点                                                          -->
+  <!-- 10. RViz 可视化                                                          -->
   <!-- ====================================================================== -->
-  <group ns="$(arg uav_name)">
-    <node pkg="multi_uav_strike" type="power_interact_node" name="power_interact_node" output="screen">
-    </node>
-  </group>
-
-  <!-- ====================================================================== -->
-  <!-- 11. RViz 可视化                                                          -->
-  <!-- ====================================================================== -->
-  <!-- <node name="rviz" pkg="rviz" type="rviz"
-        args="-d $(find multi_uav_strike)/rviz/view_strike_SITL.rviz" /> -->
+  <node name="rviz" pkg="rviz" type="rviz"
+        args="-d $(find multi_uav_strike)/rviz/view_strike_SITL.rviz" />
 
 </launch>
