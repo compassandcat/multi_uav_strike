@@ -1402,6 +1402,9 @@ public:
             ROS_WARN("[MissionManager] Stopped setpoint publisher before processing new task_flow");
         }
 
+        // 注:guidance 残留清理 / current_target_ 清锁 放到 preserve_track 判定之后,
+        //     Attack(105) 协同场景需要保留并切 strike 模式,见下方分支。
+
         ROS_WARN("[MissionManager] >>>> Received TaskFlow id=%s skills=%lu device_id=%u",
                  msg->flow_id.c_str(), msg->skills.size(), msg->device_id);
 
@@ -1558,6 +1561,56 @@ public:
             // current_target_ 不在这里同步 —— Attack skill 推到 waypoint_executor 后
             // 自身会带目标坐标下来覆盖,避免此处重复写造成姿态不一致
         }
+
+        // === 新 TaskFlow 接管:guidance 状态分两条路径处理 ===
+        // 路径 A (非 Attack 首发): disableGuidance + 清 current_target_ 旧锁
+        //   背景:startGuidanceApproach() publish enable=true 后,老 taskFlow 走了但没显式关,
+        //         guidance_control_node 仍按旧 current_target_ 生成 setpoint,PX4 OFFBOARD 下
+        //         飞机会按旧目标飞直到新 taskFlow 自己再触发 startGuidanceApproach()(几 s gap)。
+        //   处理:收到新 taskFlow 后第一时间关 guidance,保证新任务从干净状态开始。
+        // 路径 B (Attack 首发协同): 保留 guidance,显式切 mode = "strike"
+        //   背景:典型场景 —— 另一架机在跟踪目标,GS 看准时机广播 Attack(105) 协同打击。
+        //         期望语义:tracked_target_ 保留,guidance 继续推,但 mode 从 "track" → "strike"
+        //         让 guidance_control_node 切到攻击路径(弹道前置等)。
+        //   处理:不 disable,直接 publish enable=true + mode="strike" 覆盖之前的 track 模式。
+        //         这里强制覆盖,不依赖 GS 是否同时下发 WorkMode=SEARCH_STRIKE(协议上 work_mode
+        //         与 task_flow 解耦,GS 可能不发 work_mode,但语义上必须切到 strike 路径)。
+        if (!preserve_track) {
+            if (is_guidance_active_) {
+                disableGuidance();
+                ROS_WARN("[MissionManager] Disabled residual guidance from previous task_flow");
+            }
+            // 清 current_target_ 旧锁:
+            //   - guidance_control_node 缓存的旧值不应污染新 taskFlow
+            //   - triggerStrike()/checkYoloDrivenStrike() 入口(current_target_.is_locked)
+            //     需回到 NOT_LOCKED,否则新 taskFlow 一开始可能被误判"已有目标",跳过 SEARCH 阶段
+            current_target_.is_locked   = false;
+            current_target_.is_detected = false;
+            current_target_.is_shared   = false;
+            // current_target_.pose 不强制清零:留给新一轮 YOLO/cluster 覆盖
+        } else {
+            // Attack 协同:显式把 guidance 切到 strike 模式
+            // 注意:不调 disableGuidance(),避免破坏正在跟踪的目标
+            //       不动 tracked_target_ / current_target_,目标锁原样保留
+            if (is_guidance_active_) {
+                std_msgs::Bool enable;
+                enable.data = true;
+                guidance_enable_pub_.publish(enable);
+
+                std_msgs::String mode_msg;
+                mode_msg.data = "strike";  // 强制覆盖 track,即使 current_work_mode_ 还是 SEARCH_TRACK
+                guidance_mode_pub_.publish(mode_msg);
+
+                ROS_WARN("[MissionManager] Attack(105) cooperative: guidance mode -> 'strike' "
+                         "(preserved lock on current target)");
+            } else {
+                // guidance 之前没启(罕见),Attack 协同要求必须有 active guidance
+                // 这种情况下 GS 期望"用当前已锁目标"但 guidance 没在跑,留个 warn
+                ROS_WARN("[MissionManager] Attack(105) cooperative but guidance not active — "
+                         "no track to convert to strike. GS may need to re-send Track first.");
+            }
+        }
+
         // 兜底清空:此处 setLockState 早 return (因新 flow 总是 NOT_LOCKED→NOT_LOCKED,
         // 或前面 preserve_track=true 时 lock_state 保持; 总之上面已处理,这里用 setLockState
         // 兜底以保持所有清空路径统一)。
@@ -2822,8 +2875,16 @@ public:
         }
 
         // 幂等:advanceSkillStateMachine() 在 10Hz 重复 tick,只要 last_skill 仍是 COMPLETE 就会再次进入这里。
-        // 已经在 HOLDING 时直接 return,避免反复 start/stop setpoint publisher。
-        if (current_phase_ == MissionPhase::PHASE_HOLDING) {
+        // 已经在 HOLDING 且 setpoint publisher 在跑时直接 return,避免反复 start/stop。
+        // 关键守卫:setpoint_running_ 必须为 true 才 early-return —— 只看 phase==HOLDING 不够,
+        // 因为 taskFlowCallback 收到新 task_flow 时会 stopSetpointPublisher()(L1401) 但**不重置 phase**
+        // (新 flow 首发不是 takeoff 时),导致 phase=HOLDING 但 publisher 已停,此时必须重启+衔接。
+        // 否则会出现两 setpoint 源同时停的真空间隙,PX4 COM_OFFBOARD_LOSS_TIMEOUT → AUTO.LAND failsafe。
+        if (current_phase_ == MissionPhase::PHASE_HOLDING && setpoint_running_) {
+            // 已经在 HOLDING 且 publisher 活着,只刷一下 z 跟随当前高度即可
+            if (is_pose_received_) {
+                takeoff_setpoint_.pose.position.z = -current_pose_.pose.position.z;
+            }
             return;
         }
         current_phase_ = MissionPhase::PHASE_HOLDING;
@@ -2833,6 +2894,27 @@ public:
 
         if (!is_pose_received_) {
             ROS_WARN("[MissionManager] HOLDING: no pose yet (will wait inside startSetpointPublisher up to 10s)");
+        }
+
+        // === 无缝接管 waypoint_executor → setpoint publisher ===
+        // 背景(实测日志 1784519200.309~201.011):
+        //   - waypoint_executor 在 L200.309 自己报 SKILL_AREA COMPLETE 后停止发 setpoint_velocity
+        //   - mission_manager 在 L200.582 state→COMPLETE,L200.682 才进 enterHoldState
+        //   - 距离 ~373ms,加上 startSetpointPublisher 线程启动 + PX4 端识别新 setpoint_position,
+        //     总真空 > PX4 COM_OFFBOARD_LOSS_TIMEOUT(500ms)→ AUTO.LAND failsafe
+        // 修复策略:让两个 setpoint 源短暂并存 ~50ms,堵住真空窗口:
+        //   1. 立刻给 waypoint_executor 发 "stop"(它在下一个 10Hz tick 内停发 setpoint_velocity)
+        //   2. 立刻 startSetpointPublisher() 启 setpoint_position 50Hz
+        //   3. 重叠期间 PX4 OFFBOARD 任一收到 setpoint 就保持(不冲突,topic 分别是
+        //      /mavros/setpoint_velocity/cmd_vel 和 /mavros/setpoint_position/local)
+        //   4. 50ms 后 waypoint_executor 完全停止,只剩 setpoint publisher 接管
+        // 关键:不能反过来(先停 waypoint_executor 再启 publisher)—— 那就在两者之间产生真空
+        {
+            std_msgs::String stop_cmd;
+            stop_cmd.data = "stop";
+            waypoint_control_pub_.publish(stop_cmd);
+            ROS_WARN("[MissionManager]   - HOLDING: stop command sent to waypoint_executor "
+                     "(will stop ~50ms later, overlapping with setpoint publisher)");
         }
 
         if (!setpoint_running_) {
