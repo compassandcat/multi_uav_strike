@@ -46,3 +46,6 @@ building_z: 150.0
 building_size_x: 10.0
 building_size_y: 20.0
 building_size_z: 300.0
+ground_z: 0.0
+ground_range_abs_tolerance: 1.0
+ground_range_rel_tolerance: 0.02

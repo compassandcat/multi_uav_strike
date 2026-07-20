@@ -40,7 +40,6 @@
 #include <std_msgs/String.h>
 #include <std_msgs/Int16.h>
 #include <sensor_msgs/NavSatFix.h>
-#include <sensor_msgs/Range.h>
 #include <mavros_msgs/HomePosition.h>
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
@@ -54,6 +53,7 @@
 #include "multi_uav_strike/Skill.h"
 #include "multi_uav_strike/WaypointStatus.h"
 #include "multi_uav_strike/AvoidanceCmd.h"
+#include "multi_uav_strike/LidarMeasurement.h"
 
 // 安阳基准点（用于 GPS → NED 转换）
 const double ANYANG_LAT = 36.096;      // 安阳纬度
@@ -72,7 +72,7 @@ private:
     ros::Subscriber other_uav_poses_sub_;    // 邻居无人机位置
     ros::Subscriber control_sub_;            // 控制命令（来自 mission_manager）
     ros::Subscriber mission_mode_sub_;       // 工作模式（SEARCH_ONLY/SEARCH_TRACK/SEARCH_STRIKE/IDLE）
-    ros::Subscriber lidar_range_sub_;        // 前向单束激光雷达
+    ros::Subscriber lidar_measurement_sub_;  // 带命中类型的前向激光测量
 
     // ============== 发布 ==============
     ros::Publisher setpoint_velocity_pub_;    // NED 速度指令
@@ -139,6 +139,7 @@ private:
     double lidar_stop_distance_;
     double lidar_altitude_offset_;
     double latest_lidar_range_;
+    uint8_t latest_lidar_hit_type_;
     ros::Time latest_lidar_stamp_;
     ros::Time lidar_no_hit_since_;
 
@@ -246,7 +247,8 @@ public:
         lidar_climb_trigger_distance_(100.0),
         lidar_stop_distance_(20.0),
         lidar_altitude_offset_(0.0),
-        latest_lidar_range_(std::numeric_limits<double>::infinity()) {
+        latest_lidar_range_(std::numeric_limits<double>::infinity()),
+        latest_lidar_hit_type_(multi_uav_strike::LidarMeasurement::HIT_NONE) {
 
         initParams();
         initSubscribers();
@@ -354,8 +356,8 @@ public:
             &WaypointExecutor::missionModeCallback, this);
 
         if (lidar_building_avoidance_enabled_) {
-            lidar_range_sub_ = nh_.subscribe(
-                "lidar/range", 10, &WaypointExecutor::lidarRangeCallback, this);
+            lidar_measurement_sub_ = nh_.subscribe(
+                "lidar/measurement", 10, &WaypointExecutor::lidarMeasurementCallback, this);
         }
 
         // === Phase 4: Skill(分段航点) — mission_manager 下发 ===
@@ -1254,19 +1256,22 @@ public:
         has_latest_avoidance_ = true;
     }
 
-    void lidarRangeCallback(const sensor_msgs::Range::ConstPtr& msg) {
+    void lidarMeasurementCallback(const multi_uav_strike::LidarMeasurement::ConstPtr& msg) {
         latest_lidar_stamp_ = ros::Time::now();
         latest_lidar_range_ = msg->range;
-        const bool hit = std::isfinite(msg->range) &&
-                         msg->range >= msg->min_range && msg->range <= msg->max_range;
-        if (building_avoidance_state_ == BuildingAvoidanceState::CRUISE && hit &&
+        latest_lidar_hit_type_ = msg->hit_type;
+        const bool building_hit =
+            msg->hit_type == multi_uav_strike::LidarMeasurement::HIT_BUILDING &&
+            std::isfinite(msg->range) &&
+            msg->range >= msg->min_range && msg->range <= msg->max_range;
+        if (building_avoidance_state_ == BuildingAvoidanceState::CRUISE && building_hit &&
             msg->range <= lidar_climb_trigger_distance_) {
             building_avoidance_state_ = BuildingAvoidanceState::CLIMBING;
             lidar_no_hit_since_ = ros::Time();
             ROS_WARN("[WaypointExecutor] Building detected at %.1fm: start forward climb",
                      msg->range);
         } else if (building_avoidance_state_ == BuildingAvoidanceState::CLIMBING) {
-            if (hit) {
+            if (building_hit) {
                 lidar_no_hit_since_ = ros::Time();
             } else if (lidar_no_hit_since_.isZero()) {
                 lidar_no_hit_since_ = latest_lidar_stamp_;
@@ -1288,7 +1293,9 @@ public:
         const ros::Time now = ros::Time::now();
         const bool lidar_fresh = !latest_lidar_stamp_.isZero() &&
                                  (now - latest_lidar_stamp_).toSec() <= lidar_timeout_;
-        if (lidar_fresh && std::isfinite(latest_lidar_range_) &&
+        if (lidar_fresh &&
+            latest_lidar_hit_type_ == multi_uav_strike::LidarMeasurement::HIT_BUILDING &&
+            std::isfinite(latest_lidar_range_) &&
             latest_lidar_range_ < lidar_slowdown_distance_) {
             // 300m 外保持全速；300m→20m 之间线性减速；20m 内停止水平前进。
             const double denom = std::max(1.0, lidar_slowdown_distance_ - lidar_stop_distance_);
